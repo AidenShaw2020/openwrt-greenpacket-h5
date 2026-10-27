@@ -153,8 +153,13 @@ The H5 bootloader sets a persistent `fastboot-abnormal` flag during flashing.
 are not substitutes.** Do not edit `misc` by hand. Wait for normal stock boot.
 
 Now remove **all power sources**, including USB. Hold RESET, restore normal
-power, release RESET after about ten seconds, wait about 45 seconds, and
-reconnect USB. Require an actual OpenWrt initramfs login and usable Ethernet.
+power, and release RESET after about **2-3 seconds**, before Linux enters its
+failsafe button window. Keep USB disconnected and allow up to three minutes
+for Ethernet and the web interface at `192.168.0.1`. Holding RESET for ten
+seconds can also trigger OpenWrt failsafe: rapid red SYS blinking and
+`192.168.1.1` are not a completed normal recovery startup. After verifying
+Ethernet without USB, reconnect USB to verify the initramfs login and SSH key.
+Require `rootfs_type: initramfs`, no active failsafe, and usable Ethernet.
 This must be a cold NAND recovery boot, not another `fastboot boot` RAM boot.
 
 Verify the new recovery image by readback. On the PC, after checking the

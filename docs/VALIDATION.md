@@ -38,7 +38,7 @@ did not prevent application. The original build artifact manifest matched.
 
 The test applies patches without changing the build server's working sources.
 
-## Local Rebuild Candidate
+## Local Rebuilds
 
 A clean kernel rebuild completed with exit code 0 using the same CPE profile
 and driver/modem fixes, a neutral builder/host identity, and compiler prefix
@@ -47,9 +47,31 @@ existing production image validator. The NAND source file and Linux kernel
 configuration matched the preceding build. Images and dependency archives are
 not distributed; the project publishes its source overlay and build instructions.
 
-The local rebuild has not been flashed or hardware-tested; the runtime
-results above are evidence for the preceding build, not a new hardware test.
-No firmware write or configuration change was made to the running device.
+The initial privacy-checked candidate was not flashed. A subsequent CPE
+rebuild corrected a USB-dependent cold-start failure: preinit could block on
+its synchronous failsafe-prompt write to an active but disconnected ttyGS0.
+Both the DTB and Android header now select ttyMSM0 as the CPE boot console;
+USB CDC ACM remains available through the normal authenticated login helper.
+
+The console-fixed rebuild was installed using standard sysupgrade with
+configuration preserved. Independent recovery was updated through fastboot,
+followed by the required normal reboot. Installed kernel/rootfs hashes matched;
+the recovery image's complete byte range matched a NAND readback. Do not assume
+that the unused partition tail is all 0xff when comparing a whole-partition hash.
+
+Physical cold boots without USB passed for both the persistent squashfs/UBIFS
+system and recovery initramfs. LAN forwarding started at about 50 and 70 seconds,
+respectively; HTTP and SSH worked. Recovery had no active failsafe, did not mount
+the main overlay, and returned by normal reboot to the persistent system with
+its preserved SSH host key. Runtime kernel identity was `builder@buildhost`.
+Holding RESET for ten seconds also selected Linux failsafe; releasing it after
+2-3 seconds completed normal NAND recovery startup on the tested device.
+
+The newer build passed the production image checks, including UART-only CPE
+boot arguments in both images and matching DTBs. The new console regression
+check rejected the old USB-console candidate. This is not a repeat of every
+earlier radio/concurrency test or a completed new privacy audit. No binaries
+are distributed. Later OpenWrt versions still need their own port/build/tests.
 
 The generalized first-install check passed shell syntax and early-rejection
 tests for missing arguments, malformed checksums and a missing image. Its

@@ -38,6 +38,16 @@ These are not GreenPacket web-update packages. Direct fastboot RAM boot of
 the full Linux/LuCI/modem initramfs has been validated on the tested H5.
 Earlier bring-up profiles remain available for diagnostics.
 
+The CPE profile uses ttyMSM0 as its only boot console in both the DTB and
+Android image header. USB ttyGS0 remains available for authenticated login,
+but is not a boot console: OpenWrt preinit can otherwise block while writing
+the failsafe prompt to a disconnected USB TTY. With this fix, both the main
+system and independent NAND recovery completed physical cold boots without
+USB. Main LAN forwarding started after about 50 seconds; recovery after about
+70 seconds. At power-on, release RESET after about 2-3 seconds to select
+recovery; holding it for ten seconds can also activate Linux failsafe at
+192.168.1.1 instead of completing normal recovery startup at 192.168.0.1.
+
 ## Default operation
 
 The default is a normal cellular CPE router: Ethernet LAN 192.168.0.1/24,
@@ -173,3 +183,19 @@ MPSS before changing boot/system and includes its tools in the stage2 RAM root.
 All 32 nonsecure original NAND partitions have private backups with gzip CRC
 and decompressed SHA256 verification. EFS and raw OOB are excluded; this is not
 a raw full-chip clone. Keep device-specific backups outside the public patch.
+
+## Porting to another OpenWrt version
+
+The exported patch is validated against the pinned 25.12.6 revision, not every
+future branch. Start from a clean checkout of the desired version and run
+`git apply --check` before applying it. If that target or any included package
+already exists upstream, reconcile the implementation instead of overwriting
+it. Review the target's kernel version, files-6.12 and patches-6.12 directories,
+kernel APIs/configuration, and packages/LuCI feed compatibility. Backports may
+already be upstream and must not be applied twice. Keep the DTB and Android
+header boot-console selections consistent, including the recovery initramfs.
+
+After adapting the overlay, export a new patch against that clean version,
+verify application in a second clean checkout, build both CPE images, and test
+sysupgrade, cold boot without USB, recovery and modem/NAND integrity. A clean
+patch-application check alone is not proof of runtime compatibility.

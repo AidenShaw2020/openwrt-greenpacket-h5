@@ -20,7 +20,18 @@ initramfs and squashfs passed private-data checks, and both images passed
 the existing offline production-format/content validation. The patch passed
 clean-index application to the exact OpenWrt and packages-feed revisions.
 
-**The local rebuilt binaries have not themselves been flashed or boot-tested.**
+The initially privacy-checked candidate was not flashed. A later CPE rebuild
+fixes cold boot without USB by selecting ttyMSM0, not ttyGS0, in both the DTB
+and Android boot header. USB remains available for normal console login.
+This rebuild passed sysupgrade with configuration preserved, main and recovery
+cold boots without USB, image/NAND readback checks, and return from recovery
+to the persistent system. Its runtime kernel identity is `builder@buildhost`;
+the earlier privacy audit is not a complete audit of this newer build.
+
+Release RESET about 2-3 seconds after restoring power to enter recovery.
+Holding it for ten seconds can also activate Linux failsafe at `192.168.1.1`.
+Normal recovery uses `192.168.0.1` with `rootfs_type: initramfs`.
+
 The preceding build with the same driver/modem fixes passed persistent boot,
 sysupgrade, mobile data, LAN routing, LTE cell-lock and modem/NAND concurrency
 tests. LTE/5G NSA, including NR n78 activation under traffic, was observed.

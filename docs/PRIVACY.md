@@ -27,7 +27,14 @@ A local candidate was rebuilt from a cleaned kernel build with neutral
 The same decompression and filesystem checks then reported zero findings for
 the new images. An additional production validator verified the boot headers,
 DTB, login setup, absence of the private debugging overlay, unset root password,
-modem tools, and persistent-root/sysupgrade support. No hardware flash was done.
+modem tools, and persistent-root/sysupgrade support. That initial candidate
+was not flashed at the time of this audit.
+
+A later CPE rebuild with the USB boot-console correction was installed and
+passed main/recovery cold boots without USB. Its runtime kernel identity is
+`builder@buildhost`, but a complete new decompressed-content privacy audit was
+not completed. The earlier zero-findings result must not be treated as an
+audit of this newer build or of a future third-party build.
 
 Neither the rebuilt binaries nor the dependency-source snapshot is distributed.
 The project is source-only; local build and audit artifacts remain private.

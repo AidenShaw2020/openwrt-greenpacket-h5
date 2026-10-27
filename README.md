@@ -17,9 +17,11 @@ and installation instructions. Build your own images using the pinned
 upstream sources. No prebuilt firmware, dependency source archive, vendor
 firmware or device backup is distributed here.
 
-A local rebuild passed offline format/content checks but was not flashed or
-hardware-tested. The runtime results below refer to the preceding private
-build with the same driver/modem fixes. This remains an experimental port.
+A follow-up local CPE rebuild with the USB boot-console fix was installed by
+sysupgrade with configuration preserved. Both the main system and independent
+NAND recovery passed physical cold boots without USB. Earlier radio and
+concurrency results refer to the preceding build with the same driver/modem
+fixes. This remains an experimental port; a new third-party build is not certified.
 See [Privacy Review](docs/PRIVACY.md) and [Build Inputs](docs/SOURCES.md).
 
 - `target/linux/sdx/`: target, board descriptions, image builder and kernel patches.
@@ -37,6 +39,7 @@ Use the exported patch once; do not also copy the same overlay on top.
 
 - Persistent boot from NAND and standard sysupgrade preserving configuration.
 - Independent OpenWrt initramfs recovery and readback verification.
+- Main and recovery cold boot without USB; USB serial remains a login console.
 - RTL8125B Ethernet at 1 Gb/s, LAN DHCP/DNS, firewall, NAT and client HTTP traffic.
 - Mobile data through IPA/rmnet, QRTR/QMI and ModemManager.
 - LTE and 5G NSA, including an active NR band n78 secondary carrier under load.
@@ -103,6 +106,30 @@ them. Setting the kernel build user/domain does not by itself guarantee that
 all absolute build paths or third-party metadata are removed. A new build is
 not automatically byte-identical to the privately tested images.
 
+## Porting to Newer OpenWrt
+
+The patch filename records its **tested base**, not automatic compatibility
+with later versions. Keep this repository and its overlay as the local source
+of truth. From a clean checkout of the desired OpenWrt revision, first run:
+
+```sh
+git apply --check ../openwrt-greenpacket-h5/h5-openwrt-25.12.6-bringup.patch
+```
+
+If the check fails, adapt the overlay to that revision in a disposable checkout;
+do not force it over existing target/package files. Review the target kernel
+version, `files-6.12`/`patches-6.12`, kernel APIs and configuration, and each
+packages/LuCI feed patch. Drop backports already present upstream. Preserve
+the UART boot-console selection in both the CPE DTB and Android image header;
+USB login must not become a required boot dependency again.
+
+After staging only the intended port changes in that disposable checkout,
+generate a version-specific patch with `git diff --cached --binary`. Check it
+in a second clean checkout of the same revision, build both images, and repeat
+sysupgrade, main/recovery cold boot without USB, and modem/NAND integrity tests.
+Record the new OpenWrt/feed revisions and patch checksum. Successful patch
+application alone does not establish build or hardware compatibility.
+
 ## Installation and Recovery
 
 **Do not upload these files to the original GreenPacket web updater.**
@@ -124,8 +151,11 @@ the independent recovery and other partitions remain protected.
 
 On the tested installation, independent OpenWrt recovery is entered by
 powering off the unit, holding RESET while restoring power, and releasing
-RESET after approximately ten seconds. Ensure all power sources are removed
-before starting. This only boots whatever is installed in the recovery
+RESET after approximately **2-3 seconds**. Holding it for ten seconds can also
+trigger OpenWrt failsafe (rapid red SYS blinking, `192.168.1.1`). Ensure all
+power sources, including USB, are removed before starting. Normal recovery
+uses `192.168.0.1` and reports `rootfs_type: initramfs`. This only boots whatever
+is installed in the recovery
 partition; it does not install OpenWrt recovery or restore stock firmware.
 
 ## Operation

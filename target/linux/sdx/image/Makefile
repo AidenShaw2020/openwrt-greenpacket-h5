@@ -78,7 +78,7 @@ define Device/greenpacket_h5-200q1-cpe
   BLOCKSIZE := 256k
   PAGESIZE := 4096
   # Select RAM or the new OpenWrt system volume explicitly, without stock rootfs arguments.
-  H5_CMDLINE := noinitrd ro rootwait console=ttyGS0,115200n8 pcie_ports=compat pci=pcie_bus_safe
+  H5_CMDLINE := noinitrd ro rootwait console=ttyMSM0,115200n8 pcie_ports=compat pci=pcie_bus_safe
   KERNEL := kernel-bin | append-dtb | h5-bootimg ubi.mtd=system root=/dev/ubiblock0_0 rootfstype=squashfs | check-size $$(KERNEL_SIZE)
   KERNEL_INITRAMFS := kernel-bin | append-dtb | h5-bootimg root=/dev/ram0 | check-size $$(KERNEL_SIZE)
   FILESYSTEMS := squashfs

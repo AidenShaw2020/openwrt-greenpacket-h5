@@ -4,6 +4,10 @@
 / {
 	/* Keep the first compatible stable for normal OpenWrt board detection. */
 	compatible = "greenpacket,h5-200q1", "greenpacket,h5-200q1-openwrt", "qcom,sdx65";
+
+	chosen {
+		bootargs = "console=ttyMSM0,115200n8 loglevel=7 pcie_ports=compat pci=pcie_bus_safe";
+	};
 };
 
 &{/soc/sram@1468f000} {

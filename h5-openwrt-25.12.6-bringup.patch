@@ -754,7 +754,7 @@ diff --git a/h5-patches/README.md b/h5-patches/README.md
 new file mode 100644
 --- /dev/null
 +++ b/h5-patches/README.md
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,201 @@
 +# GreenPacket H5-200Q1 on vanilla OpenWrt 25.12.6
 +
 +This adds a new SDX65 target to unmodified OpenWrt; it does not use a RutOS
@@ -794,6 +794,16 @@ new file mode 100644
 +These are not GreenPacket web-update packages. Direct fastboot RAM boot of
 +the full Linux/LuCI/modem initramfs has been validated on the tested H5.
 +Earlier bring-up profiles remain available for diagnostics.
++
++The CPE profile uses ttyMSM0 as its only boot console in both the DTB and
++Android image header. USB ttyGS0 remains available for authenticated login,
++but is not a boot console: OpenWrt preinit can otherwise block while writing
++the failsafe prompt to a disconnected USB TTY. With this fix, both the main
++system and independent NAND recovery completed physical cold boots without
++USB. Main LAN forwarding started after about 50 seconds; recovery after about
++70 seconds. At power-on, release RESET after about 2-3 seconds to select
++recovery; holding it for ten seconds can also activate Linux failsafe at
++192.168.1.1 instead of completing normal recovery startup at 192.168.0.1.
 +
 +## Default operation
 +
@@ -930,6 +940,22 @@ new file mode 100644
 +All 32 nonsecure original NAND partitions have private backups with gzip CRC
 +and decompressed SHA256 verification. EFS and raw OOB are excluded; this is not
 +a raw full-chip clone. Keep device-specific backups outside the public patch.
++
++## Porting to another OpenWrt version
++
++The exported patch is validated against the pinned 25.12.6 revision, not every
++future branch. Start from a clean checkout of the desired version and run
++`git apply --check` before applying it. If that target or any included package
++already exists upstream, reconcile the implementation instead of overwriting
++it. Review the target's kernel version, files-6.12 and patches-6.12 directories,
++kernel APIs/configuration, and packages/LuCI feed compatibility. Backports may
++already be upstream and must not be applied twice. Keep the DTB and Android
++header boot-console selections consistent, including the recovery initramfs.
++
++After adapting the overlay, export a new patch against that clean version,
++verify application in a second clean checkout, build both CPE images, and test
++sysupgrade, cold boot without USB, recovery and modem/NAND integrity. A clean
++patch-application check alone is not proof of runtime compatibility.
 diff --git a/target/linux/sdx/base-files/etc/board.d/01_leds b/target/linux/sdx/base-files/etc/board.d/01_leds
 new file mode 100755
 --- /dev/null
@@ -1942,13 +1968,17 @@ diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-green
 new file mode 100644
 --- /dev/null
 +++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-cpe.dts
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,34 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +#include "qcom-sdx65-greenpacket-h5-ipa.dts"
 +
 +/ {
 +	/* Keep the first compatible stable for normal OpenWrt board detection. */
 +	compatible = "greenpacket,h5-200q1", "greenpacket,h5-200q1-openwrt", "qcom,sdx65";
++
++	chosen {
++		bootargs = "console=ttyMSM0,115200n8 loglevel=7 pcie_ports=compat pci=pcie_bus_safe";
++	};
 +};
 +
 +&{/soc/sram@1468f000} {
@@ -2630,7 +2660,7 @@ new file mode 100644
 +  BLOCKSIZE := 256k
 +  PAGESIZE := 4096
 +  # Select RAM or the new OpenWrt system volume explicitly, without stock rootfs arguments.
-+  H5_CMDLINE := noinitrd ro rootwait console=ttyGS0,115200n8 pcie_ports=compat pci=pcie_bus_safe
++  H5_CMDLINE := noinitrd ro rootwait console=ttyMSM0,115200n8 pcie_ports=compat pci=pcie_bus_safe
 +  KERNEL := kernel-bin | append-dtb | h5-bootimg ubi.mtd=system root=/dev/ubiblock0_0 rootfstype=squashfs | check-size $$(KERNEL_SIZE)
 +  KERNEL_INITRAMFS := kernel-bin | append-dtb | h5-bootimg root=/dev/ram0 | check-size $$(KERNEL_SIZE)
 +  FILESYSTEMS := squashfs

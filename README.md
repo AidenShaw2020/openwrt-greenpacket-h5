@@ -11,27 +11,24 @@ GreenPacket, Quectel, Qualcomm, or the OpenWrt project.
 
 ## Release Contents
 
-The repository includes the target, custom packages, kernel/feed patches,
-build configuration, and an exported vanilla OpenWrt patch. The
-[GitHub release](https://github.com/AidenShaw2020/openwrt-greenpacket-h5/releases)
-also provides freshly rebuilt initramfs and sysupgrade images, checksums,
-the package manifest, and a complete corresponding-source archive.
+This is a **source-only project**: the target, custom packages, kernel/feed
+patches, build configuration, an exported vanilla OpenWrt patch, and build
+and installation instructions. Build your own images using the pinned
+upstream sources. No prebuilt firmware, dependency source archive, vendor
+firmware or device backup is distributed here.
 
-The older privately tested binaries are not distributed. Public images were
-rebuilt with `builder@buildhost` and compiler path mapping, then inspected
-after decompression. No configured SIM credentials, private host keys, known
-personal build identity or known device identifier were found. See
-[Privacy Review](docs/PRIVACY.md) and [Source Archive](docs/SOURCES.md).
-
-**The public rebuild passed offline image validation but has not been flashed
-or hardware-tested.** Runtime results below refer to the preceding build with
-the same driver/modem fixes. Treat this as an experimental pre-release.
+A local rebuild passed offline format/content checks but was not flashed or
+hardware-tested. The runtime results below refer to the preceding private
+build with the same driver/modem fixes. This remains an experimental port.
+See [Privacy Review](docs/PRIVACY.md) and [Build Inputs](docs/SOURCES.md).
 
 - `target/linux/sdx/`: target, board descriptions, image builder and kernel patches.
 - `package/`: custom modem tools, LuCI application and TFTP service integration.
 - `h5-patches/`: patches for the packages feed and their application script.
 - `h5-openwrt-25.12.6-bringup.patch`: complete overlay as a patch against vanilla OpenWrt.
-- `SHA256SUMS`: checksums of the patch, images, manifest and source archive.
+- `tools/h5-install-check.sh`: read-only first-install preflight for OpenWrt RAM boot.
+- `docs/STOCK_INSTALL.md`: stock-to-OpenWrt installation and recovery procedure.
+- `SHA256SUMS`: checksum of the exported patch, not a checksum of your own build.
 
 The repository layout is an overlay, **not** a complete OpenWrt checkout.
 Use the exported patch once; do not also copy the same overlay on top.
@@ -92,9 +89,9 @@ make -j"$(nproc)" CONFIG_KERNEL_CFLAGS="-ffile-prefix-map=$PWD=/build/openwrt -f
 
 The unused `luci-app-weechat` feed entry is removed to avoid a dependency cycle
 in the pinned feed snapshot. The seed sets the neutral kernel build identity.
-The build downloads original upstream sources. Release assets include those
-dependency sources; the Git overlay does not. Device-specific modem firmware
-is not distributed in either the images or the source archive.
+The build downloads the original upstream sources directly. Dependency source
+archives and prebuilt images are not uploaded to this repository or its releases.
+Device-specific modem firmware is read from the unit, not distributed here.
 
 Expected outputs in `bin/targets/sdx/generic/`:
 
@@ -111,13 +108,12 @@ not automatically byte-identical to the privately tested images.
 **Do not upload these files to the original GreenPacket web updater.**
 They are not vendor update packages. Incorrect NAND writes can brick the unit.
 
-First-time migration from stock is an advanced, device-specific procedure,
-not an automated installer supplied by this repository. Before replacing
-stock, obtain and verify your own device backups, establish a working RAM
-boot path, and independently test recovery. Backups exclude secure EFS and
-raw OOB and are not a full-chip clone. Never use another unit's calibration
-or identity partitions. The port depends on the unit's original signed
-modem firmware, which is read from its original read-only partition.
+For a first installation from stock, follow
+[Stock Installation](docs/STOCK_INSTALL.md). It covers stock access prerequisites,
+RAM boot, private backups, independent recovery verification, preflight and
+the final sysupgrade. The helper is deliberately check-only, not a one-click
+stock exploit or automatic flasher. Never use another unit's calibration or
+identity partitions. Original signed modem firmware stays on the device.
 
 For a device **already running this persistent CPE port**, use the
 `cpe-squashfs-sysupgrade.bin` image through LuCI's standard firmware upgrade,

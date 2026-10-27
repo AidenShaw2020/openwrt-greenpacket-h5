@@ -38,18 +38,24 @@ did not prevent application. The original build artifact manifest matched.
 
 The test applies patches without changing the build server's working sources.
 
-## Public Rebuild
+## Local Rebuild Candidate
 
 A clean kernel rebuild completed with exit code 0 using the same CPE profile
 and driver/modem fixes, a neutral builder/host identity, and compiler prefix
 mapping. Both images passed decompressed-content privacy checks and the
 existing production image validator. The NAND source file and Linux kernel
-configuration matched the preceding build. The corresponding-source archive
-passed a separate private-identifier scan and zstd integrity verification.
+configuration matched the preceding build. Images and dependency archives are
+not distributed; the project publishes its source overlay and build instructions.
 
-The public rebuild has not been flashed or hardware-tested; the runtime
+The local rebuild has not been flashed or hardware-tested; the runtime
 results above are evidence for the preceding build, not a new hardware test.
 No firmware write or configuration change was made to the running device.
+
+The generalized first-install check passed shell syntax and early-rejection
+tests for missing arguments, malformed checksums and a missing image. Its
+successful hardware path and the complete published stock installation guide
+have not been retested on a fresh stock device. It is check-only; the guide
+keeps the final sysupgrade as a separate manual command.
 
 ## Not Validated
 

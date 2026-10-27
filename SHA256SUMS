@@ -1,5 +1,1 @@
 76cea29dfc529aec07be2044aee0b3f5b377d4c0b279b7f52764127d698f20eb  h5-openwrt-25.12.6-bringup.patch
-3174914a50c3556b978e6a07457c57700bb673185fca37f8ab21014c74f9a5b8  openwrt-sdx-generic-greenpacket_h5-200q1-cpe-initramfs-kernel.bin
-adfb4b0f099188116af48f222a92ba87d1574a1dcaeca55981ab321c816cbd60  openwrt-sdx-generic-greenpacket_h5-200q1-cpe-squashfs-sysupgrade.bin
-af29dcbc399e12762067e89402bf347476d6459bd8ddee7d7907259ed03d1d6e  openwrt-sdx-generic-greenpacket_h5-200q1-cpe.manifest
-245c92f373f172bd5e6263ee962966af559c06138f8037aa86e9614f914a53af  openwrt-h5-25.12.6-corresponding-source.tar.zst

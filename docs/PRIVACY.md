@@ -22,17 +22,16 @@ The older decompressed kernels contained a private build account/hostname and
 absolute build paths. Therefore **neither original image is published**.
 The account, hostname, paths and raw audit logs are omitted from this report.
 
-The public release was rebuilt from a cleaned kernel build with neutral
+A local candidate was rebuilt from a cleaned kernel build with neutral
 `builder@buildhost` identity and compiler file/debug/macro prefix mapping.
 The same decompression and filesystem checks then reported zero findings for
 the new images. An additional production validator verified the boot headers,
 DTB, login setup, absence of the private debugging overlay, unset root password,
 modem tools, and persistent-root/sysupgrade support. No hardware flash was done.
 
-The corresponding-source snapshot was checked separately. Build paths in its
-saved configuration were mapped to /build/openwrt, stale private build notes
-were replaced with public notes, Git metadata and signing private keys were
-excluded, and the outer archive has neutral numeric ownership.
+Neither the rebuilt binaries nor the dependency-source snapshot is distributed.
+The project is source-only; local build and audit artifacts remain private.
+The source checks do not certify every possible future dependency or build.
 
 The audit distinguishes complete PEM key blocks from mere format strings in
 cryptographic libraries, actual random-seed files from the scripts that manage

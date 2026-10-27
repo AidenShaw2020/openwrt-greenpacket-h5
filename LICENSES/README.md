@@ -22,11 +22,10 @@ package's `PKG_LICENSE`/`PKG_LICENSE_FILES`, and the original source archives.
 The absence of a license notice in a binary image is not permission to
 redistribute it without satisfying all applicable source and notice duties.
 
-The binary pre-release includes a corresponding-source archive containing the
-pinned OpenWrt/feed trees, applied changes, configuration, original downloaded
-source archives and their upstream license texts. See ../docs/SOURCES.md.
-No device-specific proprietary modem firmware is distributed. Anyone
-redistributing or changing these binaries must preserve the applicable source,
-notice and license obligations. Merely linking this overlay is not a substitute
-for corresponding source for the complete firmware. No trademark rights or
-vendor endorsement are granted.
+This project distributes only its source overlay, patches and documentation,
+not compiled images or bundled dependency archives. See ../docs/SOURCES.md.
+No device-specific proprietary modem firmware is distributed. Anyone building
+and redistributing binaries must preserve the applicable source, notice and
+license obligations. Merely linking this overlay is not a substitute for
+corresponding source for the complete firmware. No trademark rights or vendor
+endorsement are granted.

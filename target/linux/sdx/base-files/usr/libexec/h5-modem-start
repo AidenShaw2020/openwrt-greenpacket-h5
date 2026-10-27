@@ -1,0 +1,65 @@
+#!/bin/sh
+# Start the upstream drivers using the existing stock read-only firmware volume.
+set -eu
+[ "$(cat /tmp/sysinfo/board_name)" = greenpacket,h5-200q1 ] || exit 0
+[ "$(uci -q get h5-modem.main.enabled)" = 1 ] || exit 0
+[ -f "/lib/modules/$(uname -r)/ipa.ko" ] || exit 0
+if [ -f /sys/class/remoteproc/remoteproc0/state ] &&
+   [ "$(cat /sys/class/remoteproc/remoteproc0/state)" = running ]; then
+	exit 0
+fi
+
+# This bring-up profile must never let UBI write to the original firmware.
+[ "$(cat /sys/class/mtd/mtd30/name)" = modem ]
+[ "$(cat /sys/class/mtd/mtd30/size)" = 120586240 ]
+flags="$(cat /sys/class/mtd/mtd30/flags)"
+[ $((flags & 0x400)) -eq 0 ]
+find_firmware_ubi() {
+	for path in /sys/class/ubi/ubi[0-9]*; do
+		[ -f "$path/mtd_num" ] || continue
+		[ "$(cat "$path/mtd_num")" = 30 ] || continue
+		basename "$path"
+		return 0
+	done
+	return 1
+}
+ubi="$(find_firmware_ubi)" || {
+	ubiattach -m 30 /dev/ubi_ctrl
+	ubi="$(find_firmware_ubi)"
+}
+[ "$(cat "/sys/class/ubi/${ubi}_0/name")" = modem ]
+block="/dev/ubiblock${ubi#ubi}_0"
+[ -b "$block" ] || ubiblock -c "/dev/${ubi}_0"
+mkdir -p /mnt/h5-stock-firmware /lib/firmware/greenpacket-h5
+grep -q ' /mnt/h5-stock-firmware ' /proc/mounts ||
+	mount -t squashfs -o ro,nodev,nosuid,noexec "$block" /mnt/h5-stock-firmware
+grep -q ' /lib/firmware/greenpacket-h5 ' /proc/mounts ||
+	mount -o bind /mnt/h5-stock-firmware/image /lib/firmware/greenpacket-h5
+printf '%s\n' '4bc2dede57fa1950e51899443c1a1683db9415aa980f09567d2a1a0881650359  /lib/firmware/greenpacket-h5/modem.mdt' |
+	sha256sum -c -
+
+# Cache runtime support files before MPSS starts. NAND/BAM hardware locking
+# also serializes shared accesses, while this cache avoids repeated flash
+# reads during modem registration. PAS loads signed segments before reset
+# is released.
+support=/tmp/h5-modem-firmware
+mkdir -p "$support"
+if ! grep -q ' /lib/firmware/greenpacket-h5/modem_pr ' /proc/mounts; then
+	cp -a /mnt/h5-stock-firmware/image/modem_pr "$support/"
+	mount -o bind "$support/modem_pr" /lib/firmware/greenpacket-h5/modem_pr
+fi
+
+modprobe smp2p
+modprobe qcom_q6v5_pas
+modprobe ipa
+[ "$(cat /sys/class/remoteproc/remoteproc0/name)" = 4080000.remoteproc ]
+echo disabled > /sys/class/remoteproc/remoteproc0/recovery
+echo disabled > /sys/class/remoteproc/remoteproc0/coredump
+# Discover remoteproc's firmware directory after PAS registration, before boot.
+/etc/init.d/tqftpserv restart
+sleep 1
+echo start > /sys/class/remoteproc/remoteproc0/state
+if [ -f "/lib/modules/$(uname -r)/rpmsg_char.ko" ]; then
+	/usr/libexec/h5-at-bind || logger -t h5-modem 'DS AT endpoint binding failed'
+fi
+logger -t h5-modem 'Modem started with upstream drivers and local read-only stock firmware'

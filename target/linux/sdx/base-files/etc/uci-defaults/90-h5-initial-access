@@ -1,0 +1,22 @@
+#!/bin/sh
+# User-requested fresh-install defaults. Existing configured passwords survive.
+case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+	greenpacket,h5-200q1) ;;
+	*) exit 0 ;;
+esac
+root_hash="$(sed -n 's/^root:\([^:]*\):.*/\1/p' /etc/shadow)"
+case "$root_hash" in
+	''|'!'|'*')
+	passwd -d root >/dev/null 2>&1
+	;;
+esac
+uci set system.@system[0].ttylogin='1'
+uci commit system
+uci -q batch <<'EOF'
+set dropbear.@dropbear[0].PasswordAuth='on'
+set dropbear.@dropbear[0].RootPasswordAuth='on'
+set uhttpd.main.redirect_https='0'
+commit dropbear
+commit uhttpd
+EOF
+exit 0

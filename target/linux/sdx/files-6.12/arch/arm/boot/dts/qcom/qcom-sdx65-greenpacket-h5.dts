@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/dts-v1/;
+
+#include "qcom-sdx65.dtsi"
+#include <arm64/qcom/pmk8350.dtsi>
+#include "pmx65.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/ {
+	model = "GreenPacket H5-200Q1";
+	compatible = "greenpacket,h5-200q1", "qcom,sdx65";
+	qcom,msm-id = <458 0x20000>, <483 0x20000>, <509 0x20000>;
+	qcom,board-id = <0x4010008 0x204>;
+
+	/* ABL normally fills this in; direct RAM boot must be self-contained. */
+	memory {
+		reg = <0x80000000 0x20000000>;
+	};
+
+	aliases {
+		serial0 = &blsp1_uart3;
+		led-boot = &led_system_blue;
+		led-failsafe = &led_system_red;
+		led-running = &led_system_blue;
+		led-upgrade = &led_system_red;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&reset_button_default>;
+
+		/* Stock turin_reset: TLMM GPIO32, active low, pulled high. */
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&tlmm 32 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&system_led_default>;
+
+		/* GPIO18 is physically blue on this H5 (stock calls it green). */
+		led_system_blue: led-system {
+			label = "blue:system";
+			gpios = <&tlmm 18 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+			default-state = "on";
+		};
+
+		led_system_red: led-system-red {
+			label = "red:system";
+			gpios = <&tlmm 63 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-ethernet {
+			label = "h5:ethernet";
+			gpios = <&tlmm 17 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-4g {
+			label = "h5:4g";
+			gpios = <&tlmm 16 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+
+		led-5g {
+			label = "h5:5g";
+			gpios = <&tlmm 19 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
+
+	reserved-memory {
+		/* Preserve the carveouts captured from the stock H5 DT. */
+		audio_mem: memory@8c000000 {
+			reg = <0x8c000000 0x400000>;
+			no-map;
+		};
+
+		mpss_dsm: memory@8c400000 {
+			reg = <0x8c400000 0x3200000>;
+			no-map;
+		};
+
+		ipa_fw_mem: memory@8fced000 {
+			reg = <0x8fced000 0x10000>;
+			no-map;
+		};
+
+		mpss_adsp_mem: memory@90800000 {
+			reg = <0x90800000 0xf800000>;
+			no-map;
+		};
+	};
+};
+
+&access_control_mem {
+	reg = <0x8fd80000 0x40000>;
+};
+
+&apps_smmu {
+	status = "disabled";
+};
+
+&blsp1_uart3 {
+	status = "okay";
+};
+
+&tlmm {
+	reset_button_default: reset-button-default-state {
+		pins = "gpio32";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	system_led_default: system-led-default-state {
+		pins = "gpio16", "gpio17", "gpio18", "gpio19", "gpio63";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+/* This initial RAM bring-up description does not enable flash or the modem. */
+&ipa {
+	status = "disabled";
+};
+
+&pcie_ep {
+	status = "disabled";
+};
+
+&qpic_bam {
+	status = "disabled";
+};
+
+&qpic_nand {
+	status = "disabled";
+};
+
+&remoteproc_mpss {
+	status = "disabled";
+};

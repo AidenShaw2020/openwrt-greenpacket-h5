@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "qcom-sdx65-greenpacket-h5-ipa.dts"
+
+/ {
+	/* Keep the first compatible stable for normal OpenWrt board detection. */
+	compatible = "greenpacket,h5-200q1", "greenpacket,h5-200q1-openwrt", "qcom,sdx65";
+};
+
+&{/soc/sram@1468f000} {
+	reboot-mode {
+		compatible = "syscon-reboot-mode";
+		offset = <0x65c>;
+		/* Verified against this H5's original restart driver. */
+		mode-normal = <0x77665501>;
+		mode-bootloader = <0x77665500>;
+		mode-recovery = <0x77665502>;
+	};
+};
+
+/* Match this board's original SCM download-mode register at 0x01fd3000.
+ * The upstream SCM driver clears it on orderly shutdown. Without the DT
+ * address it may leave an inherited download-mode request untouched.
+ */
+&{/firmware/scm} {
+	qcom,dload-mode = <&tcsr 0x13000>;
+};
+
+&tcsr {
+	reg = <0x01fc0000 0x30000>;
+};

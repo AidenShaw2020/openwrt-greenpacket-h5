@@ -1,0 +1,6 @@
+#!/bin/sh /etc/rc.common
+START=78
+
+start() {
+	/usr/libexec/h5-modem-start || logger -t h5-modem 'Modem startup failed; LAN management remains available'
+}

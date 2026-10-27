@@ -1,0 +1,28 @@
+#!/bin/sh
+# Drive only the radio LEDs; modem control remains with ModemManager/netifd.
+set_led() {
+	local path="/sys/class/leds/h5:$1/brightness"
+	[ -w "$path" ] && echo "$2" > "$path"
+}
+trap 'set_led 4g 0; set_led 5g 0; exit 0' TERM INT
+while :; do
+	info="$(mmcli -m any --output-keyvalue 2>/dev/null)"
+	state="$(printf '%s\n' "$info" | sed -n 's/^modem.generic.state *: *//p')"
+	tech="$(printf '%s\n' "$info" | sed -n \
+		-e 's/^modem.generic.access-technologies *: *//p' \
+		-e 's/^modem.generic.access-technologies.value\[[0-9][0-9]*\] *: *//p')"
+	lte=0
+	nr=0
+	case "$state" in
+		registered|connecting|connected)
+			case "$tech" in
+				*5gnr*) nr=1 ;;
+				*lte*) lte=1 ;;
+			esac
+			;;
+	esac
+	set_led 4g "$lte"
+	set_led 5g "$nr"
+	sleep 10 &
+	wait $!
+done

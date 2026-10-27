@@ -1,0 +1,36 @@
+#!/bin/sh
+# rpcd exec plugin. Authentication and method ACLs are enforced by rpcd.
+. /usr/share/libubox/jshn.sh
+helper=/usr/libexec/h5-at
+
+run_query() {
+	result=$("$helper" "$@") || :
+	if json_load "$result" 2>/dev/null; then
+		printf '%s\n' "$result"
+	else
+		printf '%s\n' '{"ok":false,"error":"modem-unavailable"}'
+	fi
+}
+
+case "$1" in
+list)
+	printf '%s\n' '{"status":{},"capabilities":{},"lock_lte":{"earfcn":"String","pci":"String"},"unlock_lte":{},"lock_nr":{"pci":"String","arfcn":"String","scs":"String","band":"String"},"unlock_nr":{}}'
+	;;
+call)
+	read -r request
+	json_load "$request" 2>/dev/null || exit 1
+	case "$2" in
+	status|capabilities) run_query "$2" ;;
+	unlock_lte) run_query unlock-lte ;;
+	unlock_nr) run_query unlock-nr ;;
+	lock_lte)
+		json_get_vars earfcn pci
+		run_query lock-lte "$earfcn" "$pci"
+		;;
+	lock_nr)
+		json_get_vars pci arfcn scs band
+		run_query lock-nr "$pci" "$arfcn" "$scs" "$band"
+		;;
+	esac
+	;;
+esac

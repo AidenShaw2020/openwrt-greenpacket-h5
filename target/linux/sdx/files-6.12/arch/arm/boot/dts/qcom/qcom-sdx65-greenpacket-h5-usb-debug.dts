@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Experimental, RAM-only USB console. Flash and modem remain disabled. */
+#include "qcom-sdx65-greenpacket-h5-pcie.dts"
+
+&{/chosen} {
+	bootargs = "console=ttyGS0,115200n8 loglevel=7";
+};
+
+&apps_rsc {
+	regulators {
+		/* Actual H5 stock DT: PMX65 L5 = 1.8 V, L10 = 3.088 V. */
+		usb_vdda18: ldo5 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		usb_vdda33: ldo10 {
+			regulator-min-microvolt = <3088000>;
+			regulator-max-microvolt = <3088000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+&usb {
+	status = "okay";
+};
+
+&usb_dwc3 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	phys = <&usb_hsphy>, <&usb_qmpphy>;
+	phy-names = "usb2-phy", "usb3-phy";
+};
+
+&usb_qmpphy {
+	/* Actual stock DT: shared PMX65 L4 and L1 rails. */
+	vdda-phy-supply = <&pcie_vdda_pll>;
+	vdda-pll-supply = <&pcie_vdda_phy>;
+	status = "okay";
+};
+
+&gcc {
+	clocks = <&rpmhcc RPMH_CXO_CLK>, <&rpmhcc RPMH_CXO_CLK_A>,
+		 <&sleep_clk>, <&pcie_phy>, <&usb_qmpphy>;
+};
+
+&usb_hsphy {
+	/* Stock H5 uses the same L4, L5 and L10 rails as upstream SDX65. */
+	vdda-pll-supply = <&pcie_vdda_pll>;
+	vdda18-supply = <&usb_vdda18>;
+	vdda33-supply = <&usb_vdda33>;
+	status = "okay";
+};

@@ -1,0 +1,20 @@
+diff --git a/net/modemmanager/patches/0005-port-qmi-preserve-ipa-map-headroom.patch b/net/modemmanager/patches/0005-port-qmi-preserve-ipa-map-headroom.patch
+new file mode 100644
+--- /dev/null
++++ b/net/modemmanager/patches/0005-port-qmi-preserve-ipa-map-headroom.patch
+@@ -0,0 +1,15 @@
++Subject: [PATCH] port-qmi: preserve MAP transport headroom on IPA reset
++
++--- a/src/mm-port-qmi.c
+++++ b/src/mm-port-qmi.c
++@@ -1007,6 +1007,10 @@
++     /* mhi_net has a custom default MTU set by the kernel driver */
++     if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
++         mtu = MHI_NET_MTU_DEFAULT;
+++    else if (g_strcmp0 (self->priv->net_driver, "ipa") == 0)
+++        /* The RMNET upper device needs room for the MAP header and
+++         * optional uplink checksum header (four bytes each). */
+++        mtu = MM_PORT_NET_MTU_DEFAULT + 8;
++     else
++         mtu = MM_PORT_NET_MTU_DEFAULT;
++ 

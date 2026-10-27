@@ -1,0 +1,13 @@
+--- a/drivers/mtd/nand/raw/qcom_nandc.c
++++ b/drivers/mtd/nand/raw/qcom_nandc.c
+@@ -2186,6 +2186,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* H5 RAM bring-up: expose all NAND partitions read-only. */
++	if (of_machine_is_compatible("greenpacket,h5-200q1"))
++		mtd->flags &= ~MTD_WRITEABLE;
++
+ 	ret = mtd_device_parse_register(mtd, probes, NULL, NULL, 0);
+ 	if (ret)
+ 		goto err;

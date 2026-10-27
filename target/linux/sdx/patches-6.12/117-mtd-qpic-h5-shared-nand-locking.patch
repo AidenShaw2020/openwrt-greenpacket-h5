@@ -1,0 +1,31 @@
+Subject: [PATCH] mtd: qpic: serialize H5 NAND command batches with modem access
+
+--- a/drivers/mtd/nand/qpic_common.c
++++ b/drivers/mtd/nand/qpic_common.c
+@@ -538,6 +538,26 @@
+ 	struct bam_transaction *bam_txn = nandc->bam_txn;
+ 	int ret = 0;
+ 
++	if (nandc->props->supports_bam &&
++	    of_machine_is_compatible("greenpacket,h5-200q1")) {
++		/* A masked write to ADDR0 preserves it; VERSION is unsafe on H5. */
++		struct bam_config lock_cfg = {
++			.lock_scratchpad_addr = nandc_reg_phys(nandc, NAND_ADDR0),
++			.lock_write_mask = 0,
++		};
++		struct dma_slave_config cfg = {
++			.direction = DMA_MEM_TO_DEV,
++			.src_maxburst = 16,
++			.dst_maxburst = 16,
++			.peripheral_config = &lock_cfg,
++			.peripheral_size = sizeof(lock_cfg),
++		};
++
++		ret = dmaengine_slave_config(nandc->cmd_chan, &cfg);
++		if (ret)
++			goto err_unmap_free_desc;
++	}
++
+ 	if (nandc->props->supports_bam) {
+ 		if (bam_txn->rx_sgl_pos > bam_txn->rx_sgl_start) {
+ 			ret = qcom_prepare_bam_async_desc(nandc, nandc->rx_chan, 0);

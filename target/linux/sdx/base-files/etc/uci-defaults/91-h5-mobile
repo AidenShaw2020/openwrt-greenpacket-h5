@@ -1,0 +1,23 @@
+#!/bin/sh
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
+[ -x /usr/bin/mmcli ] || exit 0
+if ! uci -q get network.mobile >/dev/null; then
+	uci -q batch <<'EOF'
+set network.mobile=interface
+set network.mobile.proto='modemmanager'
+set network.mobile.device='qcom-soc'
+set network.mobile.iptype='ipv4v6'
+set network.mobile.auto='1'
+set network.mobile.force_connection='0'
+commit network
+EOF
+fi
+# Standard WAN firewall policy also applies to the cellular bearer.
+for zone in $(uci show firewall | sed -n 's/^\(firewall\.[^=]*\)=zone$/\1/p'); do
+	[ "$(uci -q get "$zone.name")" = wan ] || continue
+	case " $(uci -q get "$zone.network") " in
+		*' mobile '*) ;;
+		*) uci add_list "$zone.network=mobile"; uci commit firewall ;;
+	esac
+done
+exit 0

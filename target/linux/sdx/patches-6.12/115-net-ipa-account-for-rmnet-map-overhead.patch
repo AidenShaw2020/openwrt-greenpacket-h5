@@ -1,0 +1,20 @@
+Subject: [PATCH] net: ipa: account for MAP overhead in transport MTU
+
+The IPA network device carries MAP frames from the RMNET upper device.
+Limiting the transport to an IP MTU of 1500 causes RMNET to reject the
+1500-byte MTU supplied by the network, because its MAP header must fit too.
+Keep the IP payload limit unchanged and allow the transport header space.
+
+--- a/drivers/net/ipa/ipa_modem.c
++++ b/drivers/net/ipa/ipa_modem.c
+@@ -228,7 +228,9 @@ static void ipa_modem_netdev_setup(struct net_device *netdev)
+ 	netdev->hard_header_len = 0;
+ 	netdev->min_header_len = ETH_HLEN;
+ 	netdev->min_mtu = ETH_MIN_MTU;
+-	netdev->max_mtu = IPA_MTU;
++	/* RMNET validates the IP MTU plus its MAP transport headers. */
++	netdev->max_mtu = IPA_MTU + sizeof(struct rmnet_map_header) +
++			  sizeof(struct rmnet_map_ul_csum_header);
+ 	netdev->mtu = netdev->max_mtu;
+ 	netdev->addr_len = 0;
+ 	netdev->tx_queue_len = DEFAULT_TX_QUEUE_LEN;

@@ -1,0 +1,35 @@
+From: Gabor Juhos <j4g8y7@gmail.com>
+Subject: [PATCH] mtd: rawnand: qcom: fix read location register usage in config_nand_cw_read()
+
+On QPIC v2 the last codeword uses its own read-location registers.
+The v6.14 cleanup backported by OpenWrt selects the last-codeword values
+but writes them to the ordinary register bank. On H5 the modem changes
+the shared last-codeword registers at startup, exposing stale page tails.
+
+Backport the upstream fix without changing BAM completion or locking.
+Link: https://lore.kernel.org/r/20260928-qcom_nandc-config_nand_cw_read-fix-v1-1-98edccaaea0f@gmail.com
+Fixes: 8c52932da5e6 ("mtd: rawnand: qcom: cleanup qcom_nandc driver")
+Signed-off-by: Gabor Juhos <j4g8y7@gmail.com>
+---
+--- a/drivers/mtd/nand/raw/qcom_nandc.c
++++ b/drivers/mtd/nand/raw/qcom_nandc.c
+@@ -328,14 +328,16 @@ config_nand_cw_read(struct nand_chip *chip, bool use_ecc, int cw)
+ {
+ 	struct qcom_nand_controller *nandc = get_qcom_nand_controller(chip);
+ 	struct nand_ecc_ctrl *ecc = &chip->ecc;
+-
+ 	__le32 *reg = &nandc->regs->read_location0;
++	int reg_base = NAND_READ_LOCATION_0;
+ 
+-	if (nandc->props->qpic_version2 && qcom_nandc_is_last_cw(ecc, cw))
++	if (nandc->props->qpic_version2 && qcom_nandc_is_last_cw(ecc, cw)) {
+ 		reg = &nandc->regs->read_location_last0;
++		reg_base = NAND_READ_LOCATION_LAST_CW_0;
++	}
+ 
+ 	if (nandc->props->supports_bam)
+-		qcom_write_reg_dma(nandc, reg, NAND_READ_LOCATION_0, 4, NAND_BAM_NEXT_SGL);
++		qcom_write_reg_dma(nandc, reg, reg_base, 4, NAND_BAM_NEXT_SGL);
+ 
+ 	qcom_write_reg_dma(nandc, &nandc->regs->cmd, NAND_FLASH_CMD, 1, NAND_BAM_NEXT_SGL);
+ 	qcom_write_reg_dma(nandc, &nandc->regs->exec, NAND_EXEC_CMD, 1, NAND_BAM_NEXT_SGL);

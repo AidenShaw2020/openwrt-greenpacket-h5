@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* RAM comparison with the PCIe service policy captured from H5 stock. */
+#include "qcom-sdx65-greenpacket-h5-usb-debug.dts"
+
+&{/chosen} {
+	bootargs = "console=ttyGS0,115200n8 loglevel=7 pcie_ports=compat pci=pcie_bus_safe";
+};

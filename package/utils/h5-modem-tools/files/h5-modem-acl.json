@@ -1,0 +1,11 @@
+{
+  "luci-app-h5-modem": {
+    "description": "Read H5 radio measurements and configure cell locking",
+    "read": {
+      "ubus": { "h5modem": [ "status", "capabilities" ] }
+    },
+    "write": {
+      "ubus": { "h5modem": [ "lock_lte", "unlock_lte", "lock_nr", "unlock_nr" ] }
+    }
+  }
+}

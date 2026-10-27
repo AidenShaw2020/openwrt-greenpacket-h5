@@ -1,0 +1,63 @@
+--- a/drivers/net/ipa/ipa_qmi.c
++++ b/drivers/net/ipa/ipa_qmi.c
+@@ -1,3 +1,4 @@
++#include <linux/of.h>
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ /* Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
+@@ -299,6 +300,9 @@
+ 
+ 	req.platform_type_valid = 1;
+ 	req.platform_type = IPA_QMI_PLATFORM_TYPE_MSM_ANDROID;
++	/* Stock H5 uses platform type 6 for its integrated MHI-mode modem. */
++	if (of_machine_is_compatible("greenpacket,h5-200q1"))
++		req.platform_type = 6;
+ 
+ 	mem = ipa_mem_find(ipa, IPA_MEM_MODEM_HEADER);
+ 	if (mem->size) {
+@@ -476,6 +480,7 @@
+ 	int ret;
+ 
+ 	ipa_qmi->initial_boot = true;
++	ipa_qmi->uc_ready = ipa->uc_loaded;
+ 
+ 	/* The server handle is used to handle the DRIVER_INIT_COMPLETE
+ 	 * request on the first modem boot.  It also receives the
+--- a/drivers/net/ipa/ipa_uc.c
++++ b/drivers/net/ipa/ipa_uc.c
+@@ -1,3 +1,4 @@
++#include <linux/of.h>
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ /* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
+@@ -188,6 +189,21 @@
+ 	ipa->uc_loaded = false;
+ 	ipa_interrupt_enable(ipa, IPA_IRQ_UC_0);
+ 	ipa_interrupt_enable(ipa, IPA_IRQ_UC_1);
++	if (of_machine_is_compatible("greenpacket,h5-200q1")) {
++		struct ipa_uc_mem_area *shared = ipa_uc_shared(ipa);
++		u8 response = READ_ONCE(shared->response);
++		u16 version = le16_to_cpu(READ_ONCE(shared->interface_version));
++
++		/* Preserve the uC loaded by this board's boot firmware. A completed
++		 * command and matching ABI distinguish it from uninitialized SRAM.
++		 */
++		if (version == 0x1f &&
++		    (response == IPA_UC_RESPONSE_INIT_COMPLETED ||
++		     response == IPA_UC_RESPONSE_CMD_COMPLETED)) {
++			ipa->uc_loaded = true;
++			ipa_power_retention(ipa, true);
++		}
++	}
+ }
+ 
+ /* Inverse of ipa_uc_config() */
+@@ -214,7 +230,7 @@
+ 	static bool already;
+ 	int ret;
+ 
+-	if (already)
++	if (already || ipa->uc_loaded)
+ 		return;
+ 	already = true;		/* Only do this on first boot */
+ 

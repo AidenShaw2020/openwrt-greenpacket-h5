@@ -1,0 +1,38 @@
+#!/bin/sh
+# Use the upstream persistent default endpoint, outside MM's WWAN probing.
+set -eu
+[ "$(cat /tmp/sysinfo/board_name)" = greenpacket,h5-200q1 ] || exit 0
+[ "$(cat /sys/class/remoteproc/remoteproc0/state)" = running ] || exit 1
+modprobe rpmsg_char
+
+for n in $(seq 1 10); do
+	count=0
+	for p in /sys/bus/rpmsg/devices/*; do
+		[ -f "$p/name" ] || continue
+		[ "$(cat "$p/name")" = DS ] || continue
+		count=$((count + 1))
+		ds="$p"
+	done
+	[ "$count" = 1 ] && break
+	[ "$count" = 0 ] || exit 1
+	sleep 1
+done
+[ "$count" = 1 ] || exit 1
+if [ -e "$ds/driver" ]; then
+	[ "$(basename "$(readlink "$ds/driver")")" = rpmsg_chrdev ] || exit 1
+else
+	printf '%s\n' rpmsg_chrdev >"$ds/driver_override"
+	printf '%s\n' "${ds##*/}" >/sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
+fi
+for n in $(seq 1 10); do
+	for p in /sys/class/rpmsg/rpmsg[0-9]*; do
+		[ -f "$p/name" ] || continue
+		[ "$(cat "$p/name")" = DS ] || continue
+		[ -c "/dev/${p##*/}" ] || continue
+		chmod 600 "/dev/${p##*/}"
+		ln -sf "/dev/${p##*/}" /dev/h5-at
+		exit 0
+	done
+	sleep 1
+done
+exit 1

@@ -1,0 +1,17 @@
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -1,3 +1,4 @@
++#include <linux/of.h>
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Qualcomm ADSP/SLPI Peripheral Image Loader for MSM8974 and MSM8996
+@@ -722,6 +723,9 @@
+ 	}
+ 
+ 	rproc->auto_boot = desc->auto_boot;
++	/* Firmware must first be made available by the H5 RAM bring-up. */
++	if (of_machine_is_compatible("greenpacket,h5-200q1"))
++		rproc->auto_boot = false;
+ 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
+ 
+ 	adsp = rproc->priv;

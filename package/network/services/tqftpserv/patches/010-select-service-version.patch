@@ -1,0 +1,55 @@
+Subject: [PATCH] tqftpserv: allow selecting the QRTR service version
+
+Quectel RG520N OpenCPU firmware on GreenPacket H5 requests TFTP service
+4096 version 3. Without that registration no modem_pr files are fetched,
+band capabilities remain empty and DMS ONLINE fails with DeviceNotReady.
+Keep upstream version 1 as the default for other platforms.
+
+--- a/tqftpserv.c
++++ b/tqftpserv.c
+@@ -916,13 +916,16 @@
+ {
+ 	extern const char *__progname;
+ 
+-	fprintf(stderr, "Usage: %s [-d] [-h]\n", __progname);
++	fprintf(stderr, "Usage: %s [-d] [-h] [-v version]\n", __progname);
+ 	fprintf(stderr, " -d\tPrint detailed debug information\n");
+ 	fprintf(stderr, " -h\tPrint this usage info\n");
++	fprintf(stderr, " -v\tQRTR service version (1-255, default 1)\n");
+ }
+ 
+ int main(int argc, char **argv)
+ {
++	unsigned long service_version = 1;
++	char *end;
+ 	struct tftp_client *client;
+ 	struct tftp_client *next;
+ 	struct sockaddr_qrtr sq;
+@@ -937,8 +940,17 @@
+ 	int ret;
+ 	int fd;
+ 
+-	while ((opt = getopt(argc, argv, "dh")) != -1) {
++	while ((opt = getopt(argc, argv, "dhv:")) != -1) {
+ 		switch (opt) {
++		case 'v':
++			errno = 0;
++			service_version = strtoul(optarg, &end, 10);
++			if (errno || end == optarg || *end ||
++			    service_version < 1 || service_version > 255) {
++				fprintf(stderr, "Invalid QRTR service version\n");
++				return 1;
++			}
++			break;
+ 		case 'd':
+ 			tftp_debug = true;
+ 			break;
+@@ -962,7 +974,7 @@
+ 		exit(1);
+ 	}
+ 
+-	ret = qrtr_publish(fd, 4096, 1, 0);
++	ret = qrtr_publish(fd, 4096, service_version, 0);
+ 	if (ret < 0) {
+ 		fprintf(stderr, "failed to publish service registry service\n");
+ 		exit(1);

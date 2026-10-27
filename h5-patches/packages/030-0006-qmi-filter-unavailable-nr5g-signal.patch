@@ -1,0 +1,42 @@
+diff --git a/net/modemmanager/patches/0006-qmi-filter-unavailable-nr5g-signal.patch b/net/modemmanager/patches/0006-qmi-filter-unavailable-nr5g-signal.patch
+new file mode 100644
+--- /dev/null
++++ b/net/modemmanager/patches/0006-qmi-filter-unavailable-nr5g-signal.patch
+@@ -0,0 +1,37 @@
++Subject: [PATCH] qmi: omit unavailable NR signal measurements
++
++--- a/src/mm-broadband-modem-qmi.c
+++++ b/src/mm-broadband-modem-qmi.c
++@@ -6284,9 +6284,14 @@
++                                                                        &rsrp,
++                                                                        &snr,
++                                                                        NULL))) {
++-        *out_nr5g = mm_signal_new ();
++-        mm_signal_set_rsrp (*out_nr5g, (gdouble)rsrp);
++-        mm_signal_set_snr (*out_nr5g, (0.1) * ((gdouble)snr));
+++        /* Quectel reports INT16_MIN when an NR measurement is unavailable. */
+++        if (rsrp != G_MININT16 || snr != G_MININT16) {
+++            *out_nr5g = mm_signal_new ();
+++            if (rsrp != G_MININT16)
+++                mm_signal_set_rsrp (*out_nr5g, (gdouble)rsrp);
+++            if (snr != G_MININT16)
+++                mm_signal_set_snr (*out_nr5g, (0.1) * ((gdouble)snr));
+++        }
++     }
++ 
++     if ((response_output &&
++@@ -6297,9 +6302,11 @@
++          qmi_indication_nas_signal_info_output_get_5g_signal_strength_extended (indication_output,
++                                                                                 &rsrq_5g,
++                                                                                 NULL))) {
++-        if (G_UNLIKELY (!*out_nr5g))
++-            *out_nr5g = mm_signal_new ();
++-        mm_signal_set_rsrq (*out_nr5g, (gdouble)rsrq_5g);
+++        if (rsrq_5g != G_MININT16) {
+++            if (G_UNLIKELY (!*out_nr5g))
+++                *out_nr5g = mm_signal_new ();
+++            mm_signal_set_rsrq (*out_nr5g, (gdouble)rsrq_5g);
+++        }
++     }
++ }
++ 

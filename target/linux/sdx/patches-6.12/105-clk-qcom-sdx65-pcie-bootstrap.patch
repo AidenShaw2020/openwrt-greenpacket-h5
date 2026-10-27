@@ -1,0 +1,87 @@
+--- a/drivers/clk/qcom/gcc-sdx65.c
++++ b/drivers/clk/qcom/gcc-sdx65.c
+@@ -19,6 +19,7 @@
+ #include "clk-regmap.h"
+ #include "clk-regmap-divider.h"
+ #include "clk-regmap-mux.h"
++#include "clk-regmap-phy-mux.h"
+ #include "common.h"
+ #include "gdsc.h"
+ #include "reset.h"
+@@ -115,16 +116,6 @@
+ 	{ P_BI_TCXO, 2 },
+ };
+ 
+-static const struct parent_map gcc_parent_map_5[] = {
+-	{ P_PCIE_PIPE_CLK, 0 },
+-	{ P_BI_TCXO, 2 },
+-};
+-
+-static const struct clk_parent_data gcc_parent_data_5[] = {
+-	{ .fw_name = "pcie_pipe_clk"},
+-	{ .fw_name = "bi_tcxo"},
+-};
+-
+ static const struct parent_map gcc_parent_map_6[] = {
+ 	{ P_USB3_PHY_WRAPPER_GCC_USB30_PIPE_CLK, 0 },
+ 	{ P_BI_TCXO, 2 },
+@@ -152,17 +143,16 @@
+ 	},
+ };
+ 
+-static struct clk_regmap_mux gcc_pcie_pipe_clk_src = {
++static struct clk_regmap_phy_mux gcc_pcie_pipe_clk_src = {
+ 	.reg = 0x43044,
+-	.shift = 0,
+-	.width = 2,
+-	.parent_map = gcc_parent_map_5,
+-	.clkr = {
+-		.hw.init = &(struct clk_init_data){
++	.clkr = {
++		.hw.init = &(const struct clk_init_data){
+ 			.name = "gcc_pcie_pipe_clk_src",
+-			.parent_data = gcc_parent_data_5,
+-			.num_parents = 2,
+-			.ops = &clk_regmap_mux_closest_ops,
++			.parent_data = &(const struct clk_parent_data){
++				.fw_name = "pcie_pipe_clk",
++			},
++			.num_parents = 1,
++			.ops = &clk_regmap_phy_mux_ops,
+ 		},
+ 	},
+ };
+@@ -666,6 +656,7 @@
+ 		.enable_mask = BIT(0),
+ 		.hw.init = &(struct clk_init_data){
+ 			.name = "gcc_ahb_pcie_link_clk",
++			.flags = CLK_IS_CRITICAL,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},
+@@ -1429,6 +1420,7 @@
+ 		.enable_mask = BIT(0),
+ 		.hw.init = &(struct clk_init_data){
+ 			.name = "gcc_xo_pcie_link_clk",
++			.flags = CLK_IS_CRITICAL,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},
+@@ -1580,6 +1572,17 @@
+ 	regmap_update_bits(regmap, 0x6d008, BIT(21), BIT(21)); /* GCC_CPUSS_AHB_CLK */
+ 	regmap_update_bits(regmap, 0x6d008, BIT(22), BIT(22)); /* GCC_CPUSS_GNOC_CLK */
+ 
++	/* Stock SDX65 keeps both PCIe link-interface clocks critical. They
++	 * must be running before accessing the pipe mux and GDSC registers.
++	 */
++	qcom_branch_set_clk_en(regmap, 0x2e004); /* GCC_AHB_PCIE_LINK_CLK */
++	qcom_branch_set_clk_en(regmap, 0x2e008); /* GCC_XO_PCIE_LINK_CLK */
++
++	/* Bootstrap the GDSC on XO. The PHY mux switches to the QMP pipe
++	 * source when its consumer enables it, and back to XO on disable.
++	 */
++	regmap_update_bits(regmap, 0x43044, GENMASK(1, 0), 2);
++
+ 	return qcom_cc_really_probe(&pdev->dev, &gcc_sdx65_desc, regmap);
+ }
+ 

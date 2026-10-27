@@ -1,0 +1,36 @@
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -1853,6 +1853,7 @@
+ 	{ .compatible = "qcom,pcie-sc8280xp", .data = &cfg_sc8280xp },
+ 	{ .compatible = "qcom,pcie-sdm845", .data = &cfg_2_7_0 },
+ 	{ .compatible = "qcom,pcie-sdx55", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sdx65", .data = &cfg_1_9_0 },
+ 	{ .compatible = "qcom,pcie-sm8150", .data = &cfg_1_9_0 },
+ 	{ .compatible = "qcom,pcie-sm8250", .data = &cfg_1_9_0 },
+ 	{ .compatible = "qcom,pcie-sm8350", .data = &cfg_1_9_0 },
+--- a/Documentation/devicetree/bindings/pci/qcom,pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/qcom,pcie.yaml
+@@ -30,6 +30,7 @@
+           - qcom,pcie-qcs404
+           - qcom,pcie-sdm845
+           - qcom,pcie-sdx55
++          - qcom,pcie-sdx65
+       - items:
+           - const: qcom,pcie-msm8998
+           - const: qcom,pcie-msm8996
+@@ -205,6 +206,7 @@
+           contains:
+             enum:
+               - qcom,pcie-sdx55
++              - qcom,pcie-sdx65
+     then:
+       properties:
+         reg:
+@@ -478,6 +480,7 @@
+           contains:
+             enum:
+               - qcom,pcie-sdx55
++              - qcom,pcie-sdx65
+     then:
+       properties:
+         clocks:

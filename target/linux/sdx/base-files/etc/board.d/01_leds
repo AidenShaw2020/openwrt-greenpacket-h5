@@ -1,0 +1,16 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+greenpacket,h5-200q1)
+	ucidef_set_led_netdev "lan" "Ethernet link and activity" "h5:ethernet" "eth0"
+	;;
+esac
+
+board_config_flush
+
+exit 0

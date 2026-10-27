@@ -1,0 +1,58 @@
+Subject: [PATCH] mtd: qcomsmem: allow only verified H5 boot/system upgrade children
+
+The H5 parent stays read-only. Only the installer/production compatible
+and the exact verified 512 MiB map permit two writable children. Parser
+failure cannot expose a writable master. All firmware/calibration, boot
+loader, recovery and userdata partitions retain read-only flags.
+
+--- a/drivers/mtd/parsers/qcomsmempart.c
++++ b/drivers/mtd/parsers/qcomsmempart.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/ctype.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/mtd/mtd.h>
+ #include <linux/mtd/partitions.h>
+ #include <linux/slab.h>
+@@ -54,6 +55,32 @@
+ 	struct smem_flash_pentry pentry[SMEM_FLASH_PTABLE_MAX_PARTS_V4];
+ } __packed __aligned(4);
+ 
++/* The parent remains read-only, including if parsing or map checks fail. */
++static void h5_enable_upgrade_children(struct mtd_info *mtd,
++				       struct mtd_partition *parts, int count)
++{
++	if (!of_machine_is_compatible("greenpacket,h5-200q1-openwrt"))
++		return;
++
++	if (mtd->size != 0x20000000 || mtd->erasesize != 0x40000 ||
++	    mtd->writesize != 4096 || count != 33 ||
++	    strcmp(parts[2].name, "efs2") ||
++	    parts[2].offset != 0x380000 || parts[2].size != 0x1600000 ||
++	    strcmp(parts[27].name, "boot") ||
++	    parts[27].offset != 0x4440000 || parts[27].size != 0x1000000 ||
++	    strcmp(parts[30].name, "modem") ||
++	    parts[30].offset != 0x7940000 || parts[30].size != 0x7300000 ||
++	    strcmp(parts[31].name, "system") ||
++	    parts[31].offset != 0xec40000 || parts[31].size != 0x7d00000) {
++		pr_warn("H5: unexpected NAND map; keeping all partitions read-only\n");
++		return;
++	}
++
++	parts[27].add_flags |= MTD_WRITEABLE;
++	parts[31].add_flags |= MTD_WRITEABLE;
++	pr_info("H5: boot/system upgrade children enabled; NAND master stays read-only\n");
++}
++
+ static int parse_qcomsmem_part(struct mtd_info *mtd,
+ 			       const struct mtd_partition **pparts,
+ 			       struct mtd_part_parser_data *data)
+@@ -154,6 +181,7 @@
+ 
+ 	pr_debug("SMEM partition table found: ver: %d len: %d\n",
+ 		 le32_to_cpu(ptable->version), tmpparts);
++	h5_enable_upgrade_children(mtd, parts, numparts);
+ 	*pparts = parts;
+ 
+ 	return numparts;

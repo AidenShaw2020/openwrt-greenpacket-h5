@@ -1,0 +1,3 @@
+config tqftpserv 'main'
+	# RG520N uses the MDM MPSS TFTP service version, not the MSM default.
+	option service_version '3'

@@ -1,0 +1,10 @@
+# Release assets are uploaded separately after privacy and license checks.
+/release-assets/
+/audit-private/
+*.key
+*.pem
+*.db
+*.sqlite
+*known_hosts*
+*private*backup*
+__pycache__/

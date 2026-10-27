@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "qcom-sdx65-greenpacket-h5-usb-pcie-compat.dts"
+
+&remoteproc_mpss {
+	/* Exact stock MPSS carveout; firmware is supplied only after RAM boot. */
+	memory-region = <&mpss_adsp_mem>;
+	firmware-name = "greenpacket-h5/modem.mdt";
+	status = "okay";
+};

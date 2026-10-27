@@ -1,0 +1,3908 @@
+diff --git a/h5-patches/apply-packages.sh b/h5-patches/apply-packages.sh
+new file mode 100755
+--- /dev/null
++++ b/h5-patches/apply-packages.sh
+@@ -0,0 +1,16 @@
++#!/bin/sh
++# Run from the vanilla OpenWrt checkout after feeds update/install.
++set -eu
++root="$(pwd)"
++test -f include/toplevel.mk
++test -d feeds/packages/.git
++for patch in "$root"/h5-patches/packages/*.patch; do
++	if git -C feeds/packages apply --check "$patch"; then
++		git -C feeds/packages apply "$patch"
++	elif git -C feeds/packages apply --reverse --check "$patch"; then
++		printf 'Already applied: %s\n' "$(basename "$patch")"
++	else
++		printf 'Cannot apply feed patch: %s\n' "$patch" >&2
++		exit 1
++	fi
++done
+diff --git a/h5-patches/packages/010-modemmanager-qrtr-monitor.patch b/h5-patches/packages/010-modemmanager-qrtr-monitor.patch
+new file mode 100644
+--- /dev/null
++++ b/h5-patches/packages/010-modemmanager-qrtr-monitor.patch
+@@ -0,0 +1,14 @@
++diff --git a/net/modemmanager/files/usr/sbin/ModemManager-monitor b/net/modemmanager/files/usr/sbin/ModemManager-monitor
++--- a/net/modemmanager/files/usr/sbin/ModemManager-monitor
+++++ b/net/modemmanager/files/usr/sbin/ModemManager-monitor
++@@ -70,6 +70,10 @@ mm_monitor_cache_add() {
++ 	}
++ 
++ 	sysfspath=$(modemmanager_get_field "${modemstatus}" "modem.generic.physdev")
+++	# An integrated QRTR modem has a stable UID, but no USB/sysfs parent.
+++	if [ -z "${sysfspath}" ] && [ "${device}" = "qcom-soc" ]; then
+++		sysfspath="${device}"
+++	fi
++ 	[ -n "${sysfspath}" ] || {
++ 		mm_log "err" "No 'sysfspath' for object '$object' not found..."
++ 		return 2
+diff --git a/h5-patches/packages/020-0005-port-qmi-preserve-ipa-map-headroom.patch b/h5-patches/packages/020-0005-port-qmi-preserve-ipa-map-headroom.patch
+new file mode 100644
+--- /dev/null
++++ b/h5-patches/packages/020-0005-port-qmi-preserve-ipa-map-headroom.patch
+@@ -0,0 +1,20 @@
++diff --git a/net/modemmanager/patches/0005-port-qmi-preserve-ipa-map-headroom.patch b/net/modemmanager/patches/0005-port-qmi-preserve-ipa-map-headroom.patch
++new file mode 100644
++--- /dev/null
+++++ b/net/modemmanager/patches/0005-port-qmi-preserve-ipa-map-headroom.patch
++@@ -0,0 +1,15 @@
+++Subject: [PATCH] port-qmi: preserve MAP transport headroom on IPA reset
+++
+++--- a/src/mm-port-qmi.c
++++++ b/src/mm-port-qmi.c
+++@@ -1007,6 +1007,10 @@
+++     /* mhi_net has a custom default MTU set by the kernel driver */
+++     if (g_strcmp0 (self->priv->net_driver, "mhi_net") == 0)
+++         mtu = MHI_NET_MTU_DEFAULT;
++++    else if (g_strcmp0 (self->priv->net_driver, "ipa") == 0)
++++        /* The RMNET upper device needs room for the MAP header and
++++         * optional uplink checksum header (four bytes each). */
++++        mtu = MM_PORT_NET_MTU_DEFAULT + 8;
+++     else
+++         mtu = MM_PORT_NET_MTU_DEFAULT;
+++ 
+diff --git a/h5-patches/packages/030-0006-qmi-filter-unavailable-nr5g-signal.patch b/h5-patches/packages/030-0006-qmi-filter-unavailable-nr5g-signal.patch
+new file mode 100644
+--- /dev/null
++++ b/h5-patches/packages/030-0006-qmi-filter-unavailable-nr5g-signal.patch
+@@ -0,0 +1,42 @@
++diff --git a/net/modemmanager/patches/0006-qmi-filter-unavailable-nr5g-signal.patch b/net/modemmanager/patches/0006-qmi-filter-unavailable-nr5g-signal.patch
++new file mode 100644
++--- /dev/null
+++++ b/net/modemmanager/patches/0006-qmi-filter-unavailable-nr5g-signal.patch
++@@ -0,0 +1,37 @@
+++Subject: [PATCH] qmi: omit unavailable NR signal measurements
+++
+++--- a/src/mm-broadband-modem-qmi.c
++++++ b/src/mm-broadband-modem-qmi.c
+++@@ -6284,9 +6284,14 @@
+++                                                                        &rsrp,
+++                                                                        &snr,
+++                                                                        NULL))) {
+++-        *out_nr5g = mm_signal_new ();
+++-        mm_signal_set_rsrp (*out_nr5g, (gdouble)rsrp);
+++-        mm_signal_set_snr (*out_nr5g, (0.1) * ((gdouble)snr));
++++        /* Quectel reports INT16_MIN when an NR measurement is unavailable. */
++++        if (rsrp != G_MININT16 || snr != G_MININT16) {
++++            *out_nr5g = mm_signal_new ();
++++            if (rsrp != G_MININT16)
++++                mm_signal_set_rsrp (*out_nr5g, (gdouble)rsrp);
++++            if (snr != G_MININT16)
++++                mm_signal_set_snr (*out_nr5g, (0.1) * ((gdouble)snr));
++++        }
+++     }
+++ 
+++     if ((response_output &&
+++@@ -6297,9 +6302,11 @@
+++          qmi_indication_nas_signal_info_output_get_5g_signal_strength_extended (indication_output,
+++                                                                                 &rsrq_5g,
+++                                                                                 NULL))) {
+++-        if (G_UNLIKELY (!*out_nr5g))
+++-            *out_nr5g = mm_signal_new ();
+++-        mm_signal_set_rsrq (*out_nr5g, (gdouble)rsrq_5g);
++++        if (rsrq_5g != G_MININT16) {
++++            if (G_UNLIKELY (!*out_nr5g))
++++                *out_nr5g = mm_signal_new ();
++++            mm_signal_set_rsrq (*out_nr5g, (gdouble)rsrq_5g);
++++        }
+++     }
+++ }
+++ 
+diff --git a/package/luci-app-h5-modem/htdocs/luci-static/resources/view/h5modem/radio.js b/package/luci-app-h5-modem/htdocs/luci-static/resources/view/h5modem/radio.js
+new file mode 100644
+--- /dev/null
++++ b/package/luci-app-h5-modem/htdocs/luci-static/resources/view/h5modem/radio.js
+@@ -0,0 +1,126 @@
++'use strict';
++'require view';
++'require form';
++'require rpc';
++'require ui';
++'require poll';
++'require dom';
++
++const status = rpc.declare({ object: 'h5modem', method: 'status', expect: { '': {} } });
++const capabilities = rpc.declare({ object: 'h5modem', method: 'capabilities', expect: { '': {} } });
++const lockLTE = rpc.declare({ object: 'h5modem', method: 'lock_lte', params: [ 'earfcn', 'pci' ], expect: { '': {} } });
++const lockNR = rpc.declare({ object: 'h5modem', method: 'lock_nr', params: [ 'pci', 'arfcn', 'scs', 'band' ], expect: { '': {} } });
++const unlockLTE = rpc.declare({ object: 'h5modem', method: 'unlock_lte', expect: { '': {} } });
++const unlockNR = rpc.declare({ object: 'h5modem', method: 'unlock_nr', expect: { '': {} } });
++
++function lines(data, key) {
++	const q = data && data.queries && data.queries[key];
++	return q && q.ok && Array.isArray(q.lines) ? q.lines : [];
++}
++
++function columns(line) {
++	const body = line.slice(line.indexOf(':') + 1).trim();
++	return (body.match(/"[^"]*"|[^,]+/g) || []).map(v => v.trim().replace(/^"|"$/g, ''));
++}
++
++function measurement(value) {
++	return value != null && value !== '' && Number.isFinite(Number(value)) && Number(value) !== -32768 ? value : '—';
++}
++
++function table(headings, rows) {
++	return E('table', { 'class': 'table cbi-section-table' }, [
++		E('tr', { 'class': 'tr table-titles' }, headings.map(h => E('th', { 'class': 'th' }, h))),
++		...rows.map(row => E('tr', { 'class': 'tr' }, row.map(v => E('td', { 'class': 'td' }, String(v == null ? '—' : v)))))
++	]);
++}
++
++function radioContent(data) {
++	if (!data || !data.ok)
++		return [ E('p', {}, _('Radio information is not available yet.')) ];
++	const cells = [];
++	for (const line of lines(data, 'serving')) {
++		const c = columns(line), lte = c.indexOf('LTE');
++		if (lte >= 0 && c.length >= lte + 15)
++			cells.push([ 'LTE', 'B' + c[lte + 7], c[lte + 6], c[lte + 5], measurement(c[lte + 11]), measurement(c[lte + 12]), measurement(c[lte + 14]) ]);
++		else if (c[0] === 'NR5G-NSA' && c.length >= 9)
++			cells.push([ '5G NSA', 'n' + c[8], c[7], c[3], measurement(c[4]), measurement(c[6]), measurement(c[5]) ]);
++	}
++	const result = [
++		E('h3', {}, _('Serving cells')),
++		table([ _('Technology'), _('Band'), _('Channel'), 'PCI', _('RSRP (dBm)'), _('RSRQ (dB)'), _('SINR (dB)') ], cells),
++		E('h3', {}, _('Receive chains'))
++	];
++	const chains = [];
++	for (const [key, label, unit] of [ [ 'rsrp', 'RSRP', 'dBm' ], [ 'sinr', 'SINR', 'dB' ] ]) {
++		for (const line of lines(data, key)) {
++			const c = columns(line);
++			if (c.length !== 5) continue;
++			chains.push([ c[4] === 'NR5G' ? '5G' : c[4], label + ' (' + unit + ')', ...c.slice(0, 4).map(measurement) ]);
++		}
++	}
++	result.push(table([ _('Technology'), _('Measurement'), 'RX1', 'RX2', 'RX3', 'RX4' ], chains));
++	return result;
++}
++
++function lockContent(data) {
++	const rows = [];
++	for (const [key, label] of [ [ 'lte', 'LTE' ], [ 'nr', '5G SA' ] ]) {
++		const c = columns(lines(data, key)[0] || '');
++		let text = _('Unknown');
++		if (c[1] === '0') text = _('Not locked');
++		else if (key === 'lte' && c.length >= 4) text = _('Channel %s, PCI %s').format(c[2], c[3]);
++		else if (key === 'nr' && c.length >= 5) text = _('Channel %s, PCI %s, band n%s').format(c[2], c[1], c[4]);
++		rows.push([label, text]);
++	}
++	return table([ _('Technology'), _('Current cell lock') ], rows);
++}
++
++return view.extend({
++	load() { return Promise.all([ status(), capabilities() ]); },
++	render(data) {
++		const radio = E('div', { 'class': 'cbi-section' }, radioContent(data[0]));
++		const locks = E('div', {}, [lockContent(data[1])]);
++		const m = new form.JSONMap({ lock: { '.type': 'lock', technology: 'lte', earfcn: '', lte_pci: '', arfcn: '', nr_pci: '', scs: '30', band: '' } }, _('Cell lock'),
++			_('5G cell locking applies to SA networks. For 5G NSA, lock the LTE anchor cell.') + ' ' +
++			_('Changing a cell lock restarts network registration.'));
++		const s = m.section(form.NamedSection, 'lock', 'lock');
++		let o = s.option(form.ListValue, 'technology', _('Technology'));
++		o.value('lte', 'LTE'); o.value('nr', '5G SA');
++		for (const [name, label, rat, datatype] of [
++			[ 'earfcn', 'EARFCN', 'lte', 'range(0,262143)' ],
++			[ 'lte_pci', 'PCI', 'lte', 'range(0,503)' ],
++			[ 'arfcn', 'NR-ARFCN', 'nr', 'range(0,3279165)' ],
++			[ 'nr_pci', 'PCI', 'nr', 'range(1,1007)' ],
++			[ 'band', _('NR band'), 'nr', 'range(1,1024)' ]
++		]) {
++			o = s.option(form.Value, name, label);
++			o.depends('technology', rat); o.datatype = datatype;
++		}
++		o = s.option(form.ListValue, 'scs', _('Subcarrier spacing'));
++		o.depends('technology', 'nr');
++		for (const n of [ '15', '30', '60', '120' ]) o.value(n, n + ' kHz');
++		const value = name => String(m.data.get('json', 'lock', name) || '');
++		const finished = result => {
++			if (!result || !result.ok) throw new Error(result && result.error || _('The modem rejected the request.'));
++			ui.addNotification(null, E('p', {}, _('Cell lock updated.')), 'info');
++			return capabilities().then(c => dom.content(locks, [lockContent(c)]));
++		};
++		const failed = error => ui.addNotification(null, E('p', {}, String(error)), 'error');
++		o = s.option(form.Button, '_apply', _('Apply cell lock'));
++		o.inputstyle = 'apply';
++		o.onclick = () => m.save().then(() => value('technology') === 'lte'
++			? lockLTE(value('earfcn'), value('lte_pci'))
++			: lockNR(value('nr_pci'), value('arfcn'), value('scs'), value('band'))).then(finished).catch(failed);
++		o = s.option(form.Button, '_clear', _('Remove selected cell lock'));
++		o.inputstyle = 'reset';
++		o.onclick = () => {
++			const technology = m.lookupOption('technology', 'lock')[0].formvalue('lock');
++			return (technology === 'lte' ? unlockLTE() : unlockNR()).then(finished).catch(failed);
++		};
++		poll.add(() => status().then(d => dom.content(radio, radioContent(d))).catch(() => {}), 10);
++		return m.render().then(node => E('div', {}, [ E('h2', {}, _('Cellular Network')), radio, locks, node ]));
++	},
++	handleSaveApply: null,
++	handleSave: null,
++	handleReset: null
++});
+diff --git a/package/luci-app-h5-modem/Makefile b/package/luci-app-h5-modem/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/luci-app-h5-modem/Makefile
+@@ -0,0 +1,10 @@
++include $(TOPDIR)/rules.mk
++
++LUCI_TITLE:=GreenPacket H5 radio measurements and cell locking
++LUCI_DEPENDS:=+h5-modem-tools
++LUCI_PKGARCH:=all
++PKG_LICENSE:=GPL-2.0-only
++
++include $(TOPDIR)/feeds/luci/luci.mk
++
++# call BuildPackage - OpenWrt buildroot signature
+diff --git a/package/luci-app-h5-modem/root/usr/share/luci/menu.d/luci-app-h5-modem.json b/package/luci-app-h5-modem/root/usr/share/luci/menu.d/luci-app-h5-modem.json
+new file mode 100644
+--- /dev/null
++++ b/package/luci-app-h5-modem/root/usr/share/luci/menu.d/luci-app-h5-modem.json
+@@ -0,0 +1,8 @@
++{
++  "admin/network/h5modem": {
++    "title": "Cellular Network",
++    "order": 65,
++    "action": { "type": "view", "path": "h5modem/radio" },
++    "depends": { "acl": [ "luci-app-h5-modem" ] }
++  }
++}
+diff --git a/package/network/config/netifd/patches/010-device-recognize-existing-kernel-interfaces.patch b/package/network/config/netifd/patches/010-device-recognize-existing-kernel-interfaces.patch
+new file mode 100644
+--- /dev/null
++++ b/package/network/config/netifd/patches/010-device-recognize-existing-kernel-interfaces.patch
+@@ -0,0 +1,41 @@
++From 01c4149b4c71c6badced01d534b1af3570e29f61 Mon Sep 17 00:00:00 2001
++From: ghoker143 <ghoker51@protonmail.com>
++Date: Sun, 22 Mar 2026 12:43:47 +0800
++Subject: [PATCH] device: skip VLAN chain lookup for existing kernel interfaces
++
++Signed-off-by: ghoker143 <ghoker51@protonmail.com>
++---
++ device.c | 13 +++++++++++--
++ 1 file changed, 11 insertions(+), 2 deletions(-)
++
++diff --git a/device.c b/device.c
++index 301be31..a8c654f 100644
++--- a/device.c
+++++ b/device.c
++@@ -14,6 +14,7 @@
++ #include <string.h>
++ #include <stdlib.h>
++ #include <stdio.h>
+++#include <net/if.h>
++ #include <assert.h>
++ 
++ #include <sys/types.h>
++@@ -893,8 +894,16 @@ __device_get(const char *name, int create, bool check_vlan)
++ 
++ 	dev = avl_find_element(&devices, name, dev, avl);
++ 
++-	if (!dev && check_vlan && strchr(name, '.'))
++-		return get_vlan_device_chain(name, create);
+++	if (!dev && check_vlan && strchr(name, '.')) {
+++		/*
+++		 * Only treat dotted names as VLAN-style if the full name does
+++		 * NOT already exist as a real kernel netdev.  Externally managed
+++		 * interfaces (e.g. ModemManager QMI mux links: qmapmux0.0) are
+++		 * valid kernel devices whose names happen to contain a dot.
+++		 */
+++		if (!if_nametoindex(name))
+++			return get_vlan_device_chain(name, create);
+++	}
++ 
++ 	if (name[0] == '@')
++ 		return device_alias_get(name + 1);
+diff --git a/package/network/services/tqftpserv/files/tqftpserv.init b/package/network/services/tqftpserv/files/tqftpserv.init
+new file mode 100755
+--- /dev/null
++++ b/package/network/services/tqftpserv/files/tqftpserv.init
+@@ -0,0 +1,24 @@
++#!/bin/sh /etc/rc.common
++START=75
++STOP=15
++USE_PROCD=1
++
++start_service() {
++	local version
++	version="$(uci -q get tqftpserv.main.service_version)"
++	case "$version" in
++		''|*[!0-9]*) version=1 ;;
++	esac
++	[ "$version" -ge 1 ] && [ "$version" -le 255 ] || version=1
++	mkdir -p /var/lib/tqftpserv
++	chown nobody:nogroup /var/lib/tqftpserv
++	chmod 700 /var/lib/tqftpserv
++	procd_open_instance
++	procd_set_param command /usr/sbin/tqftpserv -v "$version"
++	procd_set_param user nobody
++	procd_set_param group nogroup
++	procd_set_param respawn 3600 5 5
++	procd_set_param stdout 1
++	procd_set_param stderr 1
++	procd_close_instance
++}
+diff --git a/package/network/services/tqftpserv/Makefile b/package/network/services/tqftpserv/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/tqftpserv/Makefile
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: GPL-2.0-only
++include $(TOPDIR)/rules.mk
++
++PKG_NAME:=tqftpserv
++PKG_VERSION:=1.3
++PKG_RELEASE:=2
++PKG_LICENSE:=BSD-3-Clause
++PKG_LICENSE_FILES:=LICENSE qrtr/LICENSE
++PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
++
++include $(INCLUDE_DIR)/package.mk
++
++define Download/tqftpserv-source
++  FILE:=tqftpserv-1.3.tar.gz
++  URL:=https://codeload.github.com/linux-msm/tqftpserv/tar.gz/refs/tags
++  URL_FILE:=v1.3
++  HASH:=87a3845e8f47b42f31d8aaad04c5e0707e391b3954d096aeff6f0a03467dc33f
++endef
++$(eval $(call Download,tqftpserv-source))
++
++define Download/tqftpserv-qrtr
++  FILE:=qrtr-1.2.tar.gz
++  URL:=https://codeload.github.com/linux-msm/qrtr/tar.gz/refs/tags
++  URL_FILE:=v1.2
++  HASH:=7a82bf80246fe71287b13c66c0466208822e8337fcd4aaf302eee6c5fcb48a52
++endef
++$(eval $(call Download,tqftpserv-qrtr))
++
++$(STAMP_PREPARED): $(DL_DIR)/tqftpserv-1.3.tar.gz $(DL_DIR)/qrtr-1.2.tar.gz
++
++define Package/tqftpserv
++  SECTION:=net
++  CATEGORY:=Network
++  TITLE:=Qualcomm QRTR firmware file service
++  DEPENDS:=+kmod-qrtr +libpthread
++  URL:=https://github.com/linux-msm/tqftpserv
++endef
++
++define Package/tqftpserv/description
++ Upstream TFTP service over QRTR for Qualcomm remote processors. Firmware
++ is read from /lib/firmware; writable service files stay in RAM under /var.
++ No proprietary firmware is included.
++endef
++
++define Build/Prepare
++	$(INSTALL_DIR) $(PKG_BUILD_DIR)/qrtr
++	$(TAR) -C $(PKG_BUILD_DIR) --strip-components=1 -xzf $(DL_DIR)/tqftpserv-1.3.tar.gz
++	$(TAR) -C $(PKG_BUILD_DIR)/qrtr --strip-components=1 -xzf $(DL_DIR)/qrtr-1.2.tar.gz
++	$(Build/Patch)
++endef
++
++define Build/Compile
++	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -D_GNU_SOURCE \
++		-ffunction-sections -fdata-sections -Wl,--gc-sections \
++		-I$(PKG_BUILD_DIR)/qrtr/include -I$(PKG_BUILD_DIR) \
++		$(PKG_BUILD_DIR)/tqftpserv.c $(PKG_BUILD_DIR)/translate.c \
++		$(PKG_BUILD_DIR)/qrtr/lib/qrtr.c $(PKG_BUILD_DIR)/qrtr/lib/qmi.c \
++		$(PKG_BUILD_DIR)/qrtr/lib/logging.c $(TARGET_LDFLAGS) \
++		-o $(PKG_BUILD_DIR)/tqftpserv
++endef
++
++define Package/tqftpserv/install
++	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d
++	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tqftpserv $(1)/usr/sbin/tqftpserv
++	$(INSTALL_BIN) ./files/tqftpserv.init $(1)/etc/init.d/tqftpserv
++endef
++
++$(eval $(call BuildPackage,tqftpserv))
+diff --git a/package/network/services/tqftpserv/patches/010-select-service-version.patch b/package/network/services/tqftpserv/patches/010-select-service-version.patch
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/tqftpserv/patches/010-select-service-version.patch
+@@ -0,0 +1,55 @@
++Subject: [PATCH] tqftpserv: allow selecting the QRTR service version
++
++Quectel RG520N OpenCPU firmware on GreenPacket H5 requests TFTP service
++4096 version 3. Without that registration no modem_pr files are fetched,
++band capabilities remain empty and DMS ONLINE fails with DeviceNotReady.
++Keep upstream version 1 as the default for other platforms.
++
++--- a/tqftpserv.c
+++++ b/tqftpserv.c
++@@ -916,13 +916,16 @@
++ {
++ 	extern const char *__progname;
++ 
++-	fprintf(stderr, "Usage: %s [-d] [-h]\n", __progname);
+++	fprintf(stderr, "Usage: %s [-d] [-h] [-v version]\n", __progname);
++ 	fprintf(stderr, " -d\tPrint detailed debug information\n");
++ 	fprintf(stderr, " -h\tPrint this usage info\n");
+++	fprintf(stderr, " -v\tQRTR service version (1-255, default 1)\n");
++ }
++ 
++ int main(int argc, char **argv)
++ {
+++	unsigned long service_version = 1;
+++	char *end;
++ 	struct tftp_client *client;
++ 	struct tftp_client *next;
++ 	struct sockaddr_qrtr sq;
++@@ -937,8 +940,17 @@
++ 	int ret;
++ 	int fd;
++ 
++-	while ((opt = getopt(argc, argv, "dh")) != -1) {
+++	while ((opt = getopt(argc, argv, "dhv:")) != -1) {
++ 		switch (opt) {
+++		case 'v':
+++			errno = 0;
+++			service_version = strtoul(optarg, &end, 10);
+++			if (errno || end == optarg || *end ||
+++			    service_version < 1 || service_version > 255) {
+++				fprintf(stderr, "Invalid QRTR service version\n");
+++				return 1;
+++			}
+++			break;
++ 		case 'd':
++ 			tftp_debug = true;
++ 			break;
++@@ -962,7 +974,7 @@
++ 		exit(1);
++ 	}
++ 
++-	ret = qrtr_publish(fd, 4096, 1, 0);
+++	ret = qrtr_publish(fd, 4096, service_version, 0);
++ 	if (ret < 0) {
++ 		fprintf(stderr, "failed to publish service registry service\n");
++ 		exit(1);
+diff --git a/package/utils/h5-modem-tools/files/h5-modem-acl.json b/package/utils/h5-modem-tools/files/h5-modem-acl.json
+new file mode 100644
+--- /dev/null
++++ b/package/utils/h5-modem-tools/files/h5-modem-acl.json
+@@ -0,0 +1,11 @@
++{
++  "luci-app-h5-modem": {
++    "description": "Read H5 radio measurements and configure cell locking",
++    "read": {
++      "ubus": { "h5modem": [ "status", "capabilities" ] }
++    },
++    "write": {
++      "ubus": { "h5modem": [ "lock_lte", "unlock_lte", "lock_nr", "unlock_nr" ] }
++    }
++  }
++}
+diff --git a/package/utils/h5-modem-tools/files/h5modem b/package/utils/h5-modem-tools/files/h5modem
+new file mode 100755
+--- /dev/null
++++ b/package/utils/h5-modem-tools/files/h5modem
+@@ -0,0 +1,36 @@
++#!/bin/sh
++# rpcd exec plugin. Authentication and method ACLs are enforced by rpcd.
++. /usr/share/libubox/jshn.sh
++helper=/usr/libexec/h5-at
++
++run_query() {
++	result=$("$helper" "$@") || :
++	if json_load "$result" 2>/dev/null; then
++		printf '%s\n' "$result"
++	else
++		printf '%s\n' '{"ok":false,"error":"modem-unavailable"}'
++	fi
++}
++
++case "$1" in
++list)
++	printf '%s\n' '{"status":{},"capabilities":{},"lock_lte":{"earfcn":"String","pci":"String"},"unlock_lte":{},"lock_nr":{"pci":"String","arfcn":"String","scs":"String","band":"String"},"unlock_nr":{}}'
++	;;
++call)
++	read -r request
++	json_load "$request" 2>/dev/null || exit 1
++	case "$2" in
++	status|capabilities) run_query "$2" ;;
++	unlock_lte) run_query unlock-lte ;;
++	unlock_nr) run_query unlock-nr ;;
++	lock_lte)
++		json_get_vars earfcn pci
++		run_query lock-lte "$earfcn" "$pci"
++		;;
++	lock_nr)
++		json_get_vars pci arfcn scs band
++		run_query lock-nr "$pci" "$arfcn" "$scs" "$band"
++		;;
++	esac
++	;;
++esac
+diff --git a/package/utils/h5-modem-tools/Makefile b/package/utils/h5-modem-tools/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/utils/h5-modem-tools/Makefile
+@@ -0,0 +1,35 @@
++include $(TOPDIR)/rules.mk
++
++PKG_NAME:=h5-modem-tools
++PKG_VERSION:=1
++PKG_RELEASE:=1
++PKG_LICENSE:=GPL-2.0-only
++
++include $(INCLUDE_DIR)/package.mk
++
++define Package/h5-modem-tools
++  SECTION:=utils
++  CATEGORY:=Utilities
++  TITLE:=GreenPacket H5 modem diagnostics
++  DEPENDS:=@TARGET_sdx +kmod-h5-rpmsg-at +rpcd +jshn
++endef
++
++define Build/Prepare
++	mkdir -p $(PKG_BUILD_DIR)
++	$(CP) ./src/* $(PKG_BUILD_DIR)/
++endef
++
++define Build/Compile
++	$(TARGET_CC) $(TARGET_CFLAGS) -Wall -Wextra -Werror \
++		-o $(PKG_BUILD_DIR)/h5-at $(PKG_BUILD_DIR)/h5-at.c $(TARGET_LDFLAGS)
++endef
++
++define Package/h5-modem-tools/install
++	$(INSTALL_DIR) $(1)/usr/libexec
++	$(INSTALL_BIN) $(PKG_BUILD_DIR)/h5-at $(1)/usr/libexec/h5-at
++	$(INSTALL_DIR) $(1)/usr/libexec/rpcd $(1)/usr/share/rpcd/acl.d
++	$(INSTALL_BIN) ./files/h5modem $(1)/usr/libexec/rpcd/h5modem
++	$(INSTALL_DATA) ./files/h5-modem-acl.json $(1)/usr/share/rpcd/acl.d/h5-modem.json
++endef
++
++$(eval $(call BuildPackage,h5-modem-tools))
+diff --git a/package/utils/h5-modem-tools/src/h5-at.c b/package/utils/h5-modem-tools/src/h5-at.c
+new file mode 100644
+--- /dev/null
++++ b/package/utils/h5-modem-tools/src/h5-at.c
+@@ -0,0 +1,171 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#define RESPONSE_SIZE 16384
++
++struct query { const char *key; const char *command; const char *prefix; };
++
++static void json_string(const char *s)
++{
++    putchar('"');
++    for (; *s; s++) {
++        unsigned char c = (unsigned char)*s;
++        if (c == '"' || c == '\\') printf("\\%c", c);
++        else if (c < 32) printf("\\u%04x", c);
++        else putchar(c);
++    }
++    putchar('"');
++}
++
++static int error_json(const char *reason)
++{
++    printf("{\"ok\":false,\"error\":");
++    json_string(reason);
++    puts("}");
++    return 1;
++}
++
++static long long milliseconds(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
++}
++
++static int number(const char *s, unsigned min, unsigned max, unsigned *value)
++{
++    if (!s || !*s) return 0;
++    for (const char *p = s; *p; p++) if (*p < '0' || *p > '9') return 0;
++    char *end;
++    errno = 0;
++    unsigned long n = strtoul(s, &end, 10);
++    if (errno || *end || n < min || n > max) return 0;
++    *value = (unsigned)n;
++    return 1;
++}
++
++static int terminal(const char *s)
++{
++    if (strstr(s, "\nOK\r") || strstr(s, "\nOK\n")) return 1;
++    if (strstr(s, "\nERROR") || strstr(s, "+CME ERROR:") ||
++        strstr(s, "+CMS ERROR:")) return -1;
++    return 0;
++}
++
++/* RPMSG preserves packets. Blocking writes permit GLINK RX intent requests. */
++static int query(int fd, const char *command, char *response)
++{
++    response[0] = 0;
++    struct pollfd p = { .fd = fd, .events = POLLIN };
++    char stale[4096];
++    for (int n = 0; n < 32 && poll(&p, 1, 0) > 0; n++) {
++        if (!(p.revents & POLLIN)) break;
++        if (read(fd, stale, sizeof(stale)) <= 0) break;
++    }
++    size_t length = strlen(command);
++    if (write(fd, command, length) != (ssize_t)length) return 0;
++    size_t used = 0;
++    long long deadline = milliseconds() + 4000;
++    while (milliseconds() < deadline) {
++        int r = poll(&p, 1, 100);
++        if (r < 0) { if (errno == EINTR) continue; return 0; }
++        if (!r) continue;
++        if (!(p.revents & POLLIN)) return 0;
++        char packet[4096];
++        ssize_t n = read(fd, packet, sizeof(packet));
++        if (n <= 0 || used + (size_t)n >= RESPONSE_SIZE) return 0;
++        memcpy(response + used, packet, (size_t)n);
++        used += (size_t)n;
++        response[used] = 0;
++        int t = terminal(response);
++        if (t) return t > 0;
++    }
++    return 0;
++}
++
++/* Publish only requested result prefixes; discard unrelated unsolicited data. */
++static void filtered_lines(char *response, const char *prefix)
++{
++    char *save = NULL;
++    int first = 1;
++    putchar('[');
++    for (char *line = strtok_r(response, "\r\n", &save); line;
++         line = strtok_r(NULL, "\r\n", &save)) {
++        if (strncmp(line, prefix, strlen(prefix))) continue;
++        if (!first) putchar(',');
++        first = 0;
++        json_string(line);
++    }
++    putchar(']');
++}
++
++int main(int argc, char **argv)
++{
++    const struct query status[] = {
++        { "serving", "AT+QENG=\"servingcell\"\r", "+QENG:" },
++        { "carriers", "AT+QCAINFO\r", "+QCAINFO:" },
++        { "rsrp", "AT+QRSRP\r", "+QRSRP:" },
++        { "sinr", "AT+QSINR\r", "+QSINR:" },
++    };
++    const struct query capabilities[] = {
++        { "capabilities", "AT+QNWLOCK=?\r", "+QNWLOCK:" },
++        { "lte", "AT+QNWLOCK=\"common/4g\"\r", "+QNWLOCK:" },
++        { "nr", "AT+QNWLOCK=\"common/5g\"\r", "+QNWLOCK:" },
++    };
++    const struct query *queries = NULL;
++    size_t count = 0;
++    char command[160];
++    struct query setting = { "result", command, "+QNWLOCK:" };
++    unsigned freq, pci, scs, band;
++    if (argc == 2 && !strcmp(argv[1], "status")) {
++        queries = status; count = sizeof(status) / sizeof(*status);
++    } else if (argc == 2 && !strcmp(argv[1], "capabilities")) {
++        queries = capabilities; count = sizeof(capabilities) / sizeof(*capabilities);
++    } else if (argc == 4 && !strcmp(argv[1], "lock-lte") &&
++               number(argv[2], 0, 262143, &freq) && number(argv[3], 0, 503, &pci)) {
++        snprintf(command, sizeof(command), "AT+QNWLOCK=\"common/4g\",1,%u,%u\r", freq, pci);
++        queries = &setting; count = 1;
++    } else if (argc == 6 && !strcmp(argv[1], "lock-nr") &&
++               number(argv[2], 1, 1007, &pci) && number(argv[3], 0, 3279165, &freq) &&
++               number(argv[4], 15, 120, &scs) && number(argv[5], 1, 1024, &band) &&
++               (scs == 15 || scs == 30 || scs == 60 || scs == 120)) {
++        snprintf(command, sizeof(command), "AT+QNWLOCK=\"common/5g\",%u,%u,%u,%u\r", pci, freq, scs, band);
++        queries = &setting; count = 1;
++    } else if (argc == 2 && (!strcmp(argv[1], "unlock-lte") || !strcmp(argv[1], "unlock-nr"))) {
++        snprintf(command, sizeof(command), "AT+QNWLOCK=\"common/%s\",0\r",
++                 !strcmp(argv[1], "unlock-lte") ? "4g" : "5g");
++        queries = &setting; count = 1;
++    } else return error_json("invalid-arguments");
++
++    alarm(25);
++    int lockfd = open("/var/lock/h5-at.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
++    if (lockfd < 0) return error_json("lock-unavailable");
++    if (flock(lockfd, LOCK_EX | LOCK_NB)) { close(lockfd); return error_json("busy"); }
++    int fd = open("/dev/h5-at", O_RDWR | O_CLOEXEC);
++    if (fd < 0) { close(lockfd); return error_json("port-unavailable"); }
++    char response[RESPONSE_SIZE];
++    int all_ok = 1;
++    printf("{\"queries\":{");
++    for (size_t i = 0; i < count; i++) {
++        int ok = query(fd, queries[i].command, response);
++        all_ok &= ok;
++        if (i) putchar(',');
++        json_string(queries[i].key);
++        printf(":{\"ok\":%s,\"lines\":", ok ? "true" : "false");
++        filtered_lines(response, queries[i].prefix);
++        putchar('}');
++    }
++    printf("},\"ok\":%s}\n", all_ok ? "true" : "false");
++    close(fd);
++    close(lockfd);
++    return !all_ok;
++}
+diff --git a/h5-patches/README.md b/h5-patches/README.md
+new file mode 100644
+--- /dev/null
++++ b/h5-patches/README.md
+@@ -0,0 +1,175 @@
++# GreenPacket H5-200Q1 on vanilla OpenWrt 25.12.6
++
++This adds a new SDX65 target to unmodified OpenWrt; it does not use a RutOS
++kernel, target, SDK or build environment. The tested device has stock software
++912.001.604.145. Other H5 hardware or stock firmware revisions are not validated.
++
++## Reproducible build
++
++OpenWrt base: 64900e756efa667774214f9c6b17c113222e01f7 (v25.12.6),
++Linux 6.12.112. Tested feed revisions:
++
++- packages: 093d551675b1119a06ef224d419905e8d6b2af1a
++- luci: 75a306df84a020c57a631ef5b4c02ace56d93387
++
++From a clean OpenWrt checkout, apply the exported target patch, update feeds,
++check out the above feed revisions, then install feeds. Run
++`sh h5-patches/apply-packages.sh` to apply the included ModemManager fixes.
++The tested feed snapshot has an unrelated weechat-full/weechat-minimal Kconfig
++cycle through the unused luci-app-weechat package; remove that feed symlink with
++`./scripts/feeds uninstall luci-app-weechat` if all packages were installed.
++
++Select the CPE profile:
++
++```sh
++cp target/linux/sdx/h5-cpe.config .config
++make defconfig
++make -j8
++```
++
++Outputs under bin/targets/sdx/generic:
++
++- openwrt-sdx-generic-greenpacket_h5-200q1-cpe-initramfs-kernel.bin
++- openwrt-sdx-generic-greenpacket_h5-200q1-cpe-squashfs-sysupgrade.bin
++
++The initramfs includes the complete LuCI/modem stack. Both boot kernels use an
++Android v0 header, 4096-byte pages and an appended DTB, as required by this ABL.
++These are not GreenPacket web-update packages. Direct fastboot RAM boot of
++the full Linux/LuCI/modem initramfs has been validated on the tested H5.
++Earlier bring-up profiles remain available for diagnostics.
++
++## Default operation
++
++The default is a normal cellular CPE router: Ethernet LAN 192.168.0.1/24,
++DHCP/DNS, and a firewalled/NAT cellular WAN named mobile. Automatic mobile
++startup is enabled. Bridge/IP passthrough is deferred and is not enabled.
++
++LuCI is available over HTTP. Fresh root has no password and Dropbear permits
++password authentication. The USB CDC ACM and UART consoles use the standard
++OpenWrt login helper with ttylogin enabled, so setting a root password also
++protects console login. No private SSH keys, authorized keys, test SIM PIN,
++autologin shell or private diagnostic overlay are part of the public target.
++
++The native ModemManager interface handles APN, PIN and connection settings.
++Configure only a verified SIM PIN; the standard netifd handler blocks repeated
++restart attempts after a PIN error. No carrier identifiers or PINs are embedded
++in the build.
++
++Network -> Cellular Network adds standard LuCI tables for serving cells,
++carrier aggregation and per-chain signal measurements, plus validated vendor
++cell-lock controls. It uses a restricted rpcd API and /dev/h5-at, not a generic
++web command shell. LTE cell lock to the current anchor and removal were tested
++with working data in both states. The advertised NR lock is for 5G SA; it has
++not been tested on the current NSA network. NSA uses the LTE anchor. Cell-lock
++persistence across modem restarts is firmware dependent and is not promised.
++
++## Hardware and firmware
++
++RTL8125B uses upstream r8169 with the SDX65 GCC/PCIe bootstrap and stock PCIe
++policy. 1 Gb/s LAN, upstream IPA/rmnet, QRTR/QMI and ModemManager provide the
++integrated RG520N-EU transport. The DS AT service uses unmodified upstream
++rpmsg_char through driver_override, avoiding ModemManager WWAN auto-probing.
++
++Signed modem firmware is loaded from the original modem partition, mounted
++read-only and checked against the tested modem.mdt hash. No modem firmware is
++distributed in this patch. QRTR TFTP service4096 version3 is required for this
++firmware; the generic package default remains unchanged. Runtime support files
++are cached in RAM before starting MPSS.
++
++BAM command-pipe LOCK/UNLOCK serializes AP/modem NAND access. The lock dummy
++command uses the physical NAND_ADDR0 address and a zero write mask. A dummy
++write to NAND_VERSION caused resets and must not be substituted. Both block
++integrity and runtime firmware access were tested while the modem was active.
++Patch 118 also backports the upstream QPIC v2 last-codeword read-location fix
++for the v6.14 cleanup included by OpenWrt. The uncorrected driver returned
++stale final 480-byte page tails during a captured modem-start test, despite
++zero ECC errors. The corrected kernel passed three stop/start concurrency
++rounds: 14 complete rootfs reads and 171 three-page samples all matched their
++expected hashes, with zero ECC or squashfs errors.
++
++The NAND master stays read-only. Only the CPE compatible and an exact verified
++512 MiB/4 KiB-page/256 KiB-erase/33-partition map expose writable children:
++boot (mtd27) and system (mtd31). All other children remain read-only. The secure
++EFS range 0x00380000..0x01980000 is blocked through secure-regions. The sysupgrade
++platform requires metadata, the CPE compatible and both writable children.
++It uses the standard NAND sysupgrade tar with boot, system and rootfs volumes.
++
++SYS blue/red GPIOs are 18/63, Ethernet 17, 4G 16 and 5G 19. Ethernet follows
++link/activity; cellular LEDs follow ModemManager RAT. Reset is GPIO32, active
++low with pull-up and 20 ms polling. Physical press/release events were verified;
++the short press reboots while preserving configuration. The user completed
++the long-press factory-reset test and confirmed that SIM settings were restored
++afterwards. A post-test check found a new SSH host key, no test marker, and
++working mobile data; the configuration-free interval was not captured during
++the subsequent handoff.
++
++## Validation and installation status
++
++The first clean CPE initramfs booted through the stock-kernel RAM handoff.
++HTTP LuCI and Cellular Network browser checks passed, including LTE/NR values,
++cell-lock form rendering and absence of JavaScript errors. Root blank-password
++SSH worked. Mobile autostart connected to O2 CZ with the previously verified
++private SIM configuration. Live NAND flags allowed only boot/system; concurrent
++4 KiB and 1 MiB boot reads matched the original backup. sysupgrade -T accepted
++the generated image without writing flash.
++
++A previous integrated RAM image also passed a separate LAN client DHCP, DNS,
++HTTP and NAT test, and LTE cell-lock apply/readback/data/restore tests. IPv6
++service was not supplied by the test carrier and is not hardware validated.
++
++The GZIP CPE initramfs now also boots directly through a freshly restarted
++fastboot, without the stock kernel. USB console root login, blank-password SSH,
++HTTP LuCI, 1 Gb/s Ethernet, modem startup, SIM unlock with verified private
++settings and O2 data passed. A separate LAN namespace passed DHCP, DNS, NAT
++and HTTP through that mobile connection. The image builder places aliases and
++chosen before memory, preserving all DTB properties, and gives initramfs an
++explicit RAM root. Failed image attempts can affect subsequent bootloader
++tests; restart directly into fastboot before each independent RAM trial.
++
++The full standard initramfs also booted from NAND recovery after clearing the
++vendor fastboot flag described below. USB root login, blank-password SSH,
++HTTP LuCI/Cellular Network login, 1 Gb/s Ethernet, LTE/5G NSA data and a separate
++LAN client's DHCP/DNS/NAT/HTTP passed. No native-DTB handoff shim was required.
++Persistent installation into boot/system has passed: the installed kernel,
++rootfs and preserved recovery readback hashes match; normal startup uses
++squashfs with a writable UBIFS overlay. A software reboot preserved the
++configuration and automatically started the modem and AT statistics.
++Stock boot/system have been replaced; the verified original backups remain
++private. A subsequent standard sysupgrade to the corrected kernel preserved
++the overlay marker, SSH host key and verified private SIM configuration;
++kernel/rootfs/recovery readbacks passed again. Mobile data, a separate LAN
++client's DHCP/DNS/NAT/HTTP, native AT statistics, and LTE cell-lock
++apply/readback/data/unlock passed on the installed corrected system.
++The short physical RESET press rebooted and preserved configuration.
++The user also confirmed the long-press RESET test and subsequent restoration
++of SIM settings. Post-test kernel/rootfs/recovery readbacks matched, mobile
++data worked, and all three PIN1 attempts remained available.
++The CPE DT supplies the original board's
++SCM download register (TCSR + 0x13000), so the upstream SCM shutdown handler can
++clear it. With this correction, normal software reboot from the RAM image
++with active LTE/5G NSA data returned to the unchanged stock system without
++any physical power cycle. The bootloader restart target passed with MPSS
++offline. Original-stock software recovery entry and physical RESET recovery
++entry passed; OpenWrt's software recovery target remains unvalidated.
++
++The original ABL reads GPIO32 during startup. Two low readings select LAN
++recovery (boot mode6 / recovery=2); this was established from this device's
++saved ABL, not just a related vendor reference. Physical recovery entry is
++verified with the original recovery service listening on TCP 5000.
++
++The vendor's fastboot flash/erase handlers persist `fastboot-abnormal` in
++misc. At the next startup this flag bypasses kernel loading, including RESET
++recovery selection, and launches fastboot directly. After flashing recovery,
++issue a normal `fastboot reboot` before a physical recovery test. The normal
++reboot handler clears this flag; `fastboot reboot bootloader` does not.
++Negative cold tests performed without clearing it do not establish a Linux,
++DTB or image-size failure. This behavior was verified in the saved device's
++ABL and by reading misc; the original recovery booted after clearing it.
++
++Installation was performed only after the independent OpenWrt NAND recovery
++and stock restoration prechecks had passed. The standard upgrade hook stops
++MPSS before changing boot/system and includes its tools in the stage2 RAM root.
++
++All 32 nonsecure original NAND partitions have private backups with gzip CRC
++and decompressed SHA256 verification. EFS and raw OOB are excluded; this is not
++a raw full-chip clone. Keep device-specific backups outside the public patch.
+diff --git a/target/linux/sdx/base-files/etc/board.d/01_leds b/target/linux/sdx/base-files/etc/board.d/01_leds
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/board.d/01_leds
+@@ -0,0 +1,16 @@
++#!/bin/sh
++
++. /lib/functions.sh
++. /lib/functions/uci-defaults.sh
++
++board_config_update
++
++case "$(board_name)" in
++greenpacket,h5-200q1)
++	ucidef_set_led_netdev "lan" "Ethernet link and activity" "h5:ethernet" "eth0"
++	;;
++esac
++
++board_config_flush
++
++exit 0
+diff --git a/target/linux/sdx/base-files/etc/board.d/02_network b/target/linux/sdx/base-files/etc/board.d/02_network
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/board.d/02_network
+@@ -0,0 +1,17 @@
++#!/bin/sh
++
++. /lib/functions.sh
++. /lib/functions/uci-defaults.sh
++
++board_config_update
++
++case "$(board_name)" in
++greenpacket,h5-200q1)
++	ucidef_set_interface_lan "eth0"
++	ucidef_set_interface "lan" ipaddr "192.168.0.1" netmask "255.255.255.0"
++	;;
++esac
++
++board_config_flush
++
++exit 0
+diff --git a/target/linux/sdx/base-files/etc/config/h5-modem b/target/linux/sdx/base-files/etc/config/h5-modem
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/config/h5-modem
+@@ -0,0 +1,2 @@
++config modem 'main'
++	option enabled '1'
+diff --git a/target/linux/sdx/base-files/etc/config/tqftpserv b/target/linux/sdx/base-files/etc/config/tqftpserv
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/config/tqftpserv
+@@ -0,0 +1,3 @@
++config tqftpserv 'main'
++	# RG520N uses the MDM MPSS TFTP service version, not the MSM default.
++	option service_version '3'
+diff --git a/target/linux/sdx/base-files/etc/init.d/h5-cellular-leds b/target/linux/sdx/base-files/etc/init.d/h5-cellular-leds
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/init.d/h5-cellular-leds
+@@ -0,0 +1,12 @@
++#!/bin/sh /etc/rc.common
++START=95
++STOP=10
++USE_PROCD=1
++
++start_service() {
++	[ -x /usr/bin/mmcli ] || return 0
++	procd_open_instance
++	procd_set_param command /usr/libexec/h5-cellular-leds
++	procd_set_param respawn 3600 5 5
++	procd_close_instance
++}
+diff --git a/target/linux/sdx/base-files/etc/init.d/h5-modem b/target/linux/sdx/base-files/etc/init.d/h5-modem
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/init.d/h5-modem
+@@ -0,0 +1,6 @@
++#!/bin/sh /etc/rc.common
++START=78
++
++start() {
++	/usr/libexec/h5-modem-start || logger -t h5-modem 'Modem startup failed; LAN management remains available'
++}
+diff --git a/target/linux/sdx/base-files/etc/inittab b/target/linux/sdx/base-files/etc/inittab
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/inittab
+@@ -0,0 +1,4 @@
++::sysinit:/etc/init.d/rcS S boot
++::shutdown:/etc/init.d/rcS K shutdown
++ttyGS0::askfirst:/usr/libexec/login.sh
++ttyMSM0::askfirst:/usr/libexec/login.sh
+diff --git a/target/linux/sdx/base-files/etc/uci-defaults/90-h5-initial-access b/target/linux/sdx/base-files/etc/uci-defaults/90-h5-initial-access
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/uci-defaults/90-h5-initial-access
+@@ -0,0 +1,22 @@
++#!/bin/sh
++# User-requested fresh-install defaults. Existing configured passwords survive.
++case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
++	greenpacket,h5-200q1) ;;
++	*) exit 0 ;;
++esac
++root_hash="$(sed -n 's/^root:\([^:]*\):.*/\1/p' /etc/shadow)"
++case "$root_hash" in
++	''|'!'|'*')
++	passwd -d root >/dev/null 2>&1
++	;;
++esac
++uci set system.@system[0].ttylogin='1'
++uci commit system
++uci -q batch <<'EOF'
++set dropbear.@dropbear[0].PasswordAuth='on'
++set dropbear.@dropbear[0].RootPasswordAuth='on'
++set uhttpd.main.redirect_https='0'
++commit dropbear
++commit uhttpd
++EOF
++exit 0
+diff --git a/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile b/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile
+@@ -0,0 +1,23 @@
++#!/bin/sh
++[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
++[ -x /usr/bin/mmcli ] || exit 0
++if ! uci -q get network.mobile >/dev/null; then
++	uci -q batch <<'EOF'
++set network.mobile=interface
++set network.mobile.proto='modemmanager'
++set network.mobile.device='qcom-soc'
++set network.mobile.iptype='ipv4v6'
++set network.mobile.auto='1'
++set network.mobile.force_connection='0'
++commit network
++EOF
++fi
++# Standard WAN firewall policy also applies to the cellular bearer.
++for zone in $(uci show firewall | sed -n 's/^\(firewall\.[^=]*\)=zone$/\1/p'); do
++	[ "$(uci -q get "$zone.name")" = wan ] || continue
++	case " $(uci -q get "$zone.network") " in
++		*' mobile '*) ;;
++		*) uci add_list "$zone.network=mobile"; uci commit firewall ;;
++	esac
++done
++exit 0
+diff --git a/target/linux/sdx/base-files/lib/upgrade/platform.sh b/target/linux/sdx/base-files/lib/upgrade/platform.sh
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/base-files/lib/upgrade/platform.sh
+@@ -0,0 +1,48 @@
++REQUIRE_IMAGE_METADATA=1
++CI_KERNPART=boot
++CI_UBIPART=system
++CI_ROOTPART=rootfs
++# platform_check_image is also called after stage2 pivots away from squashfs.
++# Its exact compatible check needs this BusyBox applet in the RAM filesystem.
++RAMFS_COPY_BIN="${RAMFS_COPY_BIN:-} /usr/bin/tr"
++
++platform_check_image() {
++	case "$(board_name)" in
++	greenpacket,h5-200q1)
++		if ! tr '\000' '\n' </proc/device-tree/compatible |
++			grep -qx 'greenpacket,h5-200q1-openwrt'; then
++			echo "Use the H5 CPE initramfs installer; this profile is read-only."
++			return 1
++		fi
++		for idx in 27 31; do
++			flags="$(cat /sys/class/mtd/mtd$idx/flags)"
++			[ $((flags & 1024)) -ne 0 ] || return 1
++		done
++		nand_do_platform_check "$(board_name)" "$1"
++		;;
++	*)
++		echo "Unsupported board"
++		return 1
++		;;
++	esac
++}
++
++platform_do_upgrade() {
++	case "$(board_name)" in
++	greenpacket,h5-200q1)
++		platform_check_image "$1" || return 1
++		# procd stops userspace before this RAM-stage hook. Stop MPSS too,
++		# before erasing system, so it cannot access shared NAND during it.
++		state=/sys/class/remoteproc/remoteproc0/state
++		if [ -f "$state" ]; then
++			case "$(cat "$state")" in
++				running) echo stop >"$state" || return 1 ;;
++				offline) ;;
++				*) echo 'Modem is not in a safe state for NAND upgrade'; return 1 ;;
++			esac
++			[ "$(cat "$state")" = offline ] || return 1
++		fi
++		nand_do_upgrade "$1"
++		;;
++	esac
++}
+diff --git a/target/linux/sdx/base-files/usr/libexec/h5-at-bind b/target/linux/sdx/base-files/usr/libexec/h5-at-bind
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/usr/libexec/h5-at-bind
+@@ -0,0 +1,38 @@
++#!/bin/sh
++# Use the upstream persistent default endpoint, outside MM's WWAN probing.
++set -eu
++[ "$(cat /tmp/sysinfo/board_name)" = greenpacket,h5-200q1 ] || exit 0
++[ "$(cat /sys/class/remoteproc/remoteproc0/state)" = running ] || exit 1
++modprobe rpmsg_char
++
++for n in $(seq 1 10); do
++	count=0
++	for p in /sys/bus/rpmsg/devices/*; do
++		[ -f "$p/name" ] || continue
++		[ "$(cat "$p/name")" = DS ] || continue
++		count=$((count + 1))
++		ds="$p"
++	done
++	[ "$count" = 1 ] && break
++	[ "$count" = 0 ] || exit 1
++	sleep 1
++done
++[ "$count" = 1 ] || exit 1
++if [ -e "$ds/driver" ]; then
++	[ "$(basename "$(readlink "$ds/driver")")" = rpmsg_chrdev ] || exit 1
++else
++	printf '%s\n' rpmsg_chrdev >"$ds/driver_override"
++	printf '%s\n' "${ds##*/}" >/sys/bus/rpmsg/drivers/rpmsg_chrdev/bind
++fi
++for n in $(seq 1 10); do
++	for p in /sys/class/rpmsg/rpmsg[0-9]*; do
++		[ -f "$p/name" ] || continue
++		[ "$(cat "$p/name")" = DS ] || continue
++		[ -c "/dev/${p##*/}" ] || continue
++		chmod 600 "/dev/${p##*/}"
++		ln -sf "/dev/${p##*/}" /dev/h5-at
++		exit 0
++	done
++	sleep 1
++done
++exit 1
+diff --git a/target/linux/sdx/base-files/usr/libexec/h5-cellular-leds b/target/linux/sdx/base-files/usr/libexec/h5-cellular-leds
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/usr/libexec/h5-cellular-leds
+@@ -0,0 +1,28 @@
++#!/bin/sh
++# Drive only the radio LEDs; modem control remains with ModemManager/netifd.
++set_led() {
++	local path="/sys/class/leds/h5:$1/brightness"
++	[ -w "$path" ] && echo "$2" > "$path"
++}
++trap 'set_led 4g 0; set_led 5g 0; exit 0' TERM INT
++while :; do
++	info="$(mmcli -m any --output-keyvalue 2>/dev/null)"
++	state="$(printf '%s\n' "$info" | sed -n 's/^modem.generic.state *: *//p')"
++	tech="$(printf '%s\n' "$info" | sed -n \
++		-e 's/^modem.generic.access-technologies *: *//p' \
++		-e 's/^modem.generic.access-technologies.value\[[0-9][0-9]*\] *: *//p')"
++	lte=0
++	nr=0
++	case "$state" in
++		registered|connecting|connected)
++			case "$tech" in
++				*5gnr*) nr=1 ;;
++				*lte*) lte=1 ;;
++			esac
++			;;
++	esac
++	set_led 4g "$lte"
++	set_led 5g "$nr"
++	sleep 10 &
++	wait $!
++done
+diff --git a/target/linux/sdx/base-files/usr/libexec/h5-modem-start b/target/linux/sdx/base-files/usr/libexec/h5-modem-start
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/usr/libexec/h5-modem-start
+@@ -0,0 +1,65 @@
++#!/bin/sh
++# Start the upstream drivers using the existing stock read-only firmware volume.
++set -eu
++[ "$(cat /tmp/sysinfo/board_name)" = greenpacket,h5-200q1 ] || exit 0
++[ "$(uci -q get h5-modem.main.enabled)" = 1 ] || exit 0
++[ -f "/lib/modules/$(uname -r)/ipa.ko" ] || exit 0
++if [ -f /sys/class/remoteproc/remoteproc0/state ] &&
++   [ "$(cat /sys/class/remoteproc/remoteproc0/state)" = running ]; then
++	exit 0
++fi
++
++# This bring-up profile must never let UBI write to the original firmware.
++[ "$(cat /sys/class/mtd/mtd30/name)" = modem ]
++[ "$(cat /sys/class/mtd/mtd30/size)" = 120586240 ]
++flags="$(cat /sys/class/mtd/mtd30/flags)"
++[ $((flags & 0x400)) -eq 0 ]
++find_firmware_ubi() {
++	for path in /sys/class/ubi/ubi[0-9]*; do
++		[ -f "$path/mtd_num" ] || continue
++		[ "$(cat "$path/mtd_num")" = 30 ] || continue
++		basename "$path"
++		return 0
++	done
++	return 1
++}
++ubi="$(find_firmware_ubi)" || {
++	ubiattach -m 30 /dev/ubi_ctrl
++	ubi="$(find_firmware_ubi)"
++}
++[ "$(cat "/sys/class/ubi/${ubi}_0/name")" = modem ]
++block="/dev/ubiblock${ubi#ubi}_0"
++[ -b "$block" ] || ubiblock -c "/dev/${ubi}_0"
++mkdir -p /mnt/h5-stock-firmware /lib/firmware/greenpacket-h5
++grep -q ' /mnt/h5-stock-firmware ' /proc/mounts ||
++	mount -t squashfs -o ro,nodev,nosuid,noexec "$block" /mnt/h5-stock-firmware
++grep -q ' /lib/firmware/greenpacket-h5 ' /proc/mounts ||
++	mount -o bind /mnt/h5-stock-firmware/image /lib/firmware/greenpacket-h5
++printf '%s\n' '4bc2dede57fa1950e51899443c1a1683db9415aa980f09567d2a1a0881650359  /lib/firmware/greenpacket-h5/modem.mdt' |
++	sha256sum -c -
++
++# Cache runtime support files before MPSS starts. NAND/BAM hardware locking
++# also serializes shared accesses, while this cache avoids repeated flash
++# reads during modem registration. PAS loads signed segments before reset
++# is released.
++support=/tmp/h5-modem-firmware
++mkdir -p "$support"
++if ! grep -q ' /lib/firmware/greenpacket-h5/modem_pr ' /proc/mounts; then
++	cp -a /mnt/h5-stock-firmware/image/modem_pr "$support/"
++	mount -o bind "$support/modem_pr" /lib/firmware/greenpacket-h5/modem_pr
++fi
++
++modprobe smp2p
++modprobe qcom_q6v5_pas
++modprobe ipa
++[ "$(cat /sys/class/remoteproc/remoteproc0/name)" = 4080000.remoteproc ]
++echo disabled > /sys/class/remoteproc/remoteproc0/recovery
++echo disabled > /sys/class/remoteproc/remoteproc0/coredump
++# Discover remoteproc's firmware directory after PAS registration, before boot.
++/etc/init.d/tqftpserv restart
++sleep 1
++echo start > /sys/class/remoteproc/remoteproc0/state
++if [ -f "/lib/modules/$(uname -r)/rpmsg_char.ko" ]; then
++	/usr/libexec/h5-at-bind || logger -t h5-modem 'DS AT endpoint binding failed'
++fi
++logger -t h5-modem 'Modem started with upstream drivers and local read-only stock firmware'
+diff --git a/target/linux/sdx/config-6.12 b/target/linux/sdx/config-6.12
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/config-6.12
+@@ -0,0 +1,654 @@
++CONFIG_KERNEL_GZIP=y
++# CONFIG_KERNEL_XZ is not set
++CONFIG_ALIGNMENT_TRAP=y
++# CONFIG_APQ_GCC_8084 is not set
++# CONFIG_APQ_MMCC_8084 is not set
++CONFIG_ARCH_32BIT_OFF_T=y
++CONFIG_ARCH_HIBERNATION_POSSIBLE=y
++CONFIG_ARCH_KEEP_MEMBLOCK=y
++CONFIG_ARCH_MIGHT_HAVE_PC_PARPORT=y
++CONFIG_ARCH_MULTIPLATFORM=y
++CONFIG_ARCH_MULTI_V6_V7=y
++CONFIG_ARCH_MULTI_V7=y
++CONFIG_ARCH_OPTIONAL_KERNEL_RWX=y
++CONFIG_ARCH_OPTIONAL_KERNEL_RWX_DEFAULT=y
++CONFIG_ARCH_QCOM=y
++# CONFIG_ARCH_QCOM_IPQ40XX_BOOT_COMPRESSED_PET_WATCHDOG_EARLY is not set
++# CONFIG_ARCH_QCOM_RESERVE_SMEM is not set
++CONFIG_ARCH_SELECT_MEMORY_MODEL=y
++CONFIG_ARCH_SPARSEMEM_ENABLE=y
++CONFIG_ARCH_STACKWALK=y
++CONFIG_ARCH_SUSPEND_POSSIBLE=y
++CONFIG_ARM=y
++CONFIG_ARM_AMBA=y
++CONFIG_ARM_APPENDED_DTB=y
++CONFIG_ARM_ARCH_TIMER=y
++CONFIG_ARM_ARCH_TIMER_EVTSTREAM=y
++# CONFIG_ARM_ATAG_DTB_COMPAT is not set
++CONFIG_ARM_CPUIDLE=y
++# CONFIG_ARM_CPU_TOPOLOGY is not set
++CONFIG_ARM_GIC=y
++CONFIG_ARM_HAS_GROUP_RELOCS=y
++CONFIG_ARM_L1_CACHE_SHIFT=6
++CONFIG_ARM_L1_CACHE_SHIFT_6=y
++CONFIG_ARM_PATCH_IDIV=y
++CONFIG_ARM_PATCH_PHYS_VIRT=y
++CONFIG_ARM_PSCI_FW=y
++# CONFIG_ARM_QCOM_CPUFREQ_HW is not set
++# CONFIG_ARM_QCOM_CPUFREQ_NVMEM is not set
++# CONFIG_ARM_QCOM_SPM_CPUIDLE is not set
++CONFIG_ARM_SMMU=y
++CONFIG_ARM_DMA_IOMMU_ALIGNMENT=8
++CONFIG_ARM_SMMU_QCOM=y
++# CONFIG_ARM_SMMU_QCOM_DEBUG is not set
++CONFIG_ARM_SMMU_DISABLE_BYPASS_BY_DEFAULT=y
++# CONFIG_ARM_SMMU_LEGACY_DT_BINDINGS is not set
++CONFIG_ARM_THUMB=y
++CONFIG_ARM_UNWIND=y
++CONFIG_ARM_VIRT_EXT=y
++# CONFIG_AT803X_PHY is not set
++CONFIG_AUTO_ZRELADDR=y
++CONFIG_BCH=y
++CONFIG_BINFMT_FLAT_ARGVP_ENVP_ON_STACK=y
++CONFIG_BLK_DEV_LOOP=y
++CONFIG_BLK_MQ_PCI=y
++CONFIG_BOUNCE=y
++# CONFIG_CACHE_L2X0 is not set
++CONFIG_CC_HAVE_STACKPROTECTOR_TLS=y
++CONFIG_CLKSRC_QCOM=y
++CONFIG_CLONE_BACKWARDS=y
++CONFIG_CMDLINE="console=ttyMSM0,115200n8"
++CONFIG_CMDLINE_PARTITION=y
++CONFIG_COMMON_CLK=y
++CONFIG_COMMON_CLK_QCOM=y
++CONFIG_QCOM_A7PLL=y
++CONFIG_COMPACT_UNEVICTABLE_DEFAULT=1
++CONFIG_COMPAT_32BIT_TIME=y
++CONFIG_CONTEXT_TRACKING=y
++CONFIG_CONTEXT_TRACKING_IDLE=y
++CONFIG_CPUFREQ_DT=y
++CONFIG_CPUFREQ_DT_PLATDEV=y
++CONFIG_CPU_32v6K=y
++CONFIG_CPU_32v7=y
++CONFIG_CPU_ABRT_EV7=y
++CONFIG_CPU_CACHE_V7=y
++CONFIG_CPU_CACHE_VIPT=y
++CONFIG_CPU_COPY_V6=y
++CONFIG_CPU_CP15=y
++CONFIG_CPU_CP15_MMU=y
++CONFIG_CPU_FREQ=y
++CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y
++CONFIG_CPU_FREQ_GOV_ATTR_SET=y
++CONFIG_CPU_FREQ_GOV_COMMON=y
++# CONFIG_CPU_FREQ_GOV_CONSERVATIVE is not set
++CONFIG_CPU_FREQ_GOV_ONDEMAND=y
++CONFIG_CPU_FREQ_GOV_PERFORMANCE=y
++# CONFIG_CPU_FREQ_GOV_POWERSAVE is not set
++# CONFIG_CPU_FREQ_GOV_USERSPACE is not set
++CONFIG_CPU_FREQ_STAT=y
++CONFIG_CPU_HAS_ASID=y
++CONFIG_CPU_IDLE=y
++CONFIG_CPU_IDLE_GOV_LADDER=y
++CONFIG_CPU_IDLE_GOV_MENU=y
++CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y
++CONFIG_CPU_LITTLE_ENDIAN=y
++CONFIG_CPU_MITIGATIONS=y
++CONFIG_CPU_PABRT_V7=y
++CONFIG_CPU_PM=y
++CONFIG_CPU_RMAP=y
++CONFIG_CPU_SPECTRE=y
++CONFIG_CPU_THERMAL=y
++CONFIG_CPU_THUMB_CAPABLE=y
++CONFIG_CPU_TLB_V7=y
++CONFIG_CPU_V7=y
++CONFIG_CRC16=y
++CONFIG_CRC8=y
++CONFIG_CRYPTO_AES_ARM=y
++CONFIG_CRYPTO_AES_ARM_BS=y
++CONFIG_CRYPTO_ARCH_HAVE_LIB_BLAKE2S=y
++CONFIG_CRYPTO_BLAKE2S_ARM=y
++CONFIG_CRYPTO_CBC=y
++CONFIG_CRYPTO_CRYPTD=y
++CONFIG_CRYPTO_DEFLATE=y
++CONFIG_CRYPTO_DES=y
++CONFIG_CRYPTO_DEV_QCE=y
++# CONFIG_CRYPTO_DEV_QCE_ENABLE_AEAD is not set
++# CONFIG_CRYPTO_DEV_QCE_ENABLE_ALL is not set
++# CONFIG_CRYPTO_DEV_QCE_ENABLE_SHA is not set
++CONFIG_CRYPTO_DEV_QCE_ENABLE_SKCIPHER=y
++CONFIG_CRYPTO_DEV_QCE_SKCIPHER=y
++CONFIG_CRYPTO_DEV_QCE_SW_MAX_LEN=512
++CONFIG_CRYPTO_DEV_QCOM_RNG=y
++CONFIG_CRYPTO_DRBG=y
++CONFIG_CRYPTO_DRBG_HMAC=y
++CONFIG_CRYPTO_DRBG_MENU=y
++CONFIG_CRYPTO_ECB=y
++CONFIG_CRYPTO_GENIV=y
++CONFIG_CRYPTO_HMAC=y
++CONFIG_CRYPTO_HW=y
++CONFIG_CRYPTO_JITTERENTROPY=y
++CONFIG_CRYPTO_JITTERENTROPY_MEMORY_BLOCKS=64
++CONFIG_CRYPTO_JITTERENTROPY_MEMORY_BLOCKSIZE=32
++CONFIG_CRYPTO_JITTERENTROPY_OSR=1
++CONFIG_CRYPTO_LIB_DES=y
++CONFIG_CRYPTO_LIB_GF128MUL=y
++CONFIG_CRYPTO_LIB_SHA1=y
++CONFIG_CRYPTO_LIB_SHA256=y
++CONFIG_CRYPTO_LIB_UTILS=y
++CONFIG_CRYPTO_LZO=y
++CONFIG_CRYPTO_RNG=y
++CONFIG_CRYPTO_RNG2=y
++CONFIG_CRYPTO_RNG_DEFAULT=y
++CONFIG_CRYPTO_SEQIV=y
++CONFIG_CRYPTO_SHA1=y
++CONFIG_CRYPTO_SHA256=y
++CONFIG_CRYPTO_SHA256_ARM=y
++CONFIG_CRYPTO_SHA3=y
++CONFIG_CRYPTO_SHA512=y
++CONFIG_CRYPTO_SIMD=y
++CONFIG_CRYPTO_XTS=y
++CONFIG_CRYPTO_ZSTD=y
++CONFIG_CURRENT_POINTER_IN_TPIDRURO=y
++CONFIG_DCACHE_WORD_ACCESS=y
++CONFIG_DEBUG_INFO=y
++CONFIG_DEBUG_LL_INCLUDE="mach/debug-macro.S"
++CONFIG_DEBUG_MISC=y
++CONFIG_DMADEVICES=y
++CONFIG_DMA_ENGINE=y
++CONFIG_DMA_NEED_SYNC=y
++CONFIG_DMA_OF=y
++CONFIG_DMA_OPS_HELPERS=y
++CONFIG_DMA_SHARED_BUFFER=y
++CONFIG_DMA_VIRTUAL_CHANNELS=y
++CONFIG_DTC=y
++CONFIG_DT_IDLE_STATES=y
++CONFIG_EDAC_ATOMIC_SCRUB=y
++CONFIG_EDAC_SUPPORT=y
++CONFIG_EEPROM_AT24=y
++CONFIG_EXCLUSIVE_SYSTEM_RAM=y
++CONFIG_EXTCON=y
++CONFIG_FIXED_PHY=y
++CONFIG_FIX_EARLYCON_MEM=y
++CONFIG_FS_IOMAP=y
++CONFIG_FUNCTION_ALIGNMENT=0
++CONFIG_FWNODE_MDIO=y
++CONFIG_FW_LOADER_PAGED_BUF=y
++CONFIG_FW_LOADER_SYSFS=y
++CONFIG_GENERIC_ALLOCATOR=y
++CONFIG_GENERIC_BUG=y
++CONFIG_GENERIC_CLOCKEVENTS=y
++CONFIG_GENERIC_CLOCKEVENTS_BROADCAST=y
++CONFIG_GENERIC_CPU_AUTOPROBE=y
++CONFIG_GENERIC_CPU_DEVICES=y
++CONFIG_GENERIC_CPU_VULNERABILITIES=y
++CONFIG_GENERIC_EARLY_IOREMAP=y
++CONFIG_GENERIC_GETTIMEOFDAY=y
++CONFIG_GENERIC_IDLE_POLL_SETUP=y
++CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK=y
++CONFIG_GENERIC_IRQ_MULTI_HANDLER=y
++CONFIG_GENERIC_IRQ_SHOW=y
++CONFIG_GENERIC_IRQ_SHOW_LEVEL=y
++CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED=y
++CONFIG_GENERIC_MSI_IRQ=y
++CONFIG_GENERIC_PCI_IOMAP=y
++CONFIG_GENERIC_PHY=y
++CONFIG_GENERIC_PINCONF=y
++CONFIG_GENERIC_PINCTRL_GROUPS=y
++CONFIG_GENERIC_PINMUX_FUNCTIONS=y
++CONFIG_GENERIC_SCHED_CLOCK=y
++CONFIG_GENERIC_SMP_IDLE_THREAD=y
++CONFIG_GENERIC_STRNCPY_FROM_USER=y
++CONFIG_GENERIC_STRNLEN_USER=y
++CONFIG_GENERIC_TIME_VSYSCALL=y
++CONFIG_GENERIC_VDSO_32=y
++CONFIG_GPIOLIB_IRQCHIP=y
++CONFIG_GPIO_74X164=y
++CONFIG_GPIO_CDEV=y
++CONFIG_GPIO_WATCHDOG=y
++CONFIG_GPIO_WATCHDOG_ARCH_INITCALL=y
++CONFIG_GRO_CELLS=y
++# CONFIG_HARDEN_BRANCH_HISTORY is not set
++# CONFIG_HARDEN_BRANCH_PREDICTOR is not set
++CONFIG_HARDIRQS_SW_RESEND=y
++CONFIG_HAS_DMA=y
++CONFIG_HAS_IOMEM=y
++CONFIG_HAS_IOPORT=y
++CONFIG_HAS_IOPORT_MAP=y
++CONFIG_HAVE_SMP=y
++CONFIG_HIGHMEM=y
++# CONFIG_HIGHPTE is not set
++CONFIG_HWSPINLOCK=y
++CONFIG_HWSPINLOCK_QCOM=y
++CONFIG_HW_RANDOM=y
++CONFIG_HW_RANDOM_OPTEE=y
++CONFIG_HZ_FIXED=0
++CONFIG_I2C=y
++CONFIG_I2C_BOARDINFO=y
++CONFIG_I2C_CHARDEV=y
++CONFIG_I2C_HELPER_AUTO=y
++# CONFIG_I2C_QCOM_CCI is not set
++CONFIG_I2C_QUP=y
++CONFIG_INITRAMFS_SOURCE=""
++CONFIG_INTERCONNECT=y
++CONFIG_INTERCONNECT_CLK=y
++CONFIG_INTERCONNECT_QCOM=y
++CONFIG_INTERCONNECT_QCOM_SDX65=y
++# CONFIG_IOMMUFD is not set
++# CONFIG_IOMMU_DEBUGFS is not set
++# CONFIG_IOMMU_IO_PGTABLE_ARMV7S is not set
++CONFIG_IOMMU_IO_PGTABLE_LPAE=y
++# CONFIG_IOMMU_IO_PGTABLE_LPAE_SELFTEST is not set
++CONFIG_IOMMU_DEFAULT_DMA_STRICT=y
++# CONFIG_IOMMU_DEFAULT_DMA_LAZY is not set
++# CONFIG_IOMMU_DEFAULT_PASSTHROUGH is not set
++CONFIG_IOMMU_SUPPORT=y
++# CONFIG_IPQ_APSS_PLL is not set
++# CONFIG_IPQ_GCC_4019 is not set
++# CONFIG_IPQ_GCC_5018 is not set
++# CONFIG_IPQ_GCC_6018 is not set
++# CONFIG_IPQ_GCC_806X is not set
++# CONFIG_IPQ_GCC_8074 is not set
++# CONFIG_IPQ_GCC_9574 is not set
++# CONFIG_IPQ_LCC_806X is not set
++# CONFIG_IPQ_NSSCC_QCA8K is not set
++CONFIG_IRQCHIP=y
++CONFIG_IRQSTACKS=y
++CONFIG_IRQ_DOMAIN=y
++CONFIG_IRQ_DOMAIN_HIERARCHY=y
++CONFIG_IRQ_FASTEOI_HIERARCHY_HANDLERS=y
++CONFIG_IRQ_FORCED_THREADING=y
++CONFIG_IRQ_WORK=y
++CONFIG_KMAP_LOCAL=y
++CONFIG_KMAP_LOCAL_NON_LINEAR_PTE_ARRAY=y
++# CONFIG_KPSS_XCC is not set
++# CONFIG_KRAITCC is not set
++CONFIG_LEDS_GPIO=y
++CONFIG_LEDS_LP5523=y
++CONFIG_LEDS_LP5562=y
++CONFIG_LEDS_LP55XX_COMMON=y
++CONFIG_LEDS_TLC591XX=y
++CONFIG_LED_TRIGGER_PHY=y
++CONFIG_LIBFDT=y
++CONFIG_LOCK_DEBUGGING_SUPPORT=y
++CONFIG_LOCK_SPIN_ON_OWNER=y
++CONFIG_LZO_COMPRESS=y
++CONFIG_LZO_DECOMPRESS=y
++CONFIG_MAILBOX=y
++CONFIG_MDIO_BITBANG=y
++CONFIG_MDIO_BUS=y
++CONFIG_MDIO_DEVICE=y
++CONFIG_MDIO_DEVRES=y
++CONFIG_MDIO_GPIO=y
++# CONFIG_MDIO_IPQ4019 is not set
++# CONFIG_MDM_GCC_9615 is not set
++# CONFIG_MFD_HI6421_SPMI is not set
++# CONFIG_MFD_QCOM_RPM is not set
++CONFIG_MFD_SPMI_PMIC=y
++CONFIG_MFD_SYSCON=y
++CONFIG_REBOOT_MODE=y
++CONFIG_SYSCON_REBOOT_MODE=y
++CONFIG_MIGHT_HAVE_CACHE_L2X0=y
++CONFIG_MIGRATION=y
++CONFIG_MMC=y
++CONFIG_MMC_BLOCK=y
++CONFIG_MMC_CQHCI=y
++CONFIG_MMC_SDHCI=y
++CONFIG_MMC_SDHCI_IO_ACCESSORS=y
++CONFIG_MMC_SDHCI_MSM=y
++CONFIG_MMC_SDHCI_PLTFM=y
++CONFIG_MMU_LAZY_TLB_REFCOUNT=y
++CONFIG_MODULES_USE_ELF_REL=y
++# CONFIG_MSM_GCC_8660 is not set
++# CONFIG_MSM_GCC_8909 is not set
++# CONFIG_MSM_GCC_8916 is not set
++# CONFIG_MSM_GCC_8939 is not set
++# CONFIG_MSM_GCC_8960 is not set
++# CONFIG_MSM_GCC_8974 is not set
++# CONFIG_MSM_GCC_8976 is not set
++# CONFIG_MSM_GCC_8994 is not set
++# CONFIG_MSM_GCC_8996 is not set
++# CONFIG_MSM_GCC_8998 is not set
++# CONFIG_MSM_GPUCC_8998 is not set
++# CONFIG_MSM_IOMMU is not set
++# CONFIG_MSM_LCC_8960 is not set
++# CONFIG_MSM_MMCC_8960 is not set
++# CONFIG_MSM_MMCC_8974 is not set
++# CONFIG_MSM_MMCC_8996 is not set
++# CONFIG_MSM_MMCC_8998 is not set
++CONFIG_MTD_CMDLINE_PARTS=y
++CONFIG_MTD_NAND_CORE=y
++CONFIG_MTD_NAND_ECC=y
++CONFIG_MTD_NAND_ECC_SW_BCH=y
++CONFIG_MTD_NAND_ECC_SW_HAMMING=y
++CONFIG_MTD_NAND_QCOM=y
++CONFIG_MTD_QCOMSMEM_PARTS=y
++CONFIG_MTD_RAW_NAND=y
++CONFIG_MTD_UBI=y
++CONFIG_MTD_UBI_WL_THRESHOLD=4096
++CONFIG_MTD_UBI_BEB_LIMIT=20
++CONFIG_MTD_UBI_BLOCK=y
++# CONFIG_MTD_UBI_FASTMAP is not set
++# CONFIG_MTD_UBI_GLUEBI is not set
++# CONFIG_MTD_UBI_FAULT_INJECTION is not set
++# CONFIG_MTD_UBI_NVMEM is not set
++CONFIG_UBIFS_FS=y
++CONFIG_UBIFS_FS_XATTR=y
++CONFIG_UBIFS_FS_ADVANCED_COMPR=y
++CONFIG_UBIFS_FS_LZO=y
++CONFIG_UBIFS_FS_ZLIB=y
++CONFIG_MTD_SPI_NAND=y
++CONFIG_MTD_SPI_NOR=y
++CONFIG_MTD_SPLIT_FIRMWARE=y
++CONFIG_MTD_SPLIT_FIT_FW=y
++CONFIG_MTD_SPLIT_WRGG_FW=y
++CONFIG_MUTEX_SPIN_ON_OWNER=y
++CONFIG_NEED_DMA_MAP_STATE=y
++CONFIG_NEED_SRCU_NMI_SAFE=y
++CONFIG_NEON=y
++CONFIG_NET_DEVLINK=y
++CONFIG_NET_DEVMEM=y
++CONFIG_NET_DSA=y
++# CONFIG_NET_DSA_QCA8K_IPQ4019 is not set
++CONFIG_NET_DSA_TAG_OOB=y
++CONFIG_NET_EGRESS=y
++CONFIG_NET_FLOW_LIMIT=y
++CONFIG_NET_INGRESS=y
++CONFIG_NET_PTP_CLASSIFY=y
++CONFIG_NET_SELFTESTS=y
++CONFIG_NET_XGRESS=y
++CONFIG_NLS=y
++CONFIG_NO_HZ=y
++CONFIG_NO_HZ_COMMON=y
++CONFIG_NO_HZ_IDLE=y
++CONFIG_NR_CPUS=2
++CONFIG_NVMEM=y
++CONFIG_NVMEM_BLOCK=y
++CONFIG_NVMEM_LAYOUTS=y
++CONFIG_NVMEM_LAYOUT_ASCII_ENV=y
++CONFIG_NVMEM_LAYOUT_U_BOOT_ENV=y
++CONFIG_NVMEM_QCOM_QFPROM=y
++# CONFIG_NVMEM_QCOM_SEC_QFPROM is not set
++CONFIG_NVMEM_SPMI_SDAM=y
++CONFIG_NVMEM_SYSFS=y
++CONFIG_OF=y
++CONFIG_OF_ADDRESS=y
++CONFIG_OF_EARLY_FLATTREE=y
++CONFIG_OF_FLATTREE=y
++CONFIG_OF_GPIO=y
++CONFIG_OF_IRQ=y
++CONFIG_OF_KOBJ=y
++CONFIG_OF_MDIO=y
++CONFIG_OLD_SIGACTION=y
++CONFIG_OLD_SIGSUSPEND3=y
++CONFIG_OPTEE=y
++CONFIG_PADATA=y
++CONFIG_PAGE_OFFSET=0xC0000000
++CONFIG_PAGE_POOL=y
++CONFIG_PAGE_SIZE_LESS_THAN_256KB=y
++CONFIG_PAGE_SIZE_LESS_THAN_64KB=y
++CONFIG_PCI=y
++CONFIG_PCIEAER=y
++CONFIG_PCIEPORTBUS=y
++CONFIG_PCIE_DW=y
++CONFIG_PCIE_DW_HOST=y
++CONFIG_PCIE_QCOM=y
++CONFIG_PCIE_QCOM_COMMON=y
++CONFIG_PCI_DISABLE_COMMON_QUIRKS=y
++CONFIG_PCI_DOMAINS=y
++CONFIG_PCI_DOMAINS_GENERIC=y
++CONFIG_PCI_MSI=y
++CONFIG_PERF_USE_VMALLOC=y
++CONFIG_PER_VMA_LOCK=y
++CONFIG_PGTABLE_LEVELS=2
++CONFIG_PHYLIB=y
++CONFIG_PHYLIB_LEDS=y
++CONFIG_PHYLINK=y
++# CONFIG_PHY_QCOM_APQ8064_SATA is not set
++# CONFIG_PHY_QCOM_EDP is not set
++# CONFIG_PHY_QCOM_EUSB2_REPEATER is not set
++# CONFIG_PHY_QCOM_IPQ4019_USB is not set
++# CONFIG_PHY_QCOM_IPQ806X_SATA is not set
++# CONFIG_PHY_QCOM_IPQ806X_USB is not set
++# CONFIG_PHY_QCOM_M31_USB is not set
++# CONFIG_PHY_QCOM_PCIE2 is not set
++CONFIG_PHY_QCOM_QMP=y
++# CONFIG_PHY_QCOM_QMP_COMBO is not set
++CONFIG_PHY_QCOM_QMP_PCIE=y
++# CONFIG_PHY_QCOM_QMP_PCIE_8996 is not set
++# CONFIG_PHY_QCOM_QMP_UFS is not set
++CONFIG_PHY_QCOM_QMP_USB=y
++# CONFIG_PHY_QCOM_QMP_USB_LEGACY is not set
++# CONFIG_PHY_QCOM_QMP_USB3_UNI is not set
++# CONFIG_PHY_QCOM_QUSB2 is not set
++# CONFIG_PHY_QCOM_SGMII_ETH is not set
++# CONFIG_PHY_QCOM_SNPS_EUSB2 is not set
++# CONFIG_PHY_QCOM_USB_HS_28NM is not set
++CONFIG_PHY_QCOM_USB_SNPS_FEMTO_V2=y
++# CONFIG_PHY_QCOM_USB_SS is not set
++CONFIG_PINCTRL=y
++# CONFIG_PINCTRL_APQ8064 is not set
++# CONFIG_PINCTRL_APQ8084 is not set
++# CONFIG_PINCTRL_IPQ4019 is not set
++# CONFIG_PINCTRL_IPQ8064 is not set
++# CONFIG_PINCTRL_MDM9615 is not set
++CONFIG_PINCTRL_MSM=y
++# CONFIG_PINCTRL_MSM8226 is not set
++# CONFIG_PINCTRL_MSM8660 is not set
++# CONFIG_PINCTRL_MSM8909 is not set
++# CONFIG_PINCTRL_MSM8916 is not set
++# CONFIG_PINCTRL_MSM8960 is not set
++CONFIG_PINCTRL_QCOM_SPMI_PMIC=y
++# CONFIG_PINCTRL_QCOM_SSBI_PMIC is not set
++CONFIG_PINCTRL_SDX65=y
++CONFIG_PM=y
++CONFIG_PM_GENERIC_DOMAINS=y
++CONFIG_PM_OPP=y
++CONFIG_POWER_RESET=y
++CONFIG_POWER_RESET_GPIO_RESTART=y
++CONFIG_POWER_RESET_MSM=y
++CONFIG_POWER_SUPPLY=y
++CONFIG_PPS=y
++CONFIG_PRINTK_TIME=y
++CONFIG_PTP_1588_CLOCK=y
++CONFIG_PTP_1588_CLOCK_OPTIONAL=y
++# CONFIG_QCA807X_PHY is not set
++# CONFIG_QCM_DISPCC_2290 is not set
++# CONFIG_QCM_GCC_2290 is not set
++CONFIG_QCOM_A53PLL=y
++# CONFIG_QCOM_ADM is not set
++CONFIG_QCOM_AOSS_QMP=y
++CONFIG_QCOM_APCS_IPC=y
++CONFIG_QCOM_BAM_DMA=y
++CONFIG_QCOM_CLK_APCS_SDX55=y
++CONFIG_QCOM_CLK_RPMH=y
++CONFIG_QCOM_COMMAND_DB=y
++# CONFIG_QCOM_CPR is not set
++# CONFIG_QCOM_EBI2 is not set
++# CONFIG_QCOM_GENI_SE is not set
++# CONFIG_QCOM_GSBI is not set
++# CONFIG_QCOM_HFPLL is not set
++# CONFIG_QCOM_ICC_BWMON is not set
++# CONFIG_QCOM_IOMMU is not set
++# CONFIG_QCOM_IPQ4019_ESS_EDMA is not set
++# CONFIG_QCOM_LLCC is not set
++CONFIG_QCOM_NET_PHYLIB=y
++# CONFIG_QCOM_OCMEM is not set
++CONFIG_QCOM_PDC=y
++# CONFIG_QCOM_Q6V5_MSS is not set
++# CONFIG_QCOM_Q6V5_PAS is not set
++# CONFIG_QCOM_QSEECOM is not set
++# CONFIG_QCOM_RAMP_CTRL is not set
++# CONFIG_QCOM_RMTFS_MEM is not set
++CONFIG_QCOM_RPMH=y
++CONFIG_QCOM_RPMHPD=y
++# CONFIG_QCOM_RPM_MASTER_STATS is not set
++CONFIG_QCOM_SCM=y
++CONFIG_QCOM_SMEM=y
++# CONFIG_QCOM_SOCINFO is not set
++# CONFIG_QCOM_SPM is not set
++# CONFIG_QCOM_STATS is not set
++CONFIG_QCOM_TCSR=y
++# CONFIG_QCOM_TSENS is not set
++CONFIG_QCOM_TZMEM=y
++CONFIG_QCOM_TZMEM_MODE_GENERIC=y
++# CONFIG_QCOM_TZMEM_MODE_SHMBRIDGE is not set
++CONFIG_QCOM_WDT=y
++# CONFIG_QCS_GCC_404 is not set
++# CONFIG_QCS_Q6SSTOP_404 is not set
++# CONFIG_QCS_TURING_404 is not set
++# CONFIG_QDU_GCC_1000 is not set
++CONFIG_RANDSTRUCT_NONE=y
++CONFIG_RAS=y
++CONFIG_RATIONAL=y
++CONFIG_REGMAP=y
++CONFIG_REGMAP_I2C=y
++CONFIG_REGMAP_MMIO=y
++CONFIG_REGULATOR=y
++CONFIG_REGULATOR_FIXED_VOLTAGE=y
++# CONFIG_REGULATOR_QCOM_LABIBB is not set
++CONFIG_REGULATOR_QCOM_RPMH=y
++# CONFIG_REGULATOR_QCOM_SPMI is not set
++# CONFIG_REGULATOR_QCOM_USB_VBUS is not set
++CONFIG_REGULATOR_VCTRL=y
++# CONFIG_REGULATOR_VQMMC_IPQ4019 is not set
++CONFIG_RESET_CONTROLLER=y
++# CONFIG_RESET_QCOM_AOSS is not set
++# CONFIG_RESET_QCOM_PDC is not set
++CONFIG_RFS_ACCEL=y
++# CONFIG_RPMSG_QCOM_GLINK_SMEM is not set
++# CONFIG_RPMSG_QCOM_SMD is not set
++CONFIG_RPS=y
++CONFIG_RTC_CLASS=y
++# CONFIG_RTC_DRV_OPTEE is not set
++CONFIG_RTC_I2C_AND_SPI=y
++CONFIG_RTC_MC146818_LIB=y
++CONFIG_RWSEM_SPIN_ON_OWNER=y
++# CONFIG_SA_GCC_8775P is not set
++# CONFIG_SA_GPUCC_8775P is not set
++CONFIG_SDX_GCC_65=y
++# CONFIG_SDX_GCC_75 is not set
++CONFIG_SERIAL_8250_FSL=y
++CONFIG_SERIAL_MCTRL_GPIO=y
++CONFIG_SERIAL_MSM=y
++CONFIG_SERIAL_MSM_CONSOLE=y
++CONFIG_SGL_ALLOC=y
++CONFIG_SKB_EXTENSIONS=y
++CONFIG_SMP=y
++CONFIG_SMP_ON_UP=y
++CONFIG_SOCK_RX_QUEUE_MAPPING=y
++CONFIG_SOFTIRQ_ON_OWN_STACK=y
++CONFIG_SPARSE_IRQ=y
++CONFIG_SPI=y
++CONFIG_SPI_BITBANG=y
++CONFIG_SPI_GPIO=y
++CONFIG_SPI_MASTER=y
++CONFIG_SPI_MEM=y
++# CONFIG_SPI_QPIC_SNAND is not set
++CONFIG_SPI_QUP=y
++CONFIG_SPLIT_PTE_PTLOCKS=y
++CONFIG_SPMI=y
++# CONFIG_SPMI_HISI3670 is not set
++CONFIG_SPMI_MSM_PMIC_ARB=y
++# CONFIG_SPMI_PMIC_CLKDIV is not set
++CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=y
++CONFIG_SQUASHFS_ZLIB=y
++CONFIG_SWPHY=y
++CONFIG_SWP_EMULATE=y
++CONFIG_SYS_SUPPORTS_APM_EMULATION=y
++CONFIG_TEE=y
++CONFIG_THERMAL=y
++CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE=y
++CONFIG_THERMAL_EMERGENCY_POWEROFF_DELAY_MS=0
++CONFIG_THERMAL_GOV_STEP_WISE=y
++CONFIG_THERMAL_OF=y
++CONFIG_THREAD_INFO_IN_TASK=y
++CONFIG_TICK_CPU_ACCOUNTING=y
++CONFIG_TIMER_OF=y
++CONFIG_TIMER_PROBE=y
++CONFIG_TREE_RCU=y
++CONFIG_TREE_SRCU=y
++CONFIG_UEVENT_HELPER_PATH=""
++CONFIG_UNCOMPRESS_INCLUDE="debug/uncompress.h"
++CONFIG_UNWINDER_ARM=y
++CONFIG_USB=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_GADGET=y
++# CONFIG_USB_DWC3_HOST is not set
++# CONFIG_USB_DWC3_DUAL_ROLE is not set
++CONFIG_USB_DWC3_QCOM=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_G_SERIAL=y
++CONFIG_USB_U_SERIAL=y
++CONFIG_U_SERIAL_CONSOLE=y
++CONFIG_USB_LIBCOMPOSITE=y
++CONFIG_USB_F_ACM=y
++CONFIG_USB_F_SERIAL=y
++CONFIG_USB_F_OBEX=y
++CONFIG_USB_COMMON=y
++CONFIG_USB_SUPPORT=y
++CONFIG_USE_OF=y
++CONFIG_VFP=y
++CONFIG_VFPv3=y
++CONFIG_WATCHDOG_CORE=y
++CONFIG_XPS=y
++CONFIG_XXHASH=y
++CONFIG_XZ_DEC_ARM=y
++CONFIG_XZ_DEC_BCJ=y
++CONFIG_ZBOOT_ROM_BSS=0
++CONFIG_ZBOOT_ROM_TEXT=0
++CONFIG_ZLIB_DEFLATE=y
++CONFIG_ZLIB_INFLATE=y
++CONFIG_ZSTD_COMMON=y
++CONFIG_ZSTD_COMPRESS=y
++CONFIG_ZSTD_DECOMPRESS=y
++# CONFIG_QCOM_COINCELL is not set
++# CONFIG_QCOM_FASTRPC is not set
++# CONFIG_RPMSG_TTY is not set
++# CONFIG_RPMSG_CHAR is not set
++# CONFIG_RPMSG_CTRL is not set
++# CONFIG_RPMSG_NS is not set
++# CONFIG_QCOM_SMD_RPM is not set
++# CONFIG_QCOM_WCNSS_CTRL is not set
++# CONFIG_QCOM_APR is not set
++# CONFIG_REMOTEPROC_CDEV is not set
++# CONFIG_QCOM_Q6V5_ADSP is not set
++# CONFIG_QCOM_Q6V5_MSS is not set
++# CONFIG_QCOM_Q6V5_WCSS is not set
++# CONFIG_QCOM_WCNSS_PIL is not set
++# CONFIG_VIRTIO_BLK is not set
++# CONFIG_VIRTIO_NET is not set
++# CONFIG_VIRTIO_DEBUG is not set
++# CONFIG_NSM is not set
++# CONFIG_QCOM_IPA is not set
++CONFIG_POWER_RESET_QCOM_PON=y
++CONFIG_NVMEM_REBOOT_MODE=y
++# CONFIG_PM8916_WATCHDOG is not set
++# CONFIG_RTC_DRV_PM8XXX is not set
++# CONFIG_QCOM_CLK_APCS_MSM8916 is not set
++# CONFIG_IPQ_APSS_6018 is not set
++# CONFIG_ARM_MHU_V2 is not set
++# CONFIG_MAILBOX_TEST is not set
++# CONFIG_QCOM_IPCC is not set
++# CONFIG_QCOM_SMP2P is not set
++# CONFIG_QCOM_SMSM is not set
++# CONFIG_QCOM_MPM is not set
++# CONFIG_INTERCONNECT_QCOM_OSM_L3 is not set
++# CONFIG_INTERCONNECT_QCOM_QDU1000 is not set
++# CONFIG_INTERCONNECT_QCOM_SA8775P is not set
++# CONFIG_INTERCONNECT_QCOM_SC7180 is not set
++# CONFIG_INTERCONNECT_QCOM_SC7280 is not set
++# CONFIG_INTERCONNECT_QCOM_SC8180X is not set
++# CONFIG_INTERCONNECT_QCOM_SC8280XP is not set
++# CONFIG_INTERCONNECT_QCOM_SDM670 is not set
++# CONFIG_INTERCONNECT_QCOM_SDM845 is not set
++# CONFIG_INTERCONNECT_QCOM_SDX55 is not set
++# CONFIG_INTERCONNECT_QCOM_SDX75 is not set
++# CONFIG_INTERCONNECT_QCOM_SM6350 is not set
++# CONFIG_INTERCONNECT_QCOM_SM7150 is not set
++# CONFIG_INTERCONNECT_QCOM_SM8150 is not set
++# CONFIG_INTERCONNECT_QCOM_SM8250 is not set
++# CONFIG_INTERCONNECT_QCOM_SM8350 is not set
++# CONFIG_INTERCONNECT_QCOM_SM8450 is not set
++# CONFIG_INTERCONNECT_QCOM_SM8550 is not set
++# CONFIG_INTERCONNECT_QCOM_SM8650 is not set
++# CONFIG_INTERCONNECT_QCOM_X1E80100 is not set
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-cpe.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-cpe.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-cpe.dts
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#include "qcom-sdx65-greenpacket-h5-ipa.dts"
++
++/ {
++	/* Keep the first compatible stable for normal OpenWrt board detection. */
++	compatible = "greenpacket,h5-200q1", "greenpacket,h5-200q1-openwrt", "qcom,sdx65";
++};
++
++&{/soc/sram@1468f000} {
++	reboot-mode {
++		compatible = "syscon-reboot-mode";
++		offset = <0x65c>;
++		/* Verified against this H5's original restart driver. */
++		mode-normal = <0x77665501>;
++		mode-bootloader = <0x77665500>;
++		mode-recovery = <0x77665502>;
++	};
++};
++
++/* Match this board's original SCM download-mode register at 0x01fd3000.
++ * The upstream SCM driver clears it on orderly shutdown. Without the DT
++ * address it may leave an inherited download-mode request untouched.
++ */
++&{/firmware/scm} {
++	qcom,dload-mode = <&tcsr 0x13000>;
++};
++
++&tcsr {
++	reg = <0x01fc0000 0x30000>;
++};
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-ipa.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-ipa.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-ipa.dts
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#include "qcom-sdx65-greenpacket-h5-modem.dts"
++
++&ipa {
++	/* Stock boot firmware already enables GSI; do not load it a second time. */
++	qcom,gsi-loader = "skip";
++	interrupts-extended = <&intc GIC_SPI 241 IRQ_TYPE_LEVEL_HIGH>,
++			      <&intc GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH>,
++			      <&ipa_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
++			      <&ipa_smp2p_in 1 IRQ_TYPE_EDGE_RISING>;
++	memory-region = <&ipa_fw_mem>;
++	status = "okay";
++};
++
++&qpic_bam {
++	status = "okay";
++};
++
++&qpic_nand {
++	status = "okay";
++
++	nand@0 {
++		reg = <0>;
++		nand-ecc-strength = <4>;
++		nand-ecc-step-size = <512>;
++		nand-bus-width = <8>;
++		/* Exact efs2 range from the verified H5 MIBIB backup. Access is
++		 * blocked by the NAND core before any hardware read is issued.
++		 */
++		secure-regions = /bits/ 64 <0x380000 0x1600000>;
++	};
++};
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-modem.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-modem.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-modem.dts
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#include "qcom-sdx65-greenpacket-h5-usb-pcie-compat.dts"
++
++&remoteproc_mpss {
++	/* Exact stock MPSS carveout; firmware is supplied only after RAM boot. */
++	memory-region = <&mpss_adsp_mem>;
++	firmware-name = "greenpacket-h5/modem.mdt";
++	status = "okay";
++};
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-pcie.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-pcie.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-pcie.dts
+@@ -0,0 +1,132 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* Experimental PCIe RC bring-up. No modem or flash support is enabled. */
++#include "qcom-sdx65-greenpacket-h5.dts"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++
++/ {
++	pcie_card_power: regulator-pcie-card {
++		compatible = "regulator-fixed";
++		regulator-name = "pcie_card_vreg";
++		gpio = <&tlmm 102 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <4000>;
++		/* Stock DT does not specify this rail's voltage. */
++	};
++};
++
++&apps_rsc {
++	regulators {
++		compatible = "qcom,pmx65-rpmh-regulators";
++		qcom,pmic-id = "b";
++
++		pcie_vdda_phy: ldo1 {
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		pcie_vdda_pll: ldo4 {
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <912000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&apps_smmu {
++	status = "okay";
++};
++
++&pcie_phy {
++	vdda-phy-supply = <&pcie_vdda_phy>;
++	vdda-pll-supply = <&pcie_vdda_pll>;
++	status = "okay";
++};
++
++&soc {
++	pcie_rc: pcie@1c00000 {
++		compatible = "qcom,pcie-sdx65";
++		reg = <0x01c00000 0x3000>,
++		      <0x40000000 0xf1d>,
++		      <0x40000f20 0xa8>,
++		      <0x40001000 0x1000>,
++		      <0x40100000 0x100000>;
++		reg-names = "parf", "dbi", "elbi", "atu", "config";
++		device_type = "pci";
++		linux,pci-domain = <0>;
++		bus-range = <0x00 0xff>;
++		max-link-speed = <3>;
++		num-lanes = <1>;
++		#address-cells = <3>;
++		#size-cells = <2>;
++		ranges = <0x01000000 0x0 0x00000000 0x40200000 0x0 0x100000>,
++			 <0x02000000 0x0 0x40300000 0x40300000 0x0 0x3fd00000>;
++
++		interrupts = <GIC_SPI 119 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 122 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 124 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 125 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SPI 126 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "msi", "msi2", "msi3", "msi4",
++				  "msi5", "msi6", "msi7", "msi8";
++		#interrupt-cells = <1>;
++		interrupt-map-mask = <0 0 0 0x7>;
++		interrupt-map = <0 0 0 1 &intc 0 141 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 2 &intc 0 142 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 3 &intc 0 143 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 4 &intc 0 144 IRQ_TYPE_LEVEL_HIGH>;
++
++		clocks = <&gcc GCC_PCIE_PIPE_CLK>,
++			 <&gcc GCC_PCIE_AUX_CLK>,
++			 <&gcc GCC_PCIE_CFG_AHB_CLK>,
++			 <&gcc GCC_PCIE_MSTR_AXI_CLK>,
++			 <&gcc GCC_PCIE_SLV_AXI_CLK>,
++			 <&gcc GCC_PCIE_SLV_Q2A_AXI_CLK>,
++			 <&gcc GCC_PCIE_SLEEP_CLK>;
++		clock-names = "pipe", "aux", "cfg", "bus_master",
++			      "bus_slave", "slave_q2a", "sleep";
++		resets = <&gcc GCC_PCIE_BCR>;
++		reset-names = "pci";
++		power-domains = <&gcc PCIE_GDSC>;
++		phys = <&pcie_phy>;
++		phy-names = "pciephy";
++		vdda-supply = <&pcie_vdda_phy>;
++		vddpe-3v3-supply = <&pcie_card_power>;
++		interconnects = <&system_noc MASTER_PCIE_0 &mc_virt SLAVE_EBI1>,
++			       <&mem_noc MASTER_APPSS_PROC &system_noc SLAVE_PCIE_0>;
++		interconnect-names = "pcie-mem", "cpu-pcie";
++		iommu-map = <0x0 &apps_smmu 0x200 0x1>,
++			    <0x100 &apps_smmu 0x201 0x1>;
++		perst-gpios = <&tlmm 57 GPIO_ACTIVE_LOW>;
++		pinctrl-0 = <&pcie_rc_clkreq &pcie_rc_perst &pcie_rc_wake>;
++		pinctrl-names = "default";
++		status = "okay";
++	};
++};
++
++&tlmm {
++	pcie_rc_clkreq: pcie-rc-clkreq-state {
++		pins = "gpio56";
++		function = "pcie_clkreq";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	pcie_rc_perst: pcie-rc-perst-state {
++		pins = "gpio57";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	pcie_rc_wake: pcie-rc-wake-state {
++		pins = "gpio53";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++};
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-usb-debug.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-usb-debug.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-usb-debug.dts
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* Experimental, RAM-only USB console. Flash and modem remain disabled. */
++#include "qcom-sdx65-greenpacket-h5-pcie.dts"
++
++&{/chosen} {
++	bootargs = "console=ttyGS0,115200n8 loglevel=7";
++};
++
++&apps_rsc {
++	regulators {
++		/* Actual H5 stock DT: PMX65 L5 = 1.8 V, L10 = 3.088 V. */
++		usb_vdda18: ldo5 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++
++		usb_vdda33: ldo10 {
++			regulator-min-microvolt = <3088000>;
++			regulator-max-microvolt = <3088000>;
++			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++		};
++	};
++};
++
++&usb {
++	status = "okay";
++};
++
++&usb_dwc3 {
++	dr_mode = "peripheral";
++	maximum-speed = "high-speed";
++	phys = <&usb_hsphy>, <&usb_qmpphy>;
++	phy-names = "usb2-phy", "usb3-phy";
++};
++
++&usb_qmpphy {
++	/* Actual stock DT: shared PMX65 L4 and L1 rails. */
++	vdda-phy-supply = <&pcie_vdda_pll>;
++	vdda-pll-supply = <&pcie_vdda_phy>;
++	status = "okay";
++};
++
++&gcc {
++	clocks = <&rpmhcc RPMH_CXO_CLK>, <&rpmhcc RPMH_CXO_CLK_A>,
++		 <&sleep_clk>, <&pcie_phy>, <&usb_qmpphy>;
++};
++
++&usb_hsphy {
++	/* Stock H5 uses the same L4, L5 and L10 rails as upstream SDX65. */
++	vdda-pll-supply = <&pcie_vdda_pll>;
++	vdda18-supply = <&usb_vdda18>;
++	vdda33-supply = <&usb_vdda33>;
++	status = "okay";
++};
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-usb-pcie-compat.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-usb-pcie-compat.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-usb-pcie-compat.dts
+@@ -0,0 +1,7 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/* RAM comparison with the PCIe service policy captured from H5 stock. */
++#include "qcom-sdx65-greenpacket-h5-usb-debug.dts"
++
++&{/chosen} {
++	bootargs = "console=ttyGS0,115200n8 loglevel=7 pcie_ports=compat pci=pcie_bus_safe";
++};
+diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5.dts
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5.dts
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/dts-v1/;
++
++#include "qcom-sdx65.dtsi"
++#include <arm64/qcom/pmk8350.dtsi>
++#include "pmx65.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++
++/ {
++	model = "GreenPacket H5-200Q1";
++	compatible = "greenpacket,h5-200q1", "qcom,sdx65";
++	qcom,msm-id = <458 0x20000>, <483 0x20000>, <509 0x20000>;
++	qcom,board-id = <0x4010008 0x204>;
++
++	/* ABL normally fills this in; direct RAM boot must be self-contained. */
++	memory {
++		reg = <0x80000000 0x20000000>;
++	};
++
++	aliases {
++		serial0 = &blsp1_uart3;
++		led-boot = &led_system_blue;
++		led-failsafe = &led_system_red;
++		led-running = &led_system_blue;
++		led-upgrade = &led_system_red;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
++	keys {
++		compatible = "gpio-keys-polled";
++		poll-interval = <20>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&reset_button_default>;
++
++		/* Stock turin_reset: TLMM GPIO32, active low, pulled high. */
++		reset {
++			label = "reset";
++			linux,code = <KEY_RESTART>;
++			gpios = <&tlmm 32 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	leds {
++		compatible = "gpio-leds";
++		pinctrl-names = "default";
++		pinctrl-0 = <&system_led_default>;
++
++		/* GPIO18 is physically blue on this H5 (stock calls it green). */
++		led_system_blue: led-system {
++			label = "blue:system";
++			gpios = <&tlmm 18 GPIO_ACTIVE_HIGH>;
++			linux,default-trigger = "heartbeat";
++			default-state = "on";
++		};
++
++		led_system_red: led-system-red {
++			label = "red:system";
++			gpios = <&tlmm 63 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led-ethernet {
++			label = "h5:ethernet";
++			gpios = <&tlmm 17 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led-4g {
++			label = "h5:4g";
++			gpios = <&tlmm 16 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led-5g {
++			label = "h5:5g";
++			gpios = <&tlmm 19 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++	};
++
++	reserved-memory {
++		/* Preserve the carveouts captured from the stock H5 DT. */
++		audio_mem: memory@8c000000 {
++			reg = <0x8c000000 0x400000>;
++			no-map;
++		};
++
++		mpss_dsm: memory@8c400000 {
++			reg = <0x8c400000 0x3200000>;
++			no-map;
++		};
++
++		ipa_fw_mem: memory@8fced000 {
++			reg = <0x8fced000 0x10000>;
++			no-map;
++		};
++
++		mpss_adsp_mem: memory@90800000 {
++			reg = <0x90800000 0xf800000>;
++			no-map;
++		};
++	};
++};
++
++&access_control_mem {
++	reg = <0x8fd80000 0x40000>;
++};
++
++&apps_smmu {
++	status = "disabled";
++};
++
++&blsp1_uart3 {
++	status = "okay";
++};
++
++&tlmm {
++	reset_button_default: reset-button-default-state {
++		pins = "gpio32";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	system_led_default: system-led-default-state {
++		pins = "gpio16", "gpio17", "gpio18", "gpio19", "gpio63";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
++
++/* This initial RAM bring-up description does not enable flash or the modem. */
++&ipa {
++	status = "disabled";
++};
++
++&pcie_ep {
++	status = "disabled";
++};
++
++&qpic_bam {
++	status = "disabled";
++};
++
++&qpic_nand {
++	status = "disabled";
++};
++
++&remoteproc_mpss {
++	status = "disabled";
++};
+diff --git a/target/linux/sdx/generic/target.mk b/target/linux/sdx/generic/target.mk
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/generic/target.mk
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++BOARDNAME:=SDX65
+diff --git a/target/linux/sdx/h5-cpe.config b/target/linux/sdx/h5-cpe.config
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/h5-cpe.config
+@@ -0,0 +1,25 @@
++CONFIG_TARGET_sdx=y
++CONFIG_TARGET_sdx_generic=y
++CONFIG_TARGET_sdx_generic_DEVICE_greenpacket_h5-200q1-cpe=y
++CONFIG_KERNEL_BUILD_USER="builder"
++CONFIG_KERNEL_BUILD_DOMAIN="buildhost"
++CONFIG_TARGET_ROOTFS_INITRAMFS=y
++CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
++CONFIG_TARGET_ROOTFS_SQUASHFS=y
++CONFIG_PACKAGE_luci=y
++CONFIG_PACKAGE_modemmanager=y
++CONFIG_PACKAGE_modemmanager-rpcd=y
++CONFIG_PACKAGE_luci-proto-modemmanager=y
++CONFIG_PACKAGE_luci-app-h5-modem=y
++CONFIG_MODEMMANAGER_WITH_NETIFD=y
++CONFIG_MODEMMANAGER_WITH_QMI=y
++CONFIG_MODEMMANAGER_WITH_QRTR=y
++# CONFIG_MODEMMANAGER_WITH_MBIM is not set
++# CONFIG_MODEMMANAGER_WITH_AT_COMMAND_VIA_DBUS is not set
++CONFIG_PACKAGE_kmod-h5-ipa=y
++CONFIG_PACKAGE_kmod-h5-rpmsg-at=y
++CONFIG_PACKAGE_h5-modem-tools=y
++CONFIG_PACKAGE_kmod-rmnet=y
++CONFIG_PACKAGE_ubi-utils=y
++CONFIG_PACKAGE_ip-full=y
++CONFIG_PACKAGE_tqftpserv=y
+diff --git a/target/linux/sdx/h5-modem.config b/target/linux/sdx/h5-modem.config
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/h5-modem.config
+@@ -0,0 +1,22 @@
++CONFIG_TARGET_sdx=y
++CONFIG_TARGET_sdx_generic=y
++CONFIG_TARGET_sdx_generic_DEVICE_greenpacket_h5-200q1-ipa=y
++CONFIG_TARGET_ROOTFS_INITRAMFS=y
++CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
++CONFIG_PACKAGE_luci=y
++CONFIG_PACKAGE_modemmanager=y
++CONFIG_PACKAGE_modemmanager-rpcd=y
++CONFIG_PACKAGE_luci-proto-modemmanager=y
++CONFIG_MODEMMANAGER_WITH_NETIFD=y
++CONFIG_MODEMMANAGER_WITH_QMI=y
++CONFIG_MODEMMANAGER_WITH_QRTR=y
++# CONFIG_MODEMMANAGER_WITH_MBIM is not set
++# CONFIG_MODEMMANAGER_WITH_AT_COMMAND_VIA_DBUS is not set
++CONFIG_PACKAGE_kmod-h5-ipa=y
++CONFIG_PACKAGE_kmod-h5-rpmsg-at=y
++CONFIG_PACKAGE_h5-modem-tools=y
++CONFIG_PACKAGE_luci-app-h5-modem=y
++CONFIG_PACKAGE_kmod-rmnet=y
++CONFIG_PACKAGE_ubi-utils=y
++CONFIG_PACKAGE_ip-full=y
++CONFIG_PACKAGE_tqftpserv=y
+diff --git a/target/linux/sdx/h5-web.config b/target/linux/sdx/h5-web.config
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/h5-web.config
+@@ -0,0 +1,9 @@
++# Seed for a clean vanilla OpenWrt v25.12.6 checkout; run make defconfig.
++CONFIG_TARGET_sdx=y
++CONFIG_TARGET_sdx_generic=y
++CONFIG_TARGET_sdx_generic_DEVICE_greenpacket_h5-200q1-web=y
++CONFIG_TARGET_ROOTFS_INITRAMFS=y
++# CONFIG_TARGET_INITRAMFS_COMPRESSION_GZIP is not set
++CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
++CONFIG_PACKAGE_luci=y
++CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
+diff --git a/target/linux/sdx/image/h5-bootimg.py b/target/linux/sdx/image/h5-bootimg.py
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/image/h5-bootimg.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""H5 Android boot header v0; no external ramdisk, DTB appended to zImage."""
++import hashlib
++import pathlib
++import struct
++import sys
++
++def bootloader_node_order(blob):
++    """Keep aliases/chosen ahead of memory edits in ABL's cached FDT walk."""
++    header = struct.unpack_from('>10I', blob)
++    pos, depth, prefix_end = header[2], 0, None
++    children = []
++    while True:
++        begin = pos
++        token, = struct.unpack_from('>I', blob, pos)
++        pos += 4
++        if token == 1:
++            end = blob.index(0, pos)
++            if depth == 1:
++                if prefix_end is None:
++                    prefix_end = begin
++                current = (blob[pos:end].decode('ascii'), begin)
++            depth += 1
++            pos = (end + 4) & ~3
++        elif token == 2:
++            depth -= 1
++            if depth == 1:
++                children.append((current[0], blob[current[1]:pos]))
++            elif depth == 0:
++                tail = blob[begin:header[2] + header[9]]
++                break
++        elif token == 3:
++            length, = struct.unpack_from('>I', blob, pos)
++            pos = (pos + 8 + length + 3) & ~3
++        elif token != 4:
++            raise ValueError('Invalid FDT token')
++    first = ('aliases', 'chosen')
++    assert all(sum(name == wanted for name, _ in children) == 1 for wanted in first)
++    ordered = [chunk for wanted in first for name, chunk in children if name == wanted]
++    ordered += [chunk for name, chunk in children if name not in first]
++    structure = blob[header[2]:prefix_end] + b''.join(ordered) + tail
++    assert len(structure) == header[9]
++    result = blob[:header[2]] + structure + blob[header[2] + header[9]:]
++    assert len(result) == len(blob)
++    return result
++
++source, destination, cmdline = sys.argv[1:]
++kernel = pathlib.Path(source).read_bytes()
++assert struct.unpack_from('<I', kernel, 0x24)[0] == 0x016f2818
++zsize = struct.unpack_from('<I', kernel, 0x2c)[0]
++assert struct.unpack_from('>I', kernel, zsize)[0] == 0xd00dfeed
++assert zsize + struct.unpack_from('>I', kernel, zsize + 4)[0] == len(kernel)
++kernel = kernel[:zsize] + bootloader_node_order(kernel[zsize:])
++command = cmdline.encode('ascii')
++assert len(command) < 1536
++header = bytearray(4096)
++header[:8] = b'ANDROID!'
++struct.pack_into('<10I', header, 8, len(kernel), 0x80008000, 0, 0x81100000,
++                 0, 0x80f00000, 0x82000000, 4096, 0, 0)
++header[48:64] = b'H5-200Q1'.ljust(16, b'\0')
++header[64:576] = command[:512].ljust(512, b'\0')
++header[608:1632] = command[512:].ljust(1024, b'\0')
++header[576:596] = hashlib.sha1(kernel + struct.pack('<I', len(kernel)) + bytes(8)).digest()
++image = header + kernel + bytes((-len(kernel)) % 4096)
++assert len(image) <= 16 * 1024 * 1024
++pathlib.Path(destination).write_bytes(image)
+diff --git a/target/linux/sdx/image/Makefile b/target/linux/sdx/image/Makefile
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/image/Makefile
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++include $(TOPDIR)/rules.mk
++include $(INCLUDE_DIR)/image.mk
++DEVICE_VARS += H5_CMDLINE
++
++define Build/h5-bootimg
++	python3 $(TOPDIR)/target/linux/sdx/image/h5-bootimg.py $@ $@.new "$(strip $(H5_CMDLINE) $(1))"
++	mv $@.new $@
++endef
++
++define Device/greenpacket_h5-200q1
++  DEVICE_VENDOR := GreenPacket
++  DEVICE_MODEL := H5-200Q1
++  KERNEL_NAME := zImage
++  DEVICE_DTS_DIR := $$(DTS_DIR)/qcom
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5
++  DEVICE_DTC_FLAGS := -@
++  DEVICE_PACKAGES := kmod-gpio-button-hotplug
++  KERNEL_INITRAMFS := kernel-bin | append-dtb
++  IMAGES :=
++endef
++TARGET_DEVICES += greenpacket_h5-200q1
++
++define Device/greenpacket_h5-200q1-pcie
++  $(call Device/greenpacket_h5-200q1)
++  DEVICE_VARIANT := Experimental PCIe RAM test
++  SUPPORTED_DEVICES := greenpacket,h5-200q1
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5-pcie
++  DEVICE_PACKAGES += kmod-r8169 pciutils
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-pcie
++
++define Device/greenpacket_h5-200q1-usb-debug
++  $(call Device/greenpacket_h5-200q1-pcie)
++  DEVICE_VARIANT := Experimental USB serial RAM test
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5-usb-debug
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-usb-debug
++
++define Device/greenpacket_h5-200q1-usb-pcie-compat
++  $(call Device/greenpacket_h5-200q1-usb-debug)
++  DEVICE_VARIANT := Experimental USB RAM test with stock PCIe policy
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5-usb-pcie-compat
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-usb-pcie-compat
++
++define Device/greenpacket_h5-200q1-web
++  $(call Device/greenpacket_h5-200q1-usb-pcie-compat)
++  DEVICE_VARIANT := Experimental LuCI HTTP RAM test
++  DEVICE_PACKAGES += luci
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-web
++
++define Device/greenpacket_h5-200q1-modem
++  $(call Device/greenpacket_h5-200q1-web)
++  DEVICE_VARIANT := Experimental MPSS firmware RAM test
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5-modem
++  DEVICE_PACKAGES += kmod-h5-mpss
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-modem
++
++define Device/greenpacket_h5-200q1-ipa
++  $(call Device/greenpacket_h5-200q1-modem)
++  DEVICE_VARIANT := Experimental IPA cellular data RAM test
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5-ipa
++  DEVICE_PACKAGES += kmod-h5-ipa kmod-h5-rpmsg-at h5-modem-tools luci-app-h5-modem ip-full modemmanager modemmanager-rpcd luci-proto-modemmanager ubi-utils tqftpserv
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-ipa
++
++define Device/greenpacket_h5-200q1-cpe
++  $(call Device/greenpacket_h5-200q1-ipa)
++  DEVICE_VARIANT := CPE router
++  DEVICE_DTS := qcom-sdx65-greenpacket-h5-cpe
++  BOARD_NAME := greenpacket_h5-200q1
++  KERNEL_SIZE := 16384k
++  IMAGE_SIZE := 128000k
++  BLOCKSIZE := 256k
++  PAGESIZE := 4096
++  # Select RAM or the new OpenWrt system volume explicitly, without stock rootfs arguments.
++  H5_CMDLINE := noinitrd ro rootwait console=ttyGS0,115200n8 pcie_ports=compat pci=pcie_bus_safe
++  KERNEL := kernel-bin | append-dtb | h5-bootimg ubi.mtd=system root=/dev/ubiblock0_0 rootfstype=squashfs | check-size $$(KERNEL_SIZE)
++  KERNEL_INITRAMFS := kernel-bin | append-dtb | h5-bootimg root=/dev/ram0 | check-size $$(KERNEL_SIZE)
++  FILESYSTEMS := squashfs
++  IMAGES := sysupgrade.bin
++  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata | check-size
++endef
++TARGET_DEVICES += greenpacket_h5-200q1-cpe
++
++$(eval $(call BuildImage))
+diff --git a/target/linux/sdx/Makefile b/target/linux/sdx/Makefile
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/Makefile
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++include $(TOPDIR)/rules.mk
++
++ARCH:=arm
++BOARD:=sdx
++BOARDNAME:=Qualcomm SDX modems
++CPU_TYPE:=cortex-a7
++CPU_SUBTYPE:=neon-vfpv4
++FEATURES:=fpu ramdisk pci pcie nand squashfs
++SUBTARGETS:=generic
++KERNEL_PATCHVER:=6.12
++KERNELNAME:=zImage dtbs
++
++include $(INCLUDE_DIR)/target.mk
++
++$(eval $(call BuildTarget))
+diff --git a/target/linux/sdx/modules.mk b/target/linux/sdx/modules.mk
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/modules.mk
+@@ -0,0 +1,93 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++define KernelPackage/h5-modem-transport
++  SUBMENU:=Network Support
++  TITLE:=H5 Qualcomm GLINK SMEM and QRTR transport
++  DEPENDS:=@TARGET_sdx +kmod-qrtr
++  KCONFIG:= \
++	CONFIG_RPMSG \
++	CONFIG_RPMSG_QCOM_GLINK \
++	CONFIG_RPMSG_QCOM_GLINK_SMEM \
++	CONFIG_QRTR_SMD
++  FILES:= \
++	$(LINUX_DIR)/drivers/rpmsg/rpmsg_core.ko \
++	$(LINUX_DIR)/drivers/rpmsg/qcom_glink.ko \
++	$(LINUX_DIR)/drivers/rpmsg/qcom_glink_smem.ko \
++	$(LINUX_DIR)/net/qrtr/qrtr-smd.ko
++  AUTOLOAD:=$(call AutoProbe,rpmsg_core qcom_glink qcom_glink_smem qrtr-smd)
++endef
++
++define KernelPackage/h5-modem-transport/description
++ Upstream Linux transport modules for experimental communication with the
++ integrated SDX65 modem. This package does not start remoteproc, load modem
++ firmware, unlock the SIM, establish a data session or enable NAND writes.
++endef
++
++$(eval $(call KernelPackage,h5-modem-transport))
++
++define KernelPackage/h5-mpss
++  SUBMENU:=Network Support
++  TITLE:=H5 upstream modem remoteproc support
++  DEPENDS:=@TARGET_sdx +kmod-h5-modem-transport
++  KCONFIG:= \
++	CONFIG_REMOTEPROC=y \
++	CONFIG_QCOM_SMP2P \
++	CONFIG_QCOM_Q6V5_PAS \
++	CONFIG_QCOM_Q6V5_COMMON \
++	CONFIG_QCOM_RPROC_COMMON \
++	CONFIG_QCOM_PIL_INFO \
++	CONFIG_QCOM_MDT_LOADER \
++	CONFIG_QCOM_QMI_HELPERS \
++	CONFIG_QCOM_SYSMON
++  FILES:= \
++	$(LINUX_DIR)/drivers/soc/qcom/smp2p.ko \
++	$(LINUX_DIR)/drivers/soc/qcom/mdt_loader.ko \
++	$(LINUX_DIR)/drivers/soc/qcom/qmi_helpers.ko \
++	$(LINUX_DIR)/drivers/remoteproc/qcom_pil_info.ko \
++	$(LINUX_DIR)/drivers/remoteproc/qcom_common.ko \
++	$(LINUX_DIR)/drivers/remoteproc/qcom_q6v5.ko \
++	$(LINUX_DIR)/drivers/remoteproc/qcom_sysmon.ko \
++	$(LINUX_DIR)/drivers/remoteproc/qcom_q6v5_pas.ko
++  # Keep experimental MPSS drivers manual until board power/reset is verified.
++endef
++
++define KernelPackage/h5-mpss/description
++ Experimental upstream Qualcomm PAS/remoteproc drivers. The modem profile
++ requires matching firmware copied separately from this device. It does
++ not bundle proprietary modem firmware or enable NAND or cellular data.
++endef
++
++$(eval $(call KernelPackage,h5-mpss))
++
++define KernelPackage/h5-ipa
++  SUBMENU:=Network Devices
++  TITLE:=H5 upstream Qualcomm IPA data transport
++  DEPENDS:=@TARGET_sdx +kmod-h5-mpss +kmod-rmnet
++  KCONFIG:=CONFIG_QCOM_IPA
++  FILES:=$(LINUX_DIR)/drivers/net/ipa/ipa.ko
++  # Manual loading while the board's data path is being verified.
++endef
++
++define KernelPackage/h5-ipa/description
++ Experimental upstream SDX65 IPA and standard RMNET/QMAP data transport.
++ Uses the IPA GSI firmware already initialized by the stock boot firmware.
++endef
++
++$(eval $(call KernelPackage,h5-ipa))
++
++define KernelPackage/h5-rpmsg-at
++  SUBMENU:=Network Support
++  TITLE:=H5 standard RPMSG character endpoint for modem AT commands
++  DEPENDS:=@TARGET_sdx +kmod-h5-modem-transport
++  KCONFIG:=CONFIG_RPMSG_CHAR
++  FILES:=$(LINUX_DIR)/drivers/rpmsg/rpmsg_char.ko
++  # Bind the H5 DS channel explicitly after PAS starts; no WWAN AT probing.
++endef
++
++define KernelPackage/h5-rpmsg-at/description
++ Unmodified upstream RPMSG character driver. The board startup helper binds
++ only the DS channel and exposes /dev/h5-at with root-only access. Its default
++ endpoint survives application close, avoiding repeated GLINK channel opens.
++endef
++
++$(eval $(call KernelPackage,h5-rpmsg-at))
+diff --git a/target/linux/sdx/patches-6.12/100-phy-qcom-sdx65-experimental-rc.patch b/target/linux/sdx/patches-6.12/100-phy-qcom-sdx65-experimental-rc.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/100-phy-qcom-sdx65-experimental-rc.patch
+@@ -0,0 +1,203 @@
++--- a/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
+++++ b/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
++@@ -1628,6 +1628,122 @@
++ 	QMP_PHY_INIT_CFG(QPHY_V4_20_PCS_LANE1_INSIG_MX_CTRL2, 0x00),
++ };
++ 
+++/* Experimental RC values captured from GreenPacket H5 stock DT. */
+++static const struct qmp_phy_init_tbl sdx65_qmp_pcie_rc_serdes_tbl[] = {
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_EN_CENTER, 0x01),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_PER1, 0x31),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_PER2, 0x01),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_STEP_SIZE1_MODE0, 0xde),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_STEP_SIZE2_MODE0, 0x07),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_STEP_SIZE1_MODE1, 0x97),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SSC_STEP_SIZE2_MODE1, 0x0c),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_BIAS_EN_CLKBUFLR_EN, 0x14),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CLK_ENABLE1, 0x90),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_PLL_IVCO, 0x0f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CP_CTRL_MODE0, 0x06),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CP_CTRL_MODE1, 0x06),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_PLL_RCTRL_MODE0, 0x16),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_PLL_RCTRL_MODE1, 0x16),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_PLL_CCTRL_MODE0, 0x36),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_PLL_CCTRL_MODE1, 0x36),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_SYSCLK_EN_SEL, 0x08),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_LOCK_CMP_EN, 0x46),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_LOCK_CMP_CFG, 0x04),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_LOCK_CMP1_MODE0, 0x0a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_LOCK_CMP2_MODE0, 0x1a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_LOCK_CMP1_MODE1, 0x14),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_LOCK_CMP2_MODE1, 0x34),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DEC_START_MODE0, 0x82),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DEC_START_MODE1, 0xd0),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DIV_FRAC_START1_MODE0, 0x55),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DIV_FRAC_START2_MODE0, 0x55),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DIV_FRAC_START3_MODE0, 0x03),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DIV_FRAC_START1_MODE1, 0x55),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DIV_FRAC_START2_MODE1, 0x55),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_DIV_FRAC_START3_MODE1, 0x05),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_VCO_TUNE_MAP, 0x02),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CLK_SELECT, 0x34),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_HSCLK_SEL, 0x12),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_HSCLK_HS_SWITCH_SEL, 0x00),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CORECLK_DIV_MODE0, 0x0a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CORECLK_DIV_MODE1, 0x04),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CMN_MISC1, 0x88),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CORE_CLK_EN, 0x60),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CMN_CONFIG, 0x06),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_CMN_MODE, 0x14),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_COM_VCO_DC_LEVEL_CTRL, 0x0f),
+++};
+++
+++static const struct qmp_phy_init_tbl sdx65_qmp_pcie_rc_tx_tbl[] = {
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_TX_LANE_MODE_1, 0x05),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_TX_LANE_MODE_2, 0xf6),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_TX_RES_CODE_LANE_OFFSET_TX, 0x1a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_TX_RES_CODE_LANE_OFFSET_RX, 0x0c),
+++};
+++
+++static const struct qmp_phy_init_tbl sdx65_qmp_pcie_rc_rx_tbl[] = {
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_UCDR_PI_CONTROLS, 0x16),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_DFE_CTLE_POST_CAL_OFFSET, 0x38),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE_0_1_B1, 0xcc),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE_0_1_B2, 0x12),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE_0_1_B3, 0xcc),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE_0_1_B5, 0x4a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE_0_1_B6, 0x29),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B0, 0xc5),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B1, 0xac),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B2, 0xb6),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B3, 0xc0),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B4, 0x07),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B5, 0xfb),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE2_B6, 0x0d),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B0, 0xc5),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B1, 0xee),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B2, 0xbf),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B3, 0xa0),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B4, 0x81),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B5, 0xde),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MODE_RATE3_B6, 0x7f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_PHPRE_CTRL, 0x20),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_AUX_DATA_THRESH_BIN_RATE_0_1, 0x3f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_AUX_DATA_THRESH_BIN_RATE_2_3, 0x37),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_DFE_3, 0x05),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH1_RATE3, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH2_RATE3, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH3_RATE3, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH4_RATE3, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH5_RATE3, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH6_RATE3, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH1_RATE210, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH2_RATE210, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_MARG_COARSE_THRESH3_RATE210, 0x1f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_UCDR_FO_GAIN_RATE2, 0x0c),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_UCDR_FO_GAIN_RATE3, 0x0a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_VGA_CAL_MAN_VAL, 0x0a),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_EQU_ADAPTOR_CNTRL4, 0x0b),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_RX_IDAC_SAOFFSET, 0x10),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_DFE_DAC_ENABLE1, 0x00),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_GM_CAL, 0x0f),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_TX_ADAPT_POST_THRESH1, 0x00),
+++	QMP_PHY_INIT_CFG(QSERDES_V5_20_RX_TX_ADAPT_POST_THRESH2, 0x1f),
+++};
+++
+++static const struct qmp_phy_init_tbl sdx65_qmp_pcie_rc_pcs_tbl[] = {
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_EQ_CONFIG4, 0x16),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_EQ_CONFIG5, 0x22),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_G3S2_PRE_GAIN, 0x2e),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_RX_SIGDET_LVL, 0xaa),
+++};
+++
+++static const struct qmp_phy_init_tbl sdx65_qmp_pcie_rc_pcs_misc_tbl[] = {
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_ENDPOINT_REFCLK_DRIVE, 0xc1),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_OSC_DTCT_ACTIONS, 0x00),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_G4_EQ_CONFIG5, 0x02),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_EQ_CONFIG1, 0x16),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_RX_MARGINING_CONFIG3, 0x28),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_G4_PRE_GAIN, 0x2e),
+++	QMP_PHY_INIT_CFG(QPHY_V5_20_PCS_PCIE_POWER_STATE_CONFIG2, 0x1d),
+++};
+++
++ static const struct qmp_phy_init_tbl sdx65_qmp_pcie_serdes_tbl[] = {
++ 	QMP_PHY_INIT_CFG(QSERDES_V5_COM_BG_TIMER, 0x02),
++ 	QMP_PHY_INIT_CFG(QSERDES_V5_COM_BIAS_EN_CLKBUFLR_EN, 0x14),
++@@ -2632,6 +2748,8 @@
++ 	const unsigned int *regs;
++ 
++ 	unsigned int pwrdn_ctrl;
+++	/* Optional RC override; zero preserves the existing mask. */
+++	unsigned int pwrdn_ctrl_rc;
++ 	/* bit offset of PHYSTATUS in QPHY_PCS_STATUS register */
++ 	unsigned int phy_status;
++ 
++@@ -3360,7 +3478,7 @@
++ 
++ 	.offsets		= &qmp_pcie_offsets_v6_20,
++ 
++-	.tbls = {
+++	.tbls_ep = &(const struct qmp_phy_cfg_tbls) {
++ 			.serdes         = sdx65_qmp_pcie_serdes_tbl,
++ 			.serdes_num     = ARRAY_SIZE(sdx65_qmp_pcie_serdes_tbl),
++ 			.tx             = sdx65_qmp_pcie_tx_tbl,
++@@ -3372,6 +3490,18 @@
++ 			.pcs_misc       = sdx65_qmp_pcie_pcs_misc_tbl,
++ 			.pcs_misc_num   = ARRAY_SIZE(sdx65_qmp_pcie_pcs_misc_tbl),
++ 		},
+++	.tbls_rc = &(const struct qmp_phy_cfg_tbls) {
+++		.serdes = sdx65_qmp_pcie_rc_serdes_tbl,
+++		.serdes_num = ARRAY_SIZE(sdx65_qmp_pcie_rc_serdes_tbl),
+++		.tx = sdx65_qmp_pcie_rc_tx_tbl,
+++		.tx_num = ARRAY_SIZE(sdx65_qmp_pcie_rc_tx_tbl),
+++		.rx = sdx65_qmp_pcie_rc_rx_tbl,
+++		.rx_num = ARRAY_SIZE(sdx65_qmp_pcie_rc_rx_tbl),
+++		.pcs = sdx65_qmp_pcie_rc_pcs_tbl,
+++		.pcs_num = ARRAY_SIZE(sdx65_qmp_pcie_rc_pcs_tbl),
+++		.pcs_misc = sdx65_qmp_pcie_rc_pcs_misc_tbl,
+++		.pcs_misc_num = ARRAY_SIZE(sdx65_qmp_pcie_rc_pcs_misc_tbl),
+++	},
++ 	.reset_list             = sdm845_pciephy_reset_l,
++ 	.num_resets             = ARRAY_SIZE(sdm845_pciephy_reset_l),
++ 	.vreg_list              = qmp_phy_vreg_l,
++@@ -3379,6 +3509,7 @@
++ 	.regs                   = pciephy_v6_regs_layout,
++ 
++ 	.pwrdn_ctrl             = SW_PWRDN,
+++	.pwrdn_ctrl_rc          = SW_PWRDN | REFCLK_DRV_DSBL,
++ 	.phy_status             = PHYSTATUS_4_20,
++ };
++ 
++@@ -3831,6 +3962,14 @@
++ 	return 0;
++ }
++ 
+++static unsigned int qmp_pcie_pwrdn_ctrl(struct qmp_pcie *qmp)
+++{
+++	if (qmp->mode == PHY_MODE_PCIE_RC && qmp->cfg->pwrdn_ctrl_rc)
+++		return qmp->cfg->pwrdn_ctrl_rc;
+++
+++	return qmp->cfg->pwrdn_ctrl;
+++}
+++
++ static int qmp_pcie_power_on(struct phy *phy)
++ {
++ 	struct qmp_pcie *qmp = phy_get_drvdata(phy);
++@@ -3842,7 +3981,7 @@
++ 	int ret;
++ 
++ 	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
++-			cfg->pwrdn_ctrl);
+++			qmp_pcie_pwrdn_ctrl(qmp));
++ 
++ 	if (qmp->mode == PHY_MODE_PCIE_RC)
++ 		mode_tbls = cfg->tbls_rc;
++@@ -3904,7 +4043,7 @@
++ 
++ 	/* Put PHY into POWER DOWN state: active low */
++ 	qphy_clrbits(qmp->pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
++-			cfg->pwrdn_ctrl);
+++			qmp_pcie_pwrdn_ctrl(qmp));
++ 
++ 	return 0;
++ }
+diff --git a/target/linux/sdx/patches-6.12/105-clk-qcom-sdx65-pcie-bootstrap.patch b/target/linux/sdx/patches-6.12/105-clk-qcom-sdx65-pcie-bootstrap.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/105-clk-qcom-sdx65-pcie-bootstrap.patch
+@@ -0,0 +1,87 @@
++--- a/drivers/clk/qcom/gcc-sdx65.c
+++++ b/drivers/clk/qcom/gcc-sdx65.c
++@@ -19,6 +19,7 @@
++ #include "clk-regmap.h"
++ #include "clk-regmap-divider.h"
++ #include "clk-regmap-mux.h"
+++#include "clk-regmap-phy-mux.h"
++ #include "common.h"
++ #include "gdsc.h"
++ #include "reset.h"
++@@ -115,16 +116,6 @@
++ 	{ P_BI_TCXO, 2 },
++ };
++ 
++-static const struct parent_map gcc_parent_map_5[] = {
++-	{ P_PCIE_PIPE_CLK, 0 },
++-	{ P_BI_TCXO, 2 },
++-};
++-
++-static const struct clk_parent_data gcc_parent_data_5[] = {
++-	{ .fw_name = "pcie_pipe_clk"},
++-	{ .fw_name = "bi_tcxo"},
++-};
++-
++ static const struct parent_map gcc_parent_map_6[] = {
++ 	{ P_USB3_PHY_WRAPPER_GCC_USB30_PIPE_CLK, 0 },
++ 	{ P_BI_TCXO, 2 },
++@@ -152,17 +143,16 @@
++ 	},
++ };
++ 
++-static struct clk_regmap_mux gcc_pcie_pipe_clk_src = {
+++static struct clk_regmap_phy_mux gcc_pcie_pipe_clk_src = {
++ 	.reg = 0x43044,
++-	.shift = 0,
++-	.width = 2,
++-	.parent_map = gcc_parent_map_5,
++-	.clkr = {
++-		.hw.init = &(struct clk_init_data){
+++	.clkr = {
+++		.hw.init = &(const struct clk_init_data){
++ 			.name = "gcc_pcie_pipe_clk_src",
++-			.parent_data = gcc_parent_data_5,
++-			.num_parents = 2,
++-			.ops = &clk_regmap_mux_closest_ops,
+++			.parent_data = &(const struct clk_parent_data){
+++				.fw_name = "pcie_pipe_clk",
+++			},
+++			.num_parents = 1,
+++			.ops = &clk_regmap_phy_mux_ops,
++ 		},
++ 	},
++ };
++@@ -666,6 +656,7 @@
++ 		.enable_mask = BIT(0),
++ 		.hw.init = &(struct clk_init_data){
++ 			.name = "gcc_ahb_pcie_link_clk",
+++			.flags = CLK_IS_CRITICAL,
++ 			.ops = &clk_branch2_ops,
++ 		},
++ 	},
++@@ -1429,6 +1420,7 @@
++ 		.enable_mask = BIT(0),
++ 		.hw.init = &(struct clk_init_data){
++ 			.name = "gcc_xo_pcie_link_clk",
+++			.flags = CLK_IS_CRITICAL,
++ 			.ops = &clk_branch2_ops,
++ 		},
++ 	},
++@@ -1580,6 +1572,17 @@
++ 	regmap_update_bits(regmap, 0x6d008, BIT(21), BIT(21)); /* GCC_CPUSS_AHB_CLK */
++ 	regmap_update_bits(regmap, 0x6d008, BIT(22), BIT(22)); /* GCC_CPUSS_GNOC_CLK */
++ 
+++	/* Stock SDX65 keeps both PCIe link-interface clocks critical. They
+++	 * must be running before accessing the pipe mux and GDSC registers.
+++	 */
+++	qcom_branch_set_clk_en(regmap, 0x2e004); /* GCC_AHB_PCIE_LINK_CLK */
+++	qcom_branch_set_clk_en(regmap, 0x2e008); /* GCC_XO_PCIE_LINK_CLK */
+++
+++	/* Bootstrap the GDSC on XO. The PHY mux switches to the QMP pipe
+++	 * source when its consumer enables it, and back to XO on disable.
+++	 */
+++	regmap_update_bits(regmap, 0x43044, GENMASK(1, 0), 2);
+++
++ 	return qcom_cc_really_probe(&pdev->dev, &gcc_sdx65_desc, regmap);
++ }
++ 
+diff --git a/target/linux/sdx/patches-6.12/110-ipa-use-registered-indication-client-and-check-result.patch b/target/linux/sdx/patches-6.12/110-ipa-use-registered-indication-client-and-check-result.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/110-ipa-use-registered-indication-client-and-check-result.patch
+@@ -0,0 +1,57 @@
++--- a/drivers/net/ipa/ipa_qmi.c
+++++ b/drivers/net/ipa/ipa_qmi.c
++@@ -81,7 +81,7 @@
++ {
++ 	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
++ 	struct qmi_handle *qmi = &ipa_qmi->server_handle;
++-	struct sockaddr_qrtr *sq = &ipa_qmi->modem_sq;
+++	struct sockaddr_qrtr *sq = &ipa_qmi->indication_sq;
++ 	struct ipa_init_complete_ind ind = { };
++ 	int ret;
++ 
++@@ -156,6 +156,7 @@
++ 
++ 	/* The modem client and server go away at the same time */
++ 	memset(&ipa_qmi->modem_sq, 0, sizeof(ipa_qmi->modem_sq));
+++	memset(&ipa_qmi->indication_sq, 0, sizeof(ipa_qmi->indication_sq));
++ 
++ 	/* initial_boot doesn't change when modem reboots */
++ 	/* uc_ready doesn't change when modem reboots */
++@@ -184,6 +185,8 @@
++ 
++ 	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++ 	ipa = container_of(ipa_qmi, struct ipa, qmi);
+++
+++	ipa_qmi->indication_sq = *sq;
++ 
++ 	rsp.rsp.result = QMI_RESULT_SUCCESS_V01;
++ 	rsp.rsp.error = QMI_ERR_NONE_V01;
++@@ -253,7 +256,9 @@
++ 				   struct sockaddr_qrtr *sq,
++ 				   struct qmi_txn *txn, const void *decoded)
++ {
++-	txn->result = 0;	/* IPA_QMI_INIT_DRIVER request was successful */
+++	const struct ipa_init_modem_driver_rsp *rsp = decoded;
+++
+++	txn->result = rsp->rsp.result == QMI_RESULT_SUCCESS_V01 ? 0 : -EREMOTEIO;
++ 	complete(&txn->completion);
++ }
++ 
++--- a/drivers/net/ipa/ipa_qmi.h
+++++ b/drivers/net/ipa/ipa_qmi.h
++@@ -18,6 +18,7 @@
++  * @client_handle:	Used to send an QMI requests to the modem
++  * @server_handle:	Used to handle QMI requests from the modem
++  * @modem_sq:		QMAP socket address for the modem QMI server
+++ * @indication_sq:	Modem client registered for indications
++  * @init_driver_work:	Work structure used for INIT_DRIVER message handling
++  * @initial_boot:	True if first boot has not yet completed
++  * @uc_ready:		True once DRIVER_INIT_COMPLETE request received
++@@ -31,6 +32,7 @@
++ 
++ 	/* Information used for the client handle */
++ 	struct sockaddr_qrtr modem_sq;
+++	struct sockaddr_qrtr indication_sq;
++ 	struct work_struct init_driver_work;
++ 
++ 	/* Flags used in negotiating readiness */
+diff --git a/target/linux/sdx/patches-6.12/110-pci-qcom-sdx65-experimental-rc.patch b/target/linux/sdx/patches-6.12/110-pci-qcom-sdx65-experimental-rc.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/110-pci-qcom-sdx65-experimental-rc.patch
+@@ -0,0 +1,36 @@
++--- a/drivers/pci/controller/dwc/pcie-qcom.c
+++++ b/drivers/pci/controller/dwc/pcie-qcom.c
++@@ -1853,6 +1853,7 @@
++ 	{ .compatible = "qcom,pcie-sc8280xp", .data = &cfg_sc8280xp },
++ 	{ .compatible = "qcom,pcie-sdm845", .data = &cfg_2_7_0 },
++ 	{ .compatible = "qcom,pcie-sdx55", .data = &cfg_1_9_0 },
+++	{ .compatible = "qcom,pcie-sdx65", .data = &cfg_1_9_0 },
++ 	{ .compatible = "qcom,pcie-sm8150", .data = &cfg_1_9_0 },
++ 	{ .compatible = "qcom,pcie-sm8250", .data = &cfg_1_9_0 },
++ 	{ .compatible = "qcom,pcie-sm8350", .data = &cfg_1_9_0 },
++--- a/Documentation/devicetree/bindings/pci/qcom,pcie.yaml
+++++ b/Documentation/devicetree/bindings/pci/qcom,pcie.yaml
++@@ -30,6 +30,7 @@
++           - qcom,pcie-qcs404
++           - qcom,pcie-sdm845
++           - qcom,pcie-sdx55
+++          - qcom,pcie-sdx65
++       - items:
++           - const: qcom,pcie-msm8998
++           - const: qcom,pcie-msm8996
++@@ -205,6 +206,7 @@
++           contains:
++             enum:
++               - qcom,pcie-sdx55
+++              - qcom,pcie-sdx65
++     then:
++       properties:
++         reg:
++@@ -478,6 +480,7 @@
++           contains:
++             enum:
++               - qcom,pcie-sdx55
+++              - qcom,pcie-sdx65
++     then:
++       properties:
++         clocks:
+diff --git a/target/linux/sdx/patches-6.12/111-ipa-preserve-H5-boot-firmware-microcontroller.patch b/target/linux/sdx/patches-6.12/111-ipa-preserve-H5-boot-firmware-microcontroller.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/111-ipa-preserve-H5-boot-firmware-microcontroller.patch
+@@ -0,0 +1,63 @@
++--- a/drivers/net/ipa/ipa_qmi.c
+++++ b/drivers/net/ipa/ipa_qmi.c
++@@ -1,3 +1,4 @@
+++#include <linux/of.h>
++ // SPDX-License-Identifier: GPL-2.0
++ 
++ /* Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
++@@ -299,6 +300,9 @@
++ 
++ 	req.platform_type_valid = 1;
++ 	req.platform_type = IPA_QMI_PLATFORM_TYPE_MSM_ANDROID;
+++	/* Stock H5 uses platform type 6 for its integrated MHI-mode modem. */
+++	if (of_machine_is_compatible("greenpacket,h5-200q1"))
+++		req.platform_type = 6;
++ 
++ 	mem = ipa_mem_find(ipa, IPA_MEM_MODEM_HEADER);
++ 	if (mem->size) {
++@@ -476,6 +480,7 @@
++ 	int ret;
++ 
++ 	ipa_qmi->initial_boot = true;
+++	ipa_qmi->uc_ready = ipa->uc_loaded;
++ 
++ 	/* The server handle is used to handle the DRIVER_INIT_COMPLETE
++ 	 * request on the first modem boot.  It also receives the
++--- a/drivers/net/ipa/ipa_uc.c
+++++ b/drivers/net/ipa/ipa_uc.c
++@@ -1,3 +1,4 @@
+++#include <linux/of.h>
++ // SPDX-License-Identifier: GPL-2.0
++ 
++ /* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
++@@ -188,6 +189,21 @@
++ 	ipa->uc_loaded = false;
++ 	ipa_interrupt_enable(ipa, IPA_IRQ_UC_0);
++ 	ipa_interrupt_enable(ipa, IPA_IRQ_UC_1);
+++	if (of_machine_is_compatible("greenpacket,h5-200q1")) {
+++		struct ipa_uc_mem_area *shared = ipa_uc_shared(ipa);
+++		u8 response = READ_ONCE(shared->response);
+++		u16 version = le16_to_cpu(READ_ONCE(shared->interface_version));
+++
+++		/* Preserve the uC loaded by this board's boot firmware. A completed
+++		 * command and matching ABI distinguish it from uninitialized SRAM.
+++		 */
+++		if (version == 0x1f &&
+++		    (response == IPA_UC_RESPONSE_INIT_COMPLETED ||
+++		     response == IPA_UC_RESPONSE_CMD_COMPLETED)) {
+++			ipa->uc_loaded = true;
+++			ipa_power_retention(ipa, true);
+++		}
+++	}
++ }
++ 
++ /* Inverse of ipa_uc_config() */
++@@ -214,7 +230,7 @@
++ 	static bool already;
++ 	int ret;
++ 
++-	if (already)
+++	if (already || ipa->uc_loaded)
++ 		return;
++ 	already = true;		/* Only do this on first boot */
++ 
+diff --git a/target/linux/sdx/patches-6.12/112-ipa-reclaim-stale-H5-AP-GSI-queues.patch b/target/linux/sdx/patches-6.12/112-ipa-reclaim-stale-H5-AP-GSI-queues.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/112-ipa-reclaim-stale-H5-AP-GSI-queues.patch
+@@ -0,0 +1,74 @@
++--- a/drivers/net/ipa/gsi.c
+++++ b/drivers/net/ipa/gsi.c
++@@ -5,6 +5,8 @@
++  */
++ 
++ #include <linux/bits.h>
+++#include <linux/of.h>
+++#include <linux/delay.h>
++ #include <linux/bug.h>
++ #include <linux/completion.h>
++ #include <linux/interrupt.h>
++@@ -2062,6 +2064,51 @@
++ 	return 0;
++ }
++ 
+++/* The H5 RAM handoff leaves AP queues from the previous kernel allocated.
+++ * Quiesce only the AP execution environment before allocating Linux rings.
+++ * Modem-owned channels and execution environments are not modified.
+++ */
+++static int gsi_h5_reclaim_ap(struct gsi *gsi)
+++{
+++	u32 i, state;
+++	int retries;
+++
+++	if (!of_machine_is_compatible("greenpacket,h5-200q1"))
+++		return 0;
+++	for (i = 0; i < gsi->channel_count; i++) {
+++		struct gsi_channel *channel = &gsi->channel[i];
+++		struct gsi *saved = channel->gsi;
+++
+++		channel->gsi = gsi;
+++		state = gsi_channel_state(channel);
+++		for (retries = 0; retries < 5 &&
+++		     (state == GSI_CHANNEL_STATE_STARTED ||
+++		      state == GSI_CHANNEL_STATE_STOP_IN_PROC); retries++) {
+++			gsi_channel_stop_command(channel);
+++			msleep(20);
+++			state = gsi_channel_state(channel);
+++		}
+++		if (state == GSI_CHANNEL_STATE_STOPPED || state == GSI_CHANNEL_STATE_ERROR)
+++			gsi_channel_reset_command(channel);
+++		if (gsi_channel_state(channel) == GSI_CHANNEL_STATE_ALLOCATED)
+++			gsi_channel_de_alloc_command(gsi, i);
+++		state = gsi_channel_state(channel);
+++		channel->gsi = saved;
+++		if (state != GSI_CHANNEL_STATE_NOT_ALLOCATED)
+++			return -EBUSY;
+++	}
+++	for (i = 0; i < gsi->evt_ring_count; i++) {
+++		state = gsi_evt_ring_state(gsi, i);
+++		if (state == GSI_EVT_RING_STATE_ERROR)
+++			gsi_evt_ring_reset_command(gsi, i);
+++		if (gsi_evt_ring_state(gsi, i) == GSI_EVT_RING_STATE_ALLOCATED)
+++			gsi_evt_ring_de_alloc_command(gsi, i);
+++		if (gsi_evt_ring_state(gsi, i) != GSI_EVT_RING_STATE_NOT_ALLOCATED)
+++			return -EBUSY;
+++	}
+++	return 0;
+++}
+++
++ /* Setup function for GSI.  GSI firmware must be loaded and initialized */
++ int gsi_setup(struct gsi *gsi)
++ {
++@@ -2088,6 +2135,10 @@
++ 	/* Initialize the error log */
++ 	reg = gsi_reg(gsi, ERROR_LOG);
++ 	iowrite32(0, gsi->virt + reg_offset(reg));
+++
+++	ret = gsi_h5_reclaim_ap(gsi);
+++	if (ret)
+++		goto err_irq_teardown;
++ 
++ 	ret = gsi_channel_setup(gsi);
++ 	if (ret)
+diff --git a/target/linux/sdx/patches-6.12/113-remoteproc-keep-H5-modem-start-manual.patch b/target/linux/sdx/patches-6.12/113-remoteproc-keep-H5-modem-start-manual.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/113-remoteproc-keep-H5-modem-start-manual.patch
+@@ -0,0 +1,17 @@
++--- a/drivers/remoteproc/qcom_q6v5_pas.c
+++++ b/drivers/remoteproc/qcom_q6v5_pas.c
++@@ -1,3 +1,4 @@
+++#include <linux/of.h>
++ // SPDX-License-Identifier: GPL-2.0-only
++ /*
++  * Qualcomm ADSP/SLPI Peripheral Image Loader for MSM8974 and MSM8996
++@@ -722,6 +723,9 @@
++ 	}
++ 
++ 	rproc->auto_boot = desc->auto_boot;
+++	/* Firmware must first be made available by the H5 RAM bring-up. */
+++	if (of_machine_is_compatible("greenpacket,h5-200q1"))
+++		rproc->auto_boot = false;
++ 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
++ 
++ 	adsp = rproc->priv;
+diff --git a/target/linux/sdx/patches-6.12/114-mtd-expose-H5-NAND-read-only.patch b/target/linux/sdx/patches-6.12/114-mtd-expose-H5-NAND-read-only.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/114-mtd-expose-H5-NAND-read-only.patch
+@@ -0,0 +1,13 @@
++--- a/drivers/mtd/nand/raw/qcom_nandc.c
+++++ b/drivers/mtd/nand/raw/qcom_nandc.c
++@@ -2186,6 +2186,10 @@
++ 	if (ret)
++ 		return ret;
++ 
+++	/* H5 RAM bring-up: expose all NAND partitions read-only. */
+++	if (of_machine_is_compatible("greenpacket,h5-200q1"))
+++		mtd->flags &= ~MTD_WRITEABLE;
+++
++ 	ret = mtd_device_parse_register(mtd, probes, NULL, NULL, 0);
++ 	if (ret)
++ 		goto err;
+diff --git a/target/linux/sdx/patches-6.12/115-net-ipa-account-for-rmnet-map-overhead.patch b/target/linux/sdx/patches-6.12/115-net-ipa-account-for-rmnet-map-overhead.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/115-net-ipa-account-for-rmnet-map-overhead.patch
+@@ -0,0 +1,20 @@
++Subject: [PATCH] net: ipa: account for MAP overhead in transport MTU
++
++The IPA network device carries MAP frames from the RMNET upper device.
++Limiting the transport to an IP MTU of 1500 causes RMNET to reject the
++1500-byte MTU supplied by the network, because its MAP header must fit too.
++Keep the IP payload limit unchanged and allow the transport header space.
++
++--- a/drivers/net/ipa/ipa_modem.c
+++++ b/drivers/net/ipa/ipa_modem.c
++@@ -228,7 +228,9 @@ static void ipa_modem_netdev_setup(struct net_device *netdev)
++ 	netdev->hard_header_len = 0;
++ 	netdev->min_header_len = ETH_HLEN;
++ 	netdev->min_mtu = ETH_MIN_MTU;
++-	netdev->max_mtu = IPA_MTU;
+++	/* RMNET validates the IP MTU plus its MAP transport headers. */
+++	netdev->max_mtu = IPA_MTU + sizeof(struct rmnet_map_header) +
+++			  sizeof(struct rmnet_map_ul_csum_header);
++ 	netdev->mtu = netdev->max_mtu;
++ 	netdev->addr_len = 0;
++ 	netdev->tx_queue_len = DEFAULT_TX_QUEUE_LEN;
+diff --git a/target/linux/sdx/patches-6.12/116-dma-qcom-bam-pipe-locking.patch b/target/linux/sdx/patches-6.12/116-dma-qcom-bam-pipe-locking.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/116-dma-qcom-bam-pipe-locking.patch
+@@ -0,0 +1,317 @@
++Subject: [PATCH] dma: qcom: backport BAM pipe locking with a masked scratch command
++
++Based on Bartosz Golaszewski v22 06/14, adapted to Linux 6.12 tasklets.
++Link: https://lists.openwall.net/linux-kernel/2026/07/17/723
++Use consistent DMA map/unmap devices and retain queue-time LOCK/UNLOCK
++bracketing. The configurable write mask permits a register-preserving
++dummy command on H5, where writing NAND_VERSION causes a reset.
++
++--- a/drivers/dma/qcom/bam_dma.c
+++++ b/drivers/dma/qcom/bam_dma.c
++@@ -30,6 +30,8 @@
++ #include <linux/module.h>
++ #include <linux/interrupt.h>
++ #include <linux/dma-mapping.h>
+++#include <linux/dma/qcom_bam_dma.h>
+++#include <linux/lockdep.h>
++ #include <linux/scatterlist.h>
++ #include <linux/device.h>
++ #include <linux/platform_device.h>
++@@ -58,6 +60,8 @@
++ #define DESC_FLAG_EOB BIT(13)
++ #define DESC_FLAG_NWD BIT(12)
++ #define DESC_FLAG_CMD BIT(11)
+++#define DESC_FLAG_LOCK BIT(10)
+++#define DESC_FLAG_UNLOCK BIT(9)
++ 
++ struct bam_async_desc {
++ 	struct virt_dma_desc vd;
++@@ -69,6 +73,11 @@
++ 	u16 flags;
++ 
++ 	struct bam_desc_hw *curr_desc;
+++
+++	/* BAM locking infrastructure */
+++	bool is_lock_desc;
+++	struct scatterlist lock_sg;
+++	struct bam_cmd_element lock_ce;
++ 
++ 	/* list node for the desc in the bam_chan list of descriptors */
++ 	struct list_head desc_node;
++@@ -370,6 +379,12 @@
++ 	struct list_head desc_list;
++ 
++ 	struct list_head node;
+++
+++	/* BAM locking infrastructure */
+++	phys_addr_t lock_scratchpad_addr;
+++	u32 lock_write_mask;
+++	enum dma_transfer_direction direction;
+++	bool bam_locked;
++ };
++ 
++ static inline struct bam_chan *to_bam_chan(struct dma_chan *common)
++@@ -586,6 +601,7 @@
++ 
++ 	spin_lock_irqsave(&bchan->vc.lock, flags);
++ 	bam_reset_channel(bchan);
+++	bchan->bam_locked = false;
++ 	spin_unlock_irqrestore(&bchan->vc.lock, flags);
++ 
++ 	dma_free_wc(bdev->dev, BAM_DESC_FIFO_SIZE, bchan->fifo_virt,
++@@ -623,12 +639,19 @@
++ static int bam_slave_config(struct dma_chan *chan,
++ 			    struct dma_slave_config *cfg)
++ {
+++	struct bam_config *peripheral_cfg = cfg->peripheral_config;
++ 	struct bam_chan *bchan = to_bam_chan(chan);
++ 	unsigned long flag;
++ 
++ 	spin_lock_irqsave(&bchan->vc.lock, flag);
++ 	memcpy(&bchan->slave, cfg, sizeof(*cfg));
++ 	bchan->reconfigure = 1;
+++	bchan->lock_scratchpad_addr = 0;
+++	if (peripheral_cfg && cfg->peripheral_size == sizeof(*peripheral_cfg)) {
+++		bchan->lock_scratchpad_addr = peripheral_cfg->lock_scratchpad_addr;
+++		bchan->lock_write_mask = peripheral_cfg->lock_write_mask;
+++		bchan->direction = cfg->direction;
+++	}
++ 	spin_unlock_irqrestore(&bchan->vc.lock, flag);
++ 
++ 	return 0;
++@@ -757,6 +780,7 @@
++ 	}
++ 
++ 	vchan_get_all_descriptors(&bchan->vc, &head);
+++	bchan->bam_locked = false;
++ 	spin_unlock_irqrestore(&bchan->vc.lock, flag);
++ 
++ 	vchan_dma_desc_free_list(&bchan->vc, &head);
++@@ -816,6 +840,15 @@
++ 	return 0;
++ }
++ 
+++static void bam_dma_free_lock_desc(struct virt_dma_desc *vd)
+++{
+++	struct bam_async_desc *async_desc = container_of(vd, struct bam_async_desc, vd);
+++	struct dma_chan *chan = vd->tx.chan;
+++
+++	dma_unmap_sg(to_bam_chan(chan)->bdev->dev, &async_desc->lock_sg, 1, DMA_TO_DEVICE);
+++	kfree(async_desc);
+++}
+++
++ /**
++  * process_channel_irqs - processes the channel interrupts
++  * @bdev: bam controller
++@@ -877,13 +910,18 @@
++ 			 * push back to front of desc_issued so that
++ 			 * it gets restarted by the tasklet
++ 			 */
+++
+++			list_del(&async_desc->desc_node);
++ 			if (!async_desc->num_desc) {
++-				vchan_cookie_complete(&async_desc->vd);
+++
+++				if (async_desc->is_lock_desc)
+++					bam_dma_free_lock_desc(&async_desc->vd);
+++				else
+++					vchan_cookie_complete(&async_desc->vd);
++ 			} else {
++ 				list_add(&async_desc->vd.node,
++ 					 &bchan->vc.desc_issued);
++ 			}
++-			list_del(&async_desc->desc_node);
++ 		}
++ 
++ 		spin_unlock_irqrestore(&bchan->vc.lock, flags);
++@@ -1008,13 +1046,102 @@
++ 	bchan->reconfigure = 0;
++ }
++ 
+++static struct bam_async_desc *
+++bam_make_lock_desc(struct bam_chan *bchan, unsigned long flag)
+++{
+++	struct bam_async_desc *async_desc;
+++	struct bam_desc_hw *desc;
+++	struct virt_dma_desc *vd;
+++	struct virt_dma_chan *vc;
+++	unsigned int mapped;
+++
+++	async_desc = kzalloc(struct_size(async_desc, desc, 1), GFP_NOWAIT);
+++	if (!async_desc) {
+++		dev_err(bchan->bdev->dev, "failed to allocate the BAM lock descriptor\n");
+++		return ERR_PTR(-ENOMEM);
+++	}
+++
+++	sg_init_table(&async_desc->lock_sg, 1);
+++
+++	async_desc->num_desc = 1;
+++	async_desc->curr_desc = async_desc->desc;
+++	async_desc->dir = DMA_MEM_TO_DEV;
+++	async_desc->is_lock_desc = true;
+++
+++	desc = async_desc->desc;
+++
+++	bam_prep_ce_le32(&async_desc->lock_ce, bchan->lock_scratchpad_addr, BAM_WRITE_COMMAND, 0);
+++	async_desc->lock_ce.mask = cpu_to_le32(bchan->lock_write_mask);
+++	sg_set_buf(&async_desc->lock_sg, &async_desc->lock_ce, sizeof(async_desc->lock_ce));
+++
+++	mapped = dma_map_sg(bchan->bdev->dev, &async_desc->lock_sg, 1, DMA_TO_DEVICE);
+++	if (!mapped) {
+++		kfree(async_desc);
+++		return ERR_PTR(-ENOMEM);
+++	}
+++
+++	desc->flags |= cpu_to_le16(DESC_FLAG_CMD | flag);
+++	desc->addr = cpu_to_le32(sg_dma_address(&async_desc->lock_sg));
+++	desc->size = cpu_to_le16(sizeof(struct bam_cmd_element));
+++
+++	vc = &bchan->vc;
+++	vd = &async_desc->vd;
+++
+++	dma_async_tx_descriptor_init(&vd->tx, &vc->chan);
+++	vd->tx.flags = DMA_PREP_CMD;
+++	vd->tx_result.result = DMA_TRANS_NOERROR;
+++	vd->tx_result.residue = 0;
+++
+++	return async_desc;
+++}
+++
+++static int bam_setup_pipe_lock(struct bam_chan *bchan)
+++{
+++	struct bam_async_desc *lock_desc, *unlock_desc;
+++
+++	lockdep_assert_held(&bchan->vc.lock);
+++
+++	/* v1.3 has no pipe locking; 6.12 also supports v1.4 and v1.7. */
+++	if (bchan->bdev->layout == bam_v1_3_reg_info || !bchan->lock_scratchpad_addr ||
+++	    bchan->direction != DMA_MEM_TO_DEV)
+++		return 0;
+++
+++	/*
+++	 * Allocate both the LOCK and the UNLOCK descriptors up-front so the
+++	 * operation is all-or-nothing: if either allocation fails we free both
+++	 * and run the sequence unlocked rather than leave the pipe locked with
+++	 * no matching UNLOCK.
+++	 *
+++	 * Both are queued in-band around the currently issued work: the LOCK is
+++	 * prepended so it enters the FIFO first, the UNLOCK is appended so it is
+++	 * the last descriptor of the sequence. They are loaded together with the
+++	 * payload in a single operation so the engine executes LOCK, the work
+++	 * and UNLOCK as one ordered batch.
+++	 */
+++	lock_desc = bam_make_lock_desc(bchan, DESC_FLAG_LOCK);
+++	if (IS_ERR(lock_desc))
+++		return PTR_ERR(lock_desc);
+++
+++	unlock_desc = bam_make_lock_desc(bchan, DESC_FLAG_UNLOCK);
+++	if (IS_ERR(unlock_desc)) {
+++		bam_dma_free_lock_desc(&lock_desc->vd);
+++		return PTR_ERR(unlock_desc);
+++	}
+++
+++	list_add(&lock_desc->vd.node, &bchan->vc.desc_issued);
+++	list_add_tail(&unlock_desc->vd.node, &bchan->vc.desc_issued);
+++	bchan->bam_locked = true;
+++
+++	return 0;
+++}
+++
++ /**
++  * bam_start_dma - start next transaction
++  * @bchan: bam dma channel
++  */
++ static void bam_start_dma(struct bam_chan *bchan)
++ {
++-	struct virt_dma_desc *vd = vchan_next_desc(&bchan->vc);
+++	struct virt_dma_desc *vd;
++ 	struct bam_device *bdev = bchan->bdev;
++ 	struct bam_async_desc *async_desc = NULL;
++ 	struct bam_desc_hw *desc;
++@@ -1026,6 +1153,7 @@
++ 
++ 	lockdep_assert_held(&bchan->vc.lock);
++ 
+++	vd = vchan_next_desc(&bchan->vc);
++ 	if (!vd)
++ 		return;
++ 
++@@ -1034,6 +1162,22 @@
++ 		return;
++ 
++ 	while (vd && !IS_BUSY(bchan)) {
+++		/*
+++		 * Open a LOCK/UNLOCK bracket around each fresh sequence.
+++		 * Sentinels inserted by bam_setup_pipe_lock() are skipped: they
+++		 * already have bam_locked set and must not trigger a second pair.
+++		 */
+++		if (!bchan->bam_locked) {
+++			ret = bam_setup_pipe_lock(bchan);
+++			if (ret) {
+++				dev_err_ratelimited(bdev->dev,
+++					"failed to setup the pipe lock, deferring transfer: %d\n", ret);
+++				break;
+++			}
+++			if (bchan->bam_locked)
+++				vd = vchan_next_desc(&bchan->vc);
+++		}
+++
++ 		list_del(&vd->node);
++ 
++ 		async_desc = container_of(vd, struct bam_async_desc, vd);
++@@ -1095,6 +1239,10 @@
++ 		bchan->tail += async_desc->xfer_len;
++ 		bchan->tail %= MAX_DESCRIPTORS;
++ 		list_add_tail(&async_desc->desc_node, &bchan->desc_list);
+++
+++		if (async_desc->is_lock_desc &&
+++		    (le16_to_cpu(async_desc->desc->flags) & DESC_FLAG_UNLOCK))
+++			bchan->bam_locked = false;
++ 	}
++ 
++ 	/* ensure descriptor writes and dma start not reordered */
++@@ -1158,8 +1306,11 @@
++  */
++ static void bam_dma_free_desc(struct virt_dma_desc *vd)
++ {
++-	struct bam_async_desc *async_desc = container_of(vd,
++-			struct bam_async_desc, vd);
+++	struct bam_async_desc *async_desc = container_of(vd, struct bam_async_desc, vd);
+++	struct dma_chan *chan = vd->tx.chan;
+++
+++	if (async_desc->is_lock_desc)
+++		dma_unmap_sg(to_bam_chan(chan)->bdev->dev, &async_desc->lock_sg, 1, DMA_TO_DEVICE);
++ 
++ 	kfree(async_desc);
++ }
++--- a/include/linux/dma/qcom_bam_dma.h
+++++ b/include/linux/dma/qcom_bam_dma.h
++@@ -5,6 +5,8 @@
++ 
++ #ifndef _QCOM_BAM_DMA_H
++ #define _QCOM_BAM_DMA_H
+++
+++#include <linux/dmaengine.h>
++ 
++ #include <asm/byteorder.h>
++ 
++@@ -35,6 +37,19 @@
++ enum bam_command_type {
++ 	BAM_WRITE_COMMAND = 0,
++ 	BAM_READ_COMMAND,
+++};
+++
+++/**
+++ * struct bam_config - BAM DMA peripheral config.
+++ *
+++ * @lock_scratchpad_addr: Physical address to use for dummy write operations
+++ *                        when queuing command descriptors with LOCK/UNLOCK
+++ *                        bits set.
+++ */
+++/* A zero lock_write_mask preserves the dummy target register. */
+++struct bam_config {
+++	phys_addr_t lock_scratchpad_addr;
+++	u32 lock_write_mask;
++ };
++ 
++ /*
+diff --git a/target/linux/sdx/patches-6.12/117-mtd-qpic-h5-shared-nand-locking.patch b/target/linux/sdx/patches-6.12/117-mtd-qpic-h5-shared-nand-locking.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/117-mtd-qpic-h5-shared-nand-locking.patch
+@@ -0,0 +1,31 @@
++Subject: [PATCH] mtd: qpic: serialize H5 NAND command batches with modem access
++
++--- a/drivers/mtd/nand/qpic_common.c
+++++ b/drivers/mtd/nand/qpic_common.c
++@@ -538,6 +538,26 @@
++ 	struct bam_transaction *bam_txn = nandc->bam_txn;
++ 	int ret = 0;
++ 
+++	if (nandc->props->supports_bam &&
+++	    of_machine_is_compatible("greenpacket,h5-200q1")) {
+++		/* A masked write to ADDR0 preserves it; VERSION is unsafe on H5. */
+++		struct bam_config lock_cfg = {
+++			.lock_scratchpad_addr = nandc_reg_phys(nandc, NAND_ADDR0),
+++			.lock_write_mask = 0,
+++		};
+++		struct dma_slave_config cfg = {
+++			.direction = DMA_MEM_TO_DEV,
+++			.src_maxburst = 16,
+++			.dst_maxburst = 16,
+++			.peripheral_config = &lock_cfg,
+++			.peripheral_size = sizeof(lock_cfg),
+++		};
+++
+++		ret = dmaengine_slave_config(nandc->cmd_chan, &cfg);
+++		if (ret)
+++			goto err_unmap_free_desc;
+++	}
+++
++ 	if (nandc->props->supports_bam) {
++ 		if (bam_txn->rx_sgl_pos > bam_txn->rx_sgl_start) {
++ 			ret = qcom_prepare_bam_async_desc(nandc, nandc->rx_chan, 0);
+diff --git a/target/linux/sdx/patches-6.12/118-mtd-h5-limit-upgrade-partitions.patch b/target/linux/sdx/patches-6.12/118-mtd-h5-limit-upgrade-partitions.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/118-mtd-h5-limit-upgrade-partitions.patch
+@@ -0,0 +1,58 @@
++Subject: [PATCH] mtd: qcomsmem: allow only verified H5 boot/system upgrade children
++
++The H5 parent stays read-only. Only the installer/production compatible
++and the exact verified 512 MiB map permit two writable children. Parser
++failure cannot expose a writable master. All firmware/calibration, boot
++loader, recovery and userdata partitions retain read-only flags.
++
++--- a/drivers/mtd/parsers/qcomsmempart.c
+++++ b/drivers/mtd/parsers/qcomsmempart.c
++@@ -7,6 +7,7 @@
++ 
++ #include <linux/ctype.h>
++ #include <linux/module.h>
+++#include <linux/of.h>
++ #include <linux/mtd/mtd.h>
++ #include <linux/mtd/partitions.h>
++ #include <linux/slab.h>
++@@ -54,6 +55,32 @@
++ 	struct smem_flash_pentry pentry[SMEM_FLASH_PTABLE_MAX_PARTS_V4];
++ } __packed __aligned(4);
++ 
+++/* The parent remains read-only, including if parsing or map checks fail. */
+++static void h5_enable_upgrade_children(struct mtd_info *mtd,
+++				       struct mtd_partition *parts, int count)
+++{
+++	if (!of_machine_is_compatible("greenpacket,h5-200q1-openwrt"))
+++		return;
+++
+++	if (mtd->size != 0x20000000 || mtd->erasesize != 0x40000 ||
+++	    mtd->writesize != 4096 || count != 33 ||
+++	    strcmp(parts[2].name, "efs2") ||
+++	    parts[2].offset != 0x380000 || parts[2].size != 0x1600000 ||
+++	    strcmp(parts[27].name, "boot") ||
+++	    parts[27].offset != 0x4440000 || parts[27].size != 0x1000000 ||
+++	    strcmp(parts[30].name, "modem") ||
+++	    parts[30].offset != 0x7940000 || parts[30].size != 0x7300000 ||
+++	    strcmp(parts[31].name, "system") ||
+++	    parts[31].offset != 0xec40000 || parts[31].size != 0x7d00000) {
+++		pr_warn("H5: unexpected NAND map; keeping all partitions read-only\n");
+++		return;
+++	}
+++
+++	parts[27].add_flags |= MTD_WRITEABLE;
+++	parts[31].add_flags |= MTD_WRITEABLE;
+++	pr_info("H5: boot/system upgrade children enabled; NAND master stays read-only\n");
+++}
+++
++ static int parse_qcomsmem_part(struct mtd_info *mtd,
++ 			       const struct mtd_partition **pparts,
++ 			       struct mtd_part_parser_data *data)
++@@ -154,6 +181,7 @@
++ 
++ 	pr_debug("SMEM partition table found: ver: %d len: %d\n",
++ 		 le32_to_cpu(ptable->version), tmpparts);
+++	h5_enable_upgrade_children(mtd, parts, numparts);
++ 	*pparts = parts;
++ 
++ 	return numparts;
+diff --git a/target/linux/sdx/patches-6.12/118-mtd-qcom-fix-last-codeword-read-location.patch b/target/linux/sdx/patches-6.12/118-mtd-qcom-fix-last-codeword-read-location.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/118-mtd-qcom-fix-last-codeword-read-location.patch
+@@ -0,0 +1,35 @@
++From: Gabor Juhos <j4g8y7@gmail.com>
++Subject: [PATCH] mtd: rawnand: qcom: fix read location register usage in config_nand_cw_read()
++
++On QPIC v2 the last codeword uses its own read-location registers.
++The v6.14 cleanup backported by OpenWrt selects the last-codeword values
++but writes them to the ordinary register bank. On H5 the modem changes
++the shared last-codeword registers at startup, exposing stale page tails.
++
++Backport the upstream fix without changing BAM completion or locking.
++Link: https://lore.kernel.org/r/20260928-qcom_nandc-config_nand_cw_read-fix-v1-1-98edccaaea0f@gmail.com
++Fixes: 8c52932da5e6 ("mtd: rawnand: qcom: cleanup qcom_nandc driver")
++Signed-off-by: Gabor Juhos <j4g8y7@gmail.com>
++---
++--- a/drivers/mtd/nand/raw/qcom_nandc.c
+++++ b/drivers/mtd/nand/raw/qcom_nandc.c
++@@ -328,14 +328,16 @@ config_nand_cw_read(struct nand_chip *chip, bool use_ecc, int cw)
++ {
++ 	struct qcom_nand_controller *nandc = get_qcom_nand_controller(chip);
++ 	struct nand_ecc_ctrl *ecc = &chip->ecc;
++-
++ 	__le32 *reg = &nandc->regs->read_location0;
+++	int reg_base = NAND_READ_LOCATION_0;
++ 
++-	if (nandc->props->qpic_version2 && qcom_nandc_is_last_cw(ecc, cw))
+++	if (nandc->props->qpic_version2 && qcom_nandc_is_last_cw(ecc, cw)) {
++ 		reg = &nandc->regs->read_location_last0;
+++		reg_base = NAND_READ_LOCATION_LAST_CW_0;
+++	}
++ 
++ 	if (nandc->props->supports_bam)
++-		qcom_write_reg_dma(nandc, reg, NAND_READ_LOCATION_0, 4, NAND_BAM_NEXT_SGL);
+++		qcom_write_reg_dma(nandc, reg, reg_base, 4, NAND_BAM_NEXT_SGL);
++ 
++ 	qcom_write_reg_dma(nandc, &nandc->regs->cmd, NAND_FLASH_CMD, 1, NAND_BAM_NEXT_SGL);
++ 	qcom_write_reg_dma(nandc, &nandc->regs->exec, NAND_EXEC_CMD, 1, NAND_BAM_NEXT_SGL);
+diff --git a/target/linux/sdx/README.md b/target/linux/sdx/README.md
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/README.md
+@@ -0,0 +1,65 @@
++# GreenPacket H5-200Q1 / Qualcomm SDX65
++
++See h5-patches/README.md in the patched OpenWrt tree for the complete build
++instructions, pinned source revisions, current validation and installation
++limits. The target is independent of RutOS and vendor kernel build systems.
++
++The CPE profile provides a normal router on 192.168.0.1 with DHCP/DNS,
++firewall/NAT, HTTP LuCI, native ModemManager and Network -> Cellular Network.
++Bridge/IP passthrough is deferred. Fresh root has an empty password and
++Dropbear supports password authentication. USB CDC ACM uses standard console
++login. No private credentials, host keys, SIM settings or modem firmware
++are embedded in the source patch.
++
++Direct fastboot RAM startup without the stock kernel has been verified with
++Linux 6.12.112, 1 Gb/s RTL8125B Ethernet, USB root login, blank-password SSH,
++HTTP LuCI and O2 CZ LTE/5G NSA data. A separate LAN client passed DHCP, DNS,
++ping and HTTP through NAT. LTE cell-lock apply/readback/data/unlock was
++verified on an earlier integrated RAM build. 5G SA lock and carrier IPv6
++remain untested. The GZIP outer kernel contains an XZ-compressed initramfs.
++
++Restart directly into fastboot before independent RAM trials: prior failed
++image attempts can affect bootloader state. The Android v0 builder places
++aliases and chosen before memory without altering DTB property values.
++Initramfs explicitly selects RAM root; the persistent kernel explicitly
++selects the new OpenWrt system UBI/squashfs root. These images are not stock
++GreenPacket web update packages.
++
++Signed modem firmware is read from the original modem UBI partition, checked
++and cached in RAM. QRTR TFTP service 4096 version 3, upstream IPA/rmnet/QMI
++and unmodified rpmsg_char provide modem data and restricted vendor AT
++operations. BAM locking serializes AP/modem NAND access. Secure EFS is
++blocked; all partitions are read-only except verified CPE boot/system
++children on the exact backed-up layout.
++
++GPIOs: SYS blue 18, SYS red 63, Ethernet 17, 4G 16, 5G 19. Reset GPIO32
++is active low with pull-up and 20 ms polling; physical press/release and
++SYS/ETH indications have been verified. Cellular indication follows actual
++ModemManager RAT. Persistent factory-reset behavior remains untested.
++
++The vendor's fastboot flash/erase handlers set a persistent `fastboot-abnormal`
++flag in misc, which bypasses kernel loading even when RESET selects recovery.
++Run a normal `fastboot reboot` after flashing to clear it before a physical
++recovery test; `fastboot reboot bootloader` does not clear it. The original
++recovery service on TCP 5000 booted after this correction. Full standard
++OpenWrt then booted from NAND recovery, with USB/SSH, HTTP LuCI, gigabit LAN,
++LTE/5G NSA data and separate LAN-client DHCP/DNS/NAT/HTTP verified. Earlier
++flag-blocked failures do not establish a DTB or image-size problem.
++The CPE DT supplies the original SCM download-mode register at TCSR + 0x13000.
++Normal software reboot with active mobile data then returned to the then
++installed stock system without a power cycle. The bootloader restart target
++also passed with MPSS offline. Physical recovery entry is verified;
++OpenWrt's software recovery target remains unvalidated.
++Standard PDC, PMIC
++PON, SPMI SDAM and nvmem reboot-mode dependencies are included in the latest
++build. Persistent installation into boot/system, exact kernel/rootfs/recovery
++readback and a configuration-preserving software reboot have passed.
++The main system now uses squashfs with a writable UBIFS overlay; stock
++boot/system are replaced and original private backups are retained.
++A subsequent standard sysupgrade preserved configuration and host keys;
++the updated kernel/rootfs and preserved recovery readbacks passed.
++Three stop/start tests of patch 118 passed all 14 complete rootfs reads and
++171 three-page samples without ECC or squashfs errors. Mobile data,
++LAN-client DHCP/DNS/NAT/HTTP, AT statistics and LTE cell-lock apply/data/unlock
++passed afterwards. A short RESET press rebooted with settings preserved.
++Long-press factory reset remains under test.

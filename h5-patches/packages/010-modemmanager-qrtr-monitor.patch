@@ -1,0 +1,14 @@
+diff --git a/net/modemmanager/files/usr/sbin/ModemManager-monitor b/net/modemmanager/files/usr/sbin/ModemManager-monitor
+--- a/net/modemmanager/files/usr/sbin/ModemManager-monitor
++++ b/net/modemmanager/files/usr/sbin/ModemManager-monitor
+@@ -70,6 +70,10 @@ mm_monitor_cache_add() {
+ 	}
+ 
+ 	sysfspath=$(modemmanager_get_field "${modemstatus}" "modem.generic.physdev")
++	# An integrated QRTR modem has a stable UID, but no USB/sysfs parent.
++	if [ -z "${sysfspath}" ] && [ "${device}" = "qcom-soc" ]; then
++		sysfspath="${device}"
++	fi
+ 	[ -n "${sysfspath}" ] || {
+ 		mm_log "err" "No 'sysfspath' for object '$object' not found..."
+ 		return 2

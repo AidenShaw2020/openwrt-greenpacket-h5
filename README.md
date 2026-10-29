@@ -40,7 +40,8 @@ Use the exported patch once; do not also copy the same overlay on top.
 - Persistent boot from NAND and standard sysupgrade preserving configuration.
 - Independent OpenWrt initramfs recovery and readback verification.
 - Main and recovery cold boot without USB; USB serial remains a login console.
-- RTL8125B Ethernet at 1 Gb/s, LAN DHCP/DNS, firewall, NAT and client HTTP traffic.
+- RTL8125B Ethernet at 1 Gb/s (`r8125-rss` with external IPA ring library support), LAN DHCP/DNS, firewall, NAT and client HTTP traffic.
+- Stock-equivalent SDX65 IPA v5.0 + Realtek RTL8125B hardware NAT and `nf_flowtable` (`[HW_OFFLOAD]`) packet acceleration (`kmod-h5-ipa-rtk`, `stage 4`), verified under an 8-stream concurrent HTTP download stress test at **115.28 Mbps** with **11.8% CPU** (**0.5% `softirq`**).
 - Mobile data through IPA/rmnet, QRTR/QMI and ModemManager.
 - LTE and 5G NSA, including an active NR band n78 secondary carrier under load.
 - LuCI modem configuration, serving cells, carrier aggregation and signal tables.

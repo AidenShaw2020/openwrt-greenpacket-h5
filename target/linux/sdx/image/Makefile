@@ -72,6 +72,7 @@ define Device/greenpacket_h5-200q1-cpe
   $(call Device/greenpacket_h5-200q1-ipa)
   DEVICE_VARIANT := CPE router
   DEVICE_DTS := qcom-sdx65-greenpacket-h5-cpe
+  DEVICE_PACKAGES += -kmod-r8169 kmod-r8125-rss kmod-h5-ipa-rtk
   BOARD_NAME := greenpacket_h5-200q1
   KERNEL_SIZE := 16384k
   IMAGE_SIZE := 128000k

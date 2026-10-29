@@ -32,3 +32,12 @@
 &tcsr {
 	reg = <0x01fc0000 0x30000>;
 };
+
+&{/soc} {
+	h5_ipa_eth: ipa-ethernet {
+		compatible = "greenpacket,h5-ipa-ethernet";
+		iommus = <&apps_smmu 0x5e3 0x0>;
+		qcom,ipa = <&ipa>;
+		status = "okay";
+	};
+};

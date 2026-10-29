@@ -35,6 +35,10 @@ Normal recovery uses `192.168.0.1` with `rootfs_type: initramfs`.
 The preceding build with the same driver/modem fixes passed persistent boot,
 sysupgrade, mobile data, LAN routing, LTE cell-lock and modem/NAND concurrency
 tests. LTE/5G NSA, including NR n78 activation under traffic, was observed.
+Stock-equivalent SDX65 IPA v5.0 + Realtek RTL8125B hardware NAT and
+`nf_flowtable` packet acceleration (`kmod-h5-ipa-rtk`, `stage 4`) was
+subsequently validated on the device, achieving **115.28 Mbps** across 8
+concurrent TCP streams at **11.8% CPU** (**0.5% `softirq`**).
 That does not establish hardware testing of your own new build.
 
 Fresh root has no password and management uses HTTP by default. Set a strong

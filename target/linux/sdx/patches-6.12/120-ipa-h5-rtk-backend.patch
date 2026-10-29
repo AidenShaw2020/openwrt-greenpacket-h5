@@ -1,0 +1,4296 @@
+Subject: net: ipa: add SDX65 Realtek RTL8125 hardware offload backend
+
+Add stock-equivalent IPA v5.0 external RTL8125 ring, uC, QMI (0x21/0x23/0x24/0x37),
+table, and NAT command backend hooks for GreenPacket H5-200Q1.
+
+---
+--- a/drivers/net/ipa/gsi.c
++++ b/drivers/net/ipa/gsi.c
+@@ -14,8 +14,11 @@
+ #include <linux/netdevice.h>
+ #include <linux/platform_device.h>
+ #include <linux/types.h>
++#include <linux/sizes.h>
++#include <linux/log2.h>
+ 
+ #include "gsi.h"
++#include "gsi_rtk.h"
+ #include "gsi_private.h"
+ #include "gsi_reg.h"
+ #include "gsi_trans.h"
+@@ -174,7 +177,7 @@
+ /* An initialized channel has a non-null GSI pointer */
+ static bool gsi_channel_initialized(struct gsi_channel *channel)
+ {
+-	return !!channel->gsi;
++	return channel->gsi && !channel->rtk;
+ }
+ 
+ /* Encode the channel protocol for the CH_C_CNTXT_0 register */
+@@ -281,40 +284,72 @@
+ 
+ static void gsi_irq_ieob_enable_one(struct gsi *gsi, u32 evt_ring_id)
+ {
+-	bool enable_ieob = !gsi->ieob_enabled_bitmap;
++	bool enable_ieob;
+ 	const struct reg *reg;
+ 	u32 val;
+-
++	unsigned long flags;
++
++	spin_lock_irqsave(&gsi->ieob_lock, flags);
++
++	enable_ieob = !(gsi->ieob_enabled_bitmap | gsi->msi_enabled_bitmap);
+ 	gsi->ieob_enabled_bitmap |= BIT(evt_ring_id);
+ 
+ 	reg = gsi_reg(gsi, CNTXT_SRC_IEOB_IRQ_MSK);
+-	val = gsi->ieob_enabled_bitmap;
++	val = gsi->ieob_enabled_bitmap | gsi->msi_enabled_bitmap;
+ 	iowrite32(val, gsi->virt + reg_offset(reg));
+ 
+ 	/* Enable the interrupt type if this is the first channel enabled */
+ 	if (enable_ieob)
+ 		gsi_irq_type_enable(gsi, GSI_IEOB);
++	spin_unlock_irqrestore(&gsi->ieob_lock, flags);
+ }
+ 
+ static void gsi_irq_ieob_disable(struct gsi *gsi, u32 event_mask)
+ {
+ 	const struct reg *reg;
+ 	u32 val;
++	unsigned long flags;
++
++	spin_lock_irqsave(&gsi->ieob_lock, flags);
+ 
+ 	gsi->ieob_enabled_bitmap &= ~event_mask;
+ 
+ 	/* Disable the interrupt type if this was the last enabled channel */
+-	if (!gsi->ieob_enabled_bitmap)
++	if (!(gsi->ieob_enabled_bitmap | gsi->msi_enabled_bitmap))
+ 		gsi_irq_type_disable(gsi, GSI_IEOB);
+ 
+ 	reg = gsi_reg(gsi, CNTXT_SRC_IEOB_IRQ_MSK);
+-	val = gsi->ieob_enabled_bitmap;
++	val = gsi->ieob_enabled_bitmap | gsi->msi_enabled_bitmap;
+ 	iowrite32(val, gsi->virt + reg_offset(reg));
++	spin_unlock_irqrestore(&gsi->ieob_lock, flags);
+ }
+ 
+ static void gsi_irq_ieob_disable_one(struct gsi *gsi, u32 evt_ring_id)
+ {
+ 	gsi_irq_ieob_disable(gsi, BIT(evt_ring_id));
++}
++
++/* MSI event rings share the hardware IEOB mask with IRQ rings. Keep their
++ * bits enabled while AP NAPI temporarily masks its own completion interrupts.
++ */
++static void gsi_irq_msi_set(struct gsi *gsi, u32 event_id, bool enable)
++{
++	const struct reg *reg = gsi_reg(gsi, CNTXT_SRC_IEOB_IRQ_MSK);
++	unsigned long flags;
++	u32 mask;
++
++	spin_lock_irqsave(&gsi->ieob_lock, flags);
++	if (enable)
++		gsi->msi_enabled_bitmap |= BIT(event_id);
++	else
++		gsi->msi_enabled_bitmap &= ~BIT(event_id);
++	mask = gsi->ieob_enabled_bitmap | gsi->msi_enabled_bitmap;
++	iowrite32(mask, gsi->virt + reg_offset(reg));
++	if (mask)
++		gsi_irq_type_enable(gsi, GSI_IEOB);
++	else
++		gsi_irq_type_disable(gsi, GSI_IEOB);
++	spin_unlock_irqrestore(&gsi->ieob_lock, flags);
+ }
+ 
+ /* Enable all GSI_interrupt types */
+@@ -1321,15 +1356,21 @@
+ static void gsi_isr_ieob(struct gsi *gsi)
+ {
+ 	const struct reg *reg;
+-	u32 event_mask;
++	u32 event_mask, status;
+ 
+ 	reg = gsi_reg(gsi, CNTXT_SRC_IEOB_IRQ);
+-	event_mask = ioread32(gsi->virt + reg_offset(reg));
++	status = ioread32(gsi->virt + reg_offset(reg));
++	status &= gsi->ieob_enabled_bitmap | gsi->msi_enabled_bitmap;
++	event_mask = status;
++	/* Raw status also contains external RTK MSI rings. Only AP-enabled
++	 * event rings own NAPI state; masked MSI completions must not enter it.
++	 */
++	event_mask &= gsi->ieob_enabled_bitmap;
+ 
+ 	gsi_irq_ieob_disable(gsi, event_mask);
+ 
+ 	reg = gsi_reg(gsi, CNTXT_SRC_IEOB_IRQ_CLR);
+-	iowrite32(event_mask, gsi->virt + reg_offset(reg));
++	iowrite32(status, gsi->virt + reg_offset(reg));
+ 
+ 	while (event_mask) {
+ 		u32 evt_ring_id = __ffs(event_mask);
+@@ -1707,6 +1748,279 @@
+ 	return event_bitmap;
+ }
+ 
++/*
++ * RTL8125 external rings on SDX65 IPA v5.0.  The protocol and scratch format
++ * follow Qualcomm dataipa ipa_eth_i.c / gsi_rtk_channel_scratch.  The H5 stock
++ * ipa3_ep_mapping selects channels 18 (producer) and 21 (consumer).
++ * Included in gsi.c to reuse its serialized hardware command implementation.
++ */
++
++#define GSI_RTK_ELEMENT_SIZE	32U
++#define GSI_RTK_PCIE_SELECT	BIT_ULL(40)
++
++static void gsi_rtk_write(struct gsi *gsi, enum gsi_reg_id id, u32 index,
++			  u32 value)
++{
++	const struct reg *reg = gsi_reg(gsi, id);
++
++	iowrite32(value, gsi->virt + reg_n_offset(reg, index));
++}
++
++static int gsi_rtk_validate(struct gsi *gsi, const struct gsi_rtk_config *c)
++{
++	u64 buffer_end;
++	u32 tail;
++
++	if (gsi->version != IPA_VERSION_5_0)
++		return -EOPNOTSUPP;
++	if (!is_power_of_2(c->ring_size) || c->ring_size < 64 ||
++	    c->ring_size > SZ_1M || !IS_ALIGNED(c->ring_addr, c->ring_size))
++		return -EINVAL;
++	if (!is_power_of_2(c->buffer_size) || c->buffer_size < 2048 ||
++	    c->buffer_size > 4096 ||
++	    !IS_ALIGNED(c->buffer_addr, c->buffer_size))
++		return -EINVAL;
++	if (c->queue > (c->toward_ipa ? 15 : 1))
++		return -EINVAL;
++	tail = c->toward_ipa ? 0 : 0x2800 + 4 * c->queue;
++	if (c->tail_offset != tail || c->bar_size < tail + sizeof(u32) ||
++	    !IS_ALIGNED(c->bar_addr, sizeof(u32)))
++		return -EINVAL;
++	/* RTK scratch: 41-bit PCIe address and 40-bit shared-buffer IOVA. */
++	buffer_end = c->buffer_addr +
++		(u64)(c->ring_size / GSI_RTK_ELEMENT_SIZE) * c->buffer_size;
++	if (!c->bar_addr || c->bar_addr >= GSI_RTK_PCIE_SELECT ||
++	    c->bar_addr + c->bar_size > GSI_RTK_PCIE_SELECT ||
++	    buffer_end > BIT_ULL(40) || buffer_end <= c->buffer_addr ||
++	    c->ring_addr >= BIT_ULL(40))
++		return -ERANGE;
++	/* Event doorbell is outside the ring.  Its low 32 bits must not wrap. */
++	if ((u64)lower_32_bits(c->ring_addr) + c->ring_size +
++	    GSI_RTK_ELEMENT_SIZE > U32_MAX)
++		return -ERANGE;
++	return 0;
++}
++
++static void gsi_rtk_program(struct gsi_rtk *rtk,
++			    const struct gsi_rtk_config *c)
++{
++	struct gsi *gsi = rtk->gsi;
++	u32 ch = rtk->channel_id, ev = rtk->event_id;
++	u64 bar = c->bar_addr | GSI_RTK_PCIE_SELECT;
++	u64 msi = bar + c->tail_offset;
++	const struct reg *reg;
++	u32 queue, value;
++
++	reg = gsi_reg(gsi, EV_CH_E_CNTXT_0);
++	value = reg_encode(reg, EV_CHTYPE, GSI_CHANNEL_TYPE_RTK) |
++		reg_encode(reg, EV_ELEMENT_SIZE, GSI_RTK_ELEMENT_SIZE);
++	/* EV_INTYPE = 0: MSI straight to the RTL8125, no AP NAPI. */
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_0, ev, value);
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_1, ev, c->ring_size);
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_2, ev, lower_32_bits(c->ring_addr));
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_3, ev, upper_32_bits(c->ring_addr));
++	reg = gsi_reg(gsi, EV_CH_E_CNTXT_8);
++	value = c->toward_ipa ? 0 : reg_encode(reg, EV_MODT, 32) |
++		reg_encode(reg, EV_MODC, 128);
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_8, ev, value);
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_9, ev, 0);
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_10, ev, lower_32_bits(msi));
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_11, ev, upper_32_bits(msi));
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_12, ev, 0);
++	gsi_rtk_write(gsi, EV_CH_E_CNTXT_13, ev, 0);
++	gsi_rtk_write(gsi, EV_CH_E_SCRATCH_0, ev, 0);
++	gsi_rtk_write(gsi, EV_CH_E_SCRATCH_1, ev, 0);
++
++	reg = gsi_reg(gsi, CH_C_CNTXT_0);
++	value = reg_encode(reg, CHTYPE_PROTOCOL, GSI_CHANNEL_TYPE_RTK) |
++		reg_encode(reg, ELEMENT_SIZE, GSI_RTK_ELEMENT_SIZE);
++	if (c->toward_ipa)
++		value |= reg_bit(reg, CHTYPE_DIR);
++	gsi_rtk_write(gsi, CH_C_CNTXT_0, ch, value);
++	reg = gsi_reg(gsi, CH_C_CNTXT_1);
++	value = reg_encode(reg, CH_R_LENGTH, c->ring_size) |
++		reg_encode(reg, CH_ERINDEX, ev);
++	gsi_rtk_write(gsi, CH_C_CNTXT_1, ch, value);
++	gsi_rtk_write(gsi, CH_C_CNTXT_2, ch, lower_32_bits(c->ring_addr));
++	gsi_rtk_write(gsi, CH_C_CNTXT_3, ch, upper_32_bits(c->ring_addr));
++	reg = gsi_reg(gsi, CH_C_QOS);
++	value = reg_encode(reg, WRR_WEIGHT, 1) | reg_bit(reg, USE_DB_ENG) |
++		reg_bit(reg, DB_IN_BYTES) |
++		reg_encode(reg, PREFETCH_MODE, SMART_PREFETCH) |
++		reg_encode(reg, EMPTY_LVL_THRSHOLD, 3);
++	gsi_rtk_write(gsi, CH_C_QOS, ch, value);
++	queue = c->toward_ipa ? c->queue : (c->queue ? 18 : 16);
++	gsi_rtk_write(gsi, CH_C_SCRATCH_0, ch, lower_32_bits(bar));
++	value = upper_32_bits(bar) | (queue << 9) |
++		(ilog2(c->buffer_size) << 14) |
++		(upper_32_bits(c->buffer_addr) << 24);
++	gsi_rtk_write(gsi, CH_C_SCRATCH_1, ch, value);
++	gsi_rtk_write(gsi, CH_C_SCRATCH_2, ch, lower_32_bits(c->buffer_addr));
++	gsi_rtk_write(gsi, CH_C_SCRATCH_3, ch, 0);
++	/* No DMA starts here; endpoint/uC and NIC setup still precede START. */
++	gsi_rtk_write(gsi, EV_CH_E_DOORBELL_0, ev,
++		      lower_32_bits(c->ring_addr) + c->ring_size + 32);
++	if (!c->toward_ipa)
++		gsi_rtk_write(gsi, CH_C_CNTXT_8, ch, 0xfdb);
++}
++
++int gsi_rtk_prepare(struct gsi *gsi, const struct gsi_rtk_config *c,
++		    struct gsi_rtk *rtk)
++{
++	struct resource *res;
++	struct gsi_channel *channel;
++	u32 ch;
++	int ev, ret;
++
++	if (!gsi || !c || !rtk || rtk->gsi)
++		return -EINVAL;
++	ret = gsi_rtk_validate(gsi, c);
++	if (ret)
++		return ret;
++	ch = c->toward_ipa ? 18 : 21;
++	if (ch >= gsi->channel_count)
++		return -ENODEV;
++	res = platform_get_resource_byname(to_platform_device(gsi->dev),
++					   IORESOURCE_MEM, "gsi");
++	if (!res || reg_n_offset(gsi_reg(gsi, CH_C_CNTXT_8), ch) + 4 >
++	    resource_size(res))
++		return -ENODEV;
++
++	mutex_lock(&gsi->mutex);
++	channel = &gsi->channel[ch];
++	if (channel->gsi) {
++		ret = -EBUSY;
++		goto out;
++	}
++	ev = gsi_evt_ring_id_alloc(gsi);
++	if (ev < 0) {
++		ret = ev;
++		goto out;
++	}
++	if (ev >= gsi->evt_ring_count) {
++		gsi_evt_ring_id_free(gsi, ev);
++		ret = -ENOSPC;
++		goto out;
++	}
++	/* Claim before the first command; failed commands can still own DMA. */
++	channel->gsi = gsi;
++	channel->rtk = rtk;
++	channel->toward_ipa = c->toward_ipa;
++	channel->evt_ring_id = ev;
++	rtk->gsi = gsi;
++	rtk->channel_id = ch;
++	rtk->event_id = ev;
++	rtk->msi_addr = res->start +
++		reg_n_offset(gsi_reg(gsi, CH_C_CNTXT_8), ch);
++	ret = gsi_evt_ring_alloc_command(gsi, ev);
++	if (ret)
++		goto out;
++	ret = gsi_channel_alloc_command(gsi, ch);
++	if (!ret) {
++		gsi_rtk_program(rtk, c);
++		rtk->prepared = true;
++		gsi_irq_msi_set(gsi, ev, true);
++	}
++out:
++	mutex_unlock(&gsi->mutex);
++	return ret;
++}
++
++int gsi_rtk_start(struct gsi_rtk *rtk)
++{
++	struct gsi *gsi;
++	int ret;
++
++	if (!rtk || !rtk->gsi || !rtk->prepared)
++		return -EINVAL;
++	gsi = rtk->gsi;
++	mutex_lock(&gsi->mutex);
++	if (gsi->channel[rtk->channel_id].rtk != rtk)
++		ret = -EINVAL;
++	else
++		ret = gsi_channel_start_command(&gsi->channel[rtk->channel_id]);
++	mutex_unlock(&gsi->mutex);
++	return ret;
++}
++
++int gsi_rtk_stop(struct gsi_rtk *rtk)
++{
++	struct gsi_channel *channel;
++	struct gsi *gsi;
++	enum gsi_channel_state state;
++	int ret = 0;
++
++	if (!rtk || !rtk->gsi)
++		return 0;
++	gsi = rtk->gsi;
++	channel = &gsi->channel[rtk->channel_id];
++	mutex_lock(&gsi->mutex);
++	if (channel->rtk != rtk) {
++		ret = -EINVAL;
++		goto out;
++	}
++	state = gsi_channel_state(channel);
++	if (state == GSI_CHANNEL_STATE_STARTED ||
++	    state == GSI_CHANNEL_STATE_STOP_IN_PROC)
++		ret = gsi_channel_stop_retry(channel);
++	else if (state != GSI_CHANNEL_STATE_ALLOCATED &&
++		 state != GSI_CHANNEL_STATE_STOPPED &&
++		 state != GSI_CHANNEL_STATE_NOT_ALLOCATED)
++		ret = -EIO;
++out:
++	mutex_unlock(&gsi->mutex);
++	return ret;
++}
++
++int gsi_rtk_release(struct gsi_rtk *rtk)
++{
++	struct gsi_channel *channel;
++	struct gsi *gsi;
++	enum gsi_channel_state state;
++	enum gsi_evt_ring_state ev_state;
++	int ret = -EBUSY;
++
++	if (!rtk || !rtk->gsi)
++		return 0;
++	gsi = rtk->gsi;
++	channel = &gsi->channel[rtk->channel_id];
++	mutex_lock(&gsi->mutex);
++	if (channel->rtk != rtk) {
++		ret = -EINVAL;
++		goto out;
++	}
++	state = gsi_channel_state(channel);
++	if (state == GSI_CHANNEL_STATE_STARTED ||
++	    state == GSI_CHANNEL_STATE_STOP_IN_PROC)
++		goto out;
++	gsi_irq_msi_set(gsi, rtk->event_id, false);
++	rtk->prepared = false;
++	if (state == GSI_CHANNEL_STATE_STOPPED || state == GSI_CHANNEL_STATE_ERROR)
++		gsi_channel_reset_command(channel);
++	state = gsi_channel_state(channel);
++	if (state == GSI_CHANNEL_STATE_ALLOCATED)
++		gsi_channel_de_alloc_command(gsi, rtk->channel_id);
++	if (gsi_channel_state(channel) != GSI_CHANNEL_STATE_NOT_ALLOCATED)
++		goto out;
++	ev_state = gsi_evt_ring_state(gsi, rtk->event_id);
++	if (ev_state != GSI_EVT_RING_STATE_NOT_ALLOCATED) {
++		gsi_evt_ring_reset_command(gsi, rtk->event_id);
++		if (gsi_evt_ring_state(gsi, rtk->event_id) ==
++		    GSI_EVT_RING_STATE_ALLOCATED)
++			gsi_evt_ring_de_alloc_command(gsi, rtk->event_id);
++	}
++	if (gsi_evt_ring_state(gsi, rtk->event_id) !=
++	    GSI_EVT_RING_STATE_NOT_ALLOCATED)
++		goto out;
++	gsi_evt_ring_id_free(gsi, rtk->event_id);
++	memset(channel, 0, sizeof(*channel));
++	memset(rtk, 0, sizeof(*rtk));
++	ret = 0;
++out:
++	mutex_unlock(&gsi->mutex);
++	return ret;
++}
++
+ /* Setup function for a single channel */
+ static int gsi_channel_setup_one(struct gsi *gsi, u32 channel_id)
+ {
+@@ -2355,6 +2669,8 @@
+ 	modem_alloc = gsi->version == IPA_VERSION_4_2;
+ 
+ 	gsi->event_bitmap = gsi_event_bitmap_init(GSI_EVT_RING_COUNT_MAX);
++	spin_lock_init(&gsi->ieob_lock);
++	gsi->msi_enabled_bitmap = 0;
+ 	gsi->ieob_enabled_bitmap = 0;
+ 
+ 	/* The endpoint data array is indexed by endpoint name */
+@@ -2483,3 +2799,8 @@
+ 	/* Hardware limit is channel->tre_count - 1 */
+ 	return channel->tre_count - (channel->trans_tre_max - 1);
+ }
++
++EXPORT_SYMBOL_GPL(gsi_rtk_prepare);
++EXPORT_SYMBOL_GPL(gsi_rtk_start);
++EXPORT_SYMBOL_GPL(gsi_rtk_stop);
++EXPORT_SYMBOL_GPL(gsi_rtk_release);
+--- a/drivers/net/ipa/gsi.h
++++ b/drivers/net/ipa/gsi.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/completion.h>
+ #include <linux/mutex.h>
++#include <linux/spinlock.h>
+ #include <linux/netdevice.h>
+ #include <linux/types.h>
+ 
+@@ -96,7 +97,10 @@
+ };
+ 
+ /* We only care about channels between IPA and AP */
++struct gsi_rtk;
++
+ struct gsi_channel {
++	struct gsi_rtk *rtk;	/* External RTL8125 ring owner, no GPI/NAPI */
+ 	struct gsi *gsi;
+ 	bool toward_ipa;
+ 	bool command;			/* AP command TX channel or not */
+@@ -145,6 +149,8 @@
+ 	u32 event_bitmap;		/* allocated event rings */
+ 	u32 modem_channel_bitmap;	/* modem channels to allocate */
+ 	u32 type_enabled_bitmap;	/* GSI IRQ types enabled */
++	spinlock_t ieob_lock;	/* AP IRQ/MSI mask updates */
++	u32 msi_enabled_bitmap;	/* External event rings, no NAPI */
+ 	u32 ieob_enabled_bitmap;	/* IEOB IRQ enabled (event rings) */
+ 	int result;			/* Negative errno (generic commands) */
+ 	struct completion completion;	/* Signals GSI command completion */
+--- a/drivers/net/ipa/gsi_reg.c
++++ b/drivers/net/ipa/gsi_reg.c
+@@ -19,6 +19,9 @@
+ 
+ 	case HW_PARAM_2:
+ 		return gsi->version >= IPA_VERSION_3_5_1;
++
++	case CH_C_CNTXT_8:
++		return gsi->version == IPA_VERSION_5_0;
+ 
+ 	case HW_PARAM_4:
+ 		return gsi->version >= IPA_VERSION_5_0;
+--- a/drivers/net/ipa/gsi_reg.h
++++ b/drivers/net/ipa/gsi_reg.h
+@@ -50,6 +50,7 @@
+ 	CH_C_CNTXT_1,
+ 	CH_C_CNTXT_2,
+ 	CH_C_CNTXT_3,
++	CH_C_CNTXT_8,				/* IPA v5.0 RTK MSI */
+ 	CH_C_QOS,
+ 	CH_C_SCRATCH_0,
+ 	CH_C_SCRATCH_1,
+@@ -124,6 +125,7 @@
+ 	GSI_CHANNEL_TYPE_MHIP			= 0x7,
+ 	GSI_CHANNEL_TYPE_AQC			= 0x8,
+ 	GSI_CHANNEL_TYPE_11AD			= 0x9,
++	GSI_CHANNEL_TYPE_RTK			= 0xc,
+ };
+ 
+ /* CH_C_CNTXT_1 register */
+--- a/drivers/net/ipa/reg/gsi_reg-v5.0.c
++++ b/drivers/net/ipa/reg/gsi_reg-v5.0.c
+@@ -39,6 +39,8 @@
+ REG_STRIDE(CH_C_CNTXT_2, ch_c_cntxt_2, 0x00014008 + 0x12000 * GSI_EE_AP, 0x80);
+ 
+ REG_STRIDE(CH_C_CNTXT_3, ch_c_cntxt_3, 0x0001400c + 0x12000 * GSI_EE_AP, 0x80);
++
++REG_STRIDE(CH_C_CNTXT_8, ch_c_cntxt_8, 0x00014020 + 0x12000 * GSI_EE_AP, 0x80);
+ 
+ static const u32 reg_ch_c_qos_fmask[] = {
+ 	[WRR_WEIGHT]					= GENMASK(3, 0),
+@@ -265,6 +267,7 @@
+ 	[CH_C_CNTXT_1]			= &reg_ch_c_cntxt_1,
+ 	[CH_C_CNTXT_2]			= &reg_ch_c_cntxt_2,
+ 	[CH_C_CNTXT_3]			= &reg_ch_c_cntxt_3,
++	[CH_C_CNTXT_8]			= &reg_ch_c_cntxt_8,
+ 	[CH_C_QOS]			= &reg_ch_c_qos,
+ 	[CH_C_SCRATCH_0]		= &reg_ch_c_scratch_0,
+ 	[CH_C_SCRATCH_1]		= &reg_ch_c_scratch_1,
+--- /dev/null
++++ b/drivers/net/ipa/gsi_rtk.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _GSI_RTK_H_
++#define _GSI_RTK_H_
++
++#include <linux/types.h>
++
++struct gsi;
++
++/* IPA-side IOVAs, not PCI DMA addresses.  The caller owns all mappings. */
++struct gsi_rtk_config {
++	u64 ring_addr;
++	u64 buffer_addr;
++	u64 bar_addr;
++	u32 ring_size;
++	u32 buffer_size;
++	u32 bar_size;
++	u32 tail_offset;
++	u8 queue;
++	bool toward_ipa;
++};
++
++/* Zero initialize before first use.  Keep alive until release succeeds. */
++struct gsi_rtk {
++	struct gsi *gsi;
++	u32 channel_id;
++	u32 event_id;
++	u64 msi_addr;
++	bool prepared;
++};
++
++/*
++ * The caller holds IPA runtime power and serializes the handle lifetime.
++ * prepare does not start DMA.  A failed prepare may retain hardware ownership;
++ * always call release, and retain the rings/mappings until release returns 0.
++ * Start only after IPA endpoint/uC setup and both NIC rings are ready.
++ * Before release, disable the NIC offload queue and IPA endpoint first.
++ */
++int gsi_rtk_prepare(struct gsi *gsi, const struct gsi_rtk_config *config,
++		    struct gsi_rtk *rtk);
++int gsi_rtk_start(struct gsi_rtk *rtk);
++int gsi_rtk_stop(struct gsi_rtk *rtk);
++int gsi_rtk_release(struct gsi_rtk *rtk);
++
++#endif
+--- a/drivers/net/ipa/ipa.h
++++ b/drivers/net/ipa/ipa.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/notifier.h>
+ #include <linux/types.h>
++#include <linux/mutex.h>
+ 
+ #include "gsi.h"
+ #include "ipa_endpoint.h"
+@@ -88,6 +89,8 @@
+ 
+ 	struct ipa_interrupt *interrupt;
+ 	bool uc_powered;
++	struct mutex uc_command_mutex; /* Serializes uC requests */
++	bool uc_command_failed;
+ 	bool uc_loaded;
+ 
+ 	void __iomem *reg_virt;
+@@ -124,6 +127,8 @@
+ 	struct ipa_endpoint *channel_map[GSI_CHANNEL_COUNT_MAX];
+ 	struct ipa_endpoint *name_map[IPA_ENDPOINT_COUNT];
+ 
++	struct ipa_rtk_endpoints *rtk_endpoints;
++	struct net_device __rcu *rtk_netdev;
+ 	bool setup_complete;
+ 
+ 	atomic_t modem_state;		/* enum ipa_modem_state */
+--- a/drivers/net/ipa/ipa_uc.c
++++ b/drivers/net/ipa/ipa_uc.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/iopoll.h>
+ #include <linux/io.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/types.h>
+@@ -15,6 +16,7 @@
+ #include "ipa_power.h"
+ #include "ipa_reg.h"
+ #include "ipa_uc.h"
++#include "ipa_uc_rtk.h"
+ 
+ /**
+  * DOC:  The IPA embedded microcontroller
+@@ -155,6 +157,9 @@
+ 	 * know the microcontroller has finished its initialization.
+ 	 */
+ 	switch (shared->response) {
++	case IPA_UC_RESPONSE_CMD_COMPLETED:
++		/* The serialized RTK command sender polls shared memory. */
++		break;
+ 	case IPA_UC_RESPONSE_INIT_COMPLETED:
+ 		if (ipa->uc_powered) {
+ 			ipa->uc_loaded = true;
+@@ -185,25 +190,30 @@
+ /* Configure the IPA microcontroller subsystem */
+ void ipa_uc_config(struct ipa *ipa)
+ {
++	mutex_init(&ipa->uc_command_mutex);
++	ipa->uc_command_failed = false;
+ 	ipa->uc_powered = false;
+ 	ipa->uc_loaded = false;
++	if (of_machine_is_compatible("greenpacket,h5-200q1")) {
++		struct ipa_uc_mem_area *shared = ipa_uc_shared(ipa);
++
++		/* H5 retains SRAM across warm reboots. An old INIT/CMD_COMPLETED
++		 * response does not prove that the uC survived the hardware reset.
++		 * Let the modem load it during the first QMI handshake, as upstream
++		 * normally does. Clear stale replies before enabling uC interrupts.
++		 */
++		dev_info(ipa->dev, "H5 uC cold initialization: previous cmd=%#x response=%#x ABI=%#x\n",
++			READ_ONCE(shared->command), READ_ONCE(shared->response),
++			le16_to_cpu(READ_ONCE(shared->interface_version)));
++		WRITE_ONCE(shared->command_param, 0);
++		WRITE_ONCE(shared->command_param_hi, 0);
++		WRITE_ONCE(shared->command, 0);
++		WRITE_ONCE(shared->response_param, 0);
++		WRITE_ONCE(shared->response, 0);
++		wmb();
++	}
+ 	ipa_interrupt_enable(ipa, IPA_IRQ_UC_0);
+ 	ipa_interrupt_enable(ipa, IPA_IRQ_UC_1);
+-	if (of_machine_is_compatible("greenpacket,h5-200q1")) {
+-		struct ipa_uc_mem_area *shared = ipa_uc_shared(ipa);
+-		u8 response = READ_ONCE(shared->response);
+-		u16 version = le16_to_cpu(READ_ONCE(shared->interface_version));
+-
+-		/* Preserve the uC loaded by this board's boot firmware. A completed
+-		 * command and matching ABI distinguish it from uninitialized SRAM.
+-		 */
+-		if (version == 0x1f &&
+-		    (response == IPA_UC_RESPONSE_INIT_COMPLETED ||
+-		     response == IPA_UC_RESPONSE_CMD_COMPLETED)) {
+-			ipa->uc_loaded = true;
+-			ipa_power_retention(ipa, true);
+-		}
+-	}
+ }
+ 
+ /* Inverse of ipa_uc_config() */
+@@ -252,9 +262,9 @@
+ 	u32 val;
+ 
+ 	/* Fill in the command data */
+-	shared->command = command;
+ 	shared->command_param = cpu_to_le32(command_param);
+ 	shared->command_param_hi = 0;
++	shared->command = command;
+ 	shared->response = 0;
+ 	shared->response_param = 0;
+ 
+@@ -262,6 +272,8 @@
+ 	reg = ipa_reg(ipa, IPA_IRQ_UC);
+ 	val = reg_bit(reg, UC_INTR);
+ 
++	/* Publish command fields in shared SRAM before raising the IRQ. */
++	wmb();
+ 	iowrite32(val, ipa->reg_virt + reg_offset(reg));
+ }
+ 
+@@ -276,3 +288,66 @@
+ 	/* give uc enough time to save state */
+ 	udelay(IPA_SEND_DELAY);
+ }
++
++/* Stock OFFLOAD feature 6, command 1/2 and success status 0. */
++#define IPA_UC_RTK_SETUP		0xc1
++#define IPA_UC_RTK_TEARDOWN	0xc2
++#define IPA_UC_RTK_SUCCESS	0xc0
++
++int ipa_uc_rtk_command(struct ipa *ipa, dma_addr_t address, bool setup)
++{
++	struct ipa_uc_mem_area *shared;
++	u8 command = setup ? IPA_UC_RTK_SETUP : IPA_UC_RTK_TEARDOWN;
++	u32 response;
++	u8 ready;
++	int ret;
++
++	static_assert(sizeof(struct ipa_uc_rtk_setup) == 28);
++	static_assert(sizeof(struct ipa_uc_rtk_teardown) == 8);
++	if (ipa->version != IPA_VERSION_5_0)
++		return -EOPNOTSUPP;
++	/* Stock passes only the low DMA word, command_param_hi stays zero. */
++	if (upper_32_bits(address) || !IS_ALIGNED(address, 4))
++		return -ERANGE;
++	mutex_lock(&ipa->uc_command_mutex);
++	if (!ipa->uc_loaded) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (ipa->uc_command_failed) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++	shared = ipa_uc_shared(ipa);
++	/* Publish coherent payload before notifying firmware. */
++	dma_wmb();
++	send_uc_command(ipa, command, lower_32_bits(address));
++	ret = read_poll_timeout(READ_ONCE, ready,
++				ready == IPA_UC_RESPONSE_CMD_COMPLETED,
++				100, 10 * USEC_PER_SEC, false, shared->response);
++	if (ret) {
++		ipa->uc_command_failed = true;
++		dev_err(ipa->dev, "RTK uC command %#x timed out; reset required\n",
++			command);
++		goto out;
++	}
++	dma_rmb();
++	response = le32_to_cpu(READ_ONCE(shared->response_param));
++	if ((response & 0xff) != command) {
++		ipa->uc_command_failed = true;
++		ret = -EPROTO;
++		dev_err(ipa->dev, "RTK uC command %#x unexpected response %#x\n",
++			command, response);
++		goto out;
++	}
++	if (((response >> 8) & 0xff) != IPA_UC_RTK_SUCCESS) {
++		ret = -EREMOTEIO;
++		dev_err(ipa->dev, "RTK uC command %#x rejected, status %#x\n",
++			command, (response >> 8) & 0xff);
++	}
++out:
++	mutex_unlock(&ipa->uc_command_mutex);
++	return ret;
++}
++
++EXPORT_SYMBOL_GPL(ipa_uc_rtk_command);
+--- /dev/null
++++ b/drivers/net/ipa/ipa_uc_rtk.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_UC_RTK_H_
++#define _IPA_UC_RTK_H_
++
++#include <linux/dma-mapping.h>
++#include <linux/types.h>
++
++struct ipa;
++
++/* Exact H5 stock ipa3_eth_config_uc ABI: setup 28 bytes, teardown 8 bytes. */
++struct ipa_uc_rtk_setup {
++	__le32 protocol;		/* 9: RTK */
++	u8 direction;		/* 0: Ethernet RX, 1: Ethernet TX */
++	u8 gsi_channel;
++	__le16 reserved;
++	u8 padding[20];
++} __packed;
++
++struct ipa_uc_rtk_teardown {
++	__le32 protocol;
++	u8 gsi_channel;
++	u8 reserved[3];
++} __packed;
++
++/*
++ * Address is a coherent DMA allocation through ipa->dev.  On SDX65 this
++ * device maps both AP SID 0x5e0 and UC SID 0x5e2 into the same IOMMU domain.
++ * The caller fills the appropriate zero-padded structure and holds a runtime
++ * power reference covering the entire external-ring lifetime.
++ *
++ * -ETIMEDOUT/-EPROTO: completion is unknown; retain payload and ring mappings
++ * until hardware reset. Further commands are refused. Do not attempt fallback
++ * by freeing memory still owned by the microcontroller.
++ */
++int ipa_uc_rtk_command(struct ipa *ipa, dma_addr_t address, bool setup);
++
++#endif
+--- a/drivers/net/ipa/ipa_endpoint.c
++++ b/drivers/net/ipa/ipa_endpoint.c
+@@ -10,6 +10,10 @@
+ #include <linux/dma-direction.h>
+ #include <linux/if_rmnet.h>
+ #include <linux/types.h>
++#include <linux/of.h>
++#include <linux/etherdevice.h>
++#include <linux/if_arp.h>
++#include <linux/moduleparam.h>
+ 
+ #include "gsi.h"
+ #include "gsi_trans.h"
+@@ -17,6 +21,7 @@
+ #include "ipa_cmd.h"
+ #include "ipa_data.h"
+ #include "ipa_endpoint.h"
++#include "ipa_endpoint_rtk.h"
+ #include "ipa_gsi.h"
+ #include "ipa_interrupt.h"
+ #include "ipa_mem.h"
+@@ -1488,7 +1493,7 @@
+ 	u32 endpoint_id;
+ 
+ 	status_mask = ipa_status_extract(ipa, data, STATUS_MASK);
+-	if (!status_mask)
++	if (!(status_mask & IPA_STATUS_MASK_TAG_VALID))
+ 		return false;	/* No valid tag */
+ 
+ 	/* The status contains a valid tag.  We know the packet was sent to
+@@ -1531,6 +1536,60 @@
+ 	return rule == IPA_STATUS_RULE_MISS;
+ }
+ 
++/* H5 has one IPA instance. Keep diagnostic counters outside the private ABI. */
++static atomic64_t ipa_rtk_rx_packets = ATOMIC64_INIT(0);
++static atomic64_t ipa_rtk_rx_bytes = ATOMIC64_INIT(0);
++static atomic64_t ipa_rtk_rx_invalid = ATOMIC64_INIT(0);
++static bool h5_rtk_status_debug;
++module_param_named(h5_rtk_status_debug, h5_rtk_status_debug, bool, 0600);
++
++void ipa_endpoint_rtk_stats(struct ipa_rtk_rx_stats *stats)
++{
++	stats->packets = atomic64_read(&ipa_rtk_rx_packets);
++	stats->bytes = atomic64_read(&ipa_rtk_rx_bytes);
++	stats->invalid = atomic64_read(&ipa_rtk_rx_invalid);
++}
++EXPORT_SYMBOL_GPL(ipa_endpoint_rtk_stats);
++
++/* Called only for packets received on AP LAN with source endpoint 8. */
++static void ipa_endpoint_rtk_exception(struct ipa *ipa, const void *status,
++				       const void *packet, unsigned int length)
++{
++	struct net_device *netdev;
++	struct sk_buff *skb;
++	u32 opcode, exception;
++	__be16 protocol;
++
++	opcode = ipa_status_extract(ipa, status, STATUS_OPCODE);
++	exception = ipa_status_extract(ipa, status, STATUS_EXCEPTION);
++	if (opcode == IPA_STATUS_OPCODE_DROPPED_PACKET ||
++	    exception == IPA_STATUS_EXCEPTION_DEAGGR || length < ETH_HLEN)
++		return;
++	memcpy(&protocol, packet + 12, sizeof(protocol));
++	if (protocol != htons(ETH_P_IP) && protocol != htons(ETH_P_IPV6) &&
++	    protocol != htons(ETH_P_ARP) && protocol != htons(ETH_P_8021Q) &&
++	    protocol != htons(ETH_P_8021AD)) {
++		atomic64_inc(&ipa_rtk_rx_invalid);
++		return;
++	}
++	rcu_read_lock();
++	netdev = rcu_dereference(ipa->rtk_netdev);
++	if (!netdev || !netif_running(netdev))
++		goto out;
++	skb = netdev_alloc_skb_ip_align(netdev, length);
++	if (!skb)
++		goto out;
++	skb_put_data(skb, packet, length);
++	skb->ip_summed = CHECKSUM_NONE;
++	skb->protocol = eth_type_trans(skb, netdev);
++	atomic64_inc(&ipa_rtk_rx_packets);
++	atomic64_add(length, &ipa_rtk_rx_bytes);
++	/* Preserve ordinary bridge/firewall/conntrack handling of exception RX. */
++	netif_receive_skb(skb);
++out:
++	rcu_read_unlock();
++}
++
+ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
+ 				      struct page *page, u32 total_len)
+ {
+@@ -1555,6 +1614,17 @@
+ 
+ 		/* Skip over status packets that lack packet data */
+ 		length = ipa_status_extract(ipa, data, STATUS_LENGTH);
++		if (unlikely(READ_ONCE(h5_rtk_status_debug)) && ipa->rtk_endpoints &&
++		    endpoint == ipa->name_map[IPA_ENDPOINT_AP_LAN_RX])
++			dev_info_ratelimited(dev,
++				"RTK RX status resid=%u len=%u op=%u src=%u dst=%u exc=%u filter=%u route=%u mask=%#x\n",
++				resid, length, ipa_status_extract(ipa, data, STATUS_OPCODE),
++				ipa_status_extract(ipa, data, STATUS_SRC_ENDPOINT),
++				ipa_status_extract(ipa, data, STATUS_DST_ENDPOINT),
++				ipa_status_extract(ipa, data, STATUS_EXCEPTION),
++				ipa_status_extract(ipa, data, STATUS_FILTER_RULE_INDEX),
++				ipa_status_extract(ipa, data, STATUS_ROUTER_RULE_INDEX),
++				ipa_status_extract(ipa, data, STATUS_MASK));
+ 		if (!length || ipa_endpoint_status_skip(endpoint, data)) {
+ 			data += IPA_STATUS_SIZE;
+ 			resid -= IPA_STATUS_SIZE;
+@@ -1567,12 +1637,19 @@
+ 		 * And if checksum offload is enabled a trailer containing
+ 		 * computed checksum information will be appended.
+ 		 */
+-		align = endpoint->config.rx.pad_align ? : 1;
++		align = 1U << endpoint->config.rx.pad_align;
+ 		len = IPA_STATUS_SIZE + ALIGN(length, align);
+ 		if (endpoint->config.checksum)
+ 			len += sizeof(struct rmnet_map_dl_csum_trailer);
+ 
+-		if (!ipa_endpoint_status_drop(endpoint, data)) {
++		if (len > resid) {
++			dev_err_ratelimited(dev, "truncated IPA status payload\n");
++			break;
++		}
++		if (endpoint == ipa->name_map[IPA_ENDPOINT_AP_LAN_RX] &&
++		    ipa_status_extract(ipa, data, STATUS_SRC_ENDPOINT) == 8) {
++			ipa_endpoint_rtk_exception(ipa, data, data + IPA_STATUS_SIZE, length);
++		} else if (!ipa_endpoint_status_drop(endpoint, data)) {
+ 			void *data2;
+ 			u32 extra;
+ 
+@@ -2176,6 +2253,34 @@
+ 			ipa->modem_tx_count++;
+ 	}
+ 
++	/* Reserve RTK's filter pointer at initial table setup, before modem
++	 * handshake, and reserve modem EP5 (Q6_DL_NLO_LL_DATA_PROD) so its
++	 * filter slot does not collide with EP8's slot.
++	 */
++	if (ipa->version == IPA_VERSION_5_0 &&
++	    of_machine_is_compatible("greenpacket,h5-200q1")) {
++		struct ipa_endpoint *rtk, *ll;
++
++		if (ipa->endpoint_count <= 8 || test_bit(5, ipa->defined) ||
++		    test_bit(8, ipa->defined)) {
++			ipa_endpoint_exit(ipa);
++			return -EINVAL;
++		}
++		ll = &ipa->endpoint[5];
++		ll->ipa = ipa;
++		ll->endpoint_id = 5;
++		ll->ee_id = GSI_EE_MODEM;
++		ll->toward_ipa = true;
++		filtered |= BIT(5);
++
++		rtk = &ipa->endpoint[8];
++		rtk->ipa = ipa;
++		rtk->endpoint_id = 8;
++		rtk->ee_id = GSI_EE_AP;
++		rtk->toward_ipa = true;
++		filtered |= BIT(8);
++	}
++
+ 	/* Make sure the set of filtered endpoints is valid */
+ 	if (!ipa_filtered_valid(ipa, filtered)) {
+ 		ipa_endpoint_exit(ipa);
+@@ -2196,3 +2301,154 @@
+ 
+ 	return -ENOMEM;
+ }
++
++/* RTK external Ethernet endpoint support; serialized by gsi.mutex. */
++static const enum ipa_reg_id ipa_rtk_saved_regs[IPA_RTK_SAVED_REGS] = {
++	ENDP_INIT_CFG, ENDP_INIT_NAT, ENDP_INIT_HDR, ENDP_INIT_HDR_EXT,
++	ENDP_INIT_HDR_METADATA_MASK, ENDP_INIT_MODE, ENDP_INIT_AGGR,
++	ENDP_INIT_HOL_BLOCK_EN, ENDP_INIT_HOL_BLOCK_TIMER, ENDP_INIT_DEAGGR,
++	ENDP_INIT_RSRC_GRP, ENDP_INIT_SEQ, ENDP_STATUS,
++	ENDP_FILTER_CACHE_CFG, ENDP_ROUTER_CACHE_CFG, ENDP_INIT_CTRL,
++};
++
++static bool ipa_rtk_register_valid(unsigned int index, bool producer)
++{
++	/* INIT_CTRL is absent on IPA v5.0. NAT/MODE/SEQ apply to producers. */
++	if (index == 15)
++		return false;
++	if (index == 1 || index == 5 || index == 11 || index == 13)
++		return producer;
++	if (index == 7 || index == 8)
++		return !producer;
++	return true;
++}
++
++int ipa_endpoint_rtk_prepare(struct ipa *ipa, struct ipa_rtk_endpoints *rtk)
++{
++	struct ipa_endpoint ep = {};
++	unsigned int direction, i;
++	const struct reg *reg;
++	int ret = 0;
++	u32 id, value;
++
++	if (!ipa || !rtk || rtk->ipa)
++		return -EINVAL;
++	if (ipa->version != IPA_VERSION_5_0 ||
++	    !of_machine_is_compatible("greenpacket,h5-200q1"))
++		return -EOPNOTSUPP;
++	mutex_lock(&ipa->gsi.mutex);
++	if (!ipa->setup_complete || !ipa->uc_loaded ||
++	    ipa->available_count <= 26 || !test_bit(8, ipa->available) ||
++	    !test_bit(26, ipa->available)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (ipa->rtk_endpoints ||
++	    (8 < ipa->endpoint_count && test_bit(8, ipa->defined)) ||
++	    (26 < ipa->endpoint_count && test_bit(26, ipa->defined))) {
++		ret = -EBUSY;
++		goto out;
++	}
++	rtk->ipa = ipa;
++	ipa->rtk_endpoints = rtk;
++	for (direction = 0; direction < 2; direction++) {
++		bool producer = direction == 0;
++
++		id = producer ? 8 : 26;
++		for (i = 0; i < IPA_RTK_SAVED_REGS; i++) {
++			if (!ipa_rtk_register_valid(i, producer))
++				continue;
++			reg = ipa_reg(ipa, ipa_rtk_saved_regs[i]);
++			rtk->saved[direction][i] = ioread32(ipa->reg_virt +
++							 reg_n_offset(reg, id));
++		}
++		memset(&ep, 0, sizeof(ep));
++		ep.ipa = ipa;
++		ep.endpoint_id = id;
++		ep.channel_id = producer ? 18 : 21;
++		ep.toward_ipa = producer;
++		ep.ee_id = GSI_EE_AP;
++		ep.config.resource_group = producer ? 0 : 1;
++		if (producer) {
++			ep.config.tx.seq_type = IPA_SEQ_2_PASS_SKIP_LAST_UC;
++		} else {
++			ep.config.aggregation = true;
++			ep.config.rx.buffer_size = 2048 + NET_SKB_PAD;
++			ep.config.rx.aggr_hard_limit = true;
++		}
++		ipa_endpoint_program(&ep);
++		reg = ipa_reg(ipa, ENDP_INIT_HDR);
++		value = ipa_header_size_encode(ipa->version, reg, ETH_HLEN);
++		iowrite32(value, ipa->reg_virt + reg_n_offset(reg, id));
++		if (producer) {
++			reg = ipa_reg(ipa, ENDP_INIT_NAT);
++			value = reg_encode(reg, NAT_EN, IPA_NAT_TYPE_SRC);
++			iowrite32(value, ipa->reg_virt + reg_n_offset(reg, id));
++		} else {
++			reg = ipa_reg(ipa, ENDP_INIT_AGGR);
++			value = reg_encode(reg, AGGR_EN, IPA_ENABLE_AGGR) |
++				reg_encode(reg, AGGR_TYPE, IPA_GENERIC) |
++				reg_encode(reg, BYTE_LIMIT, 2) |
++				reg_encode(reg, PKT_LIMIT, 1) |
++				reg_bit(reg, HARD_BYTE_LIMIT_EN);
++			iowrite32(value, ipa->reg_virt + reg_n_offset(reg, id));
++		}
++	}
++out:
++	mutex_unlock(&ipa->gsi.mutex);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_endpoint_rtk_prepare);
++
++int ipa_endpoint_rtk_attach_netdev(struct ipa_rtk_endpoints *rtk,
++				  struct net_device *netdev)
++{
++	struct ipa *ipa;
++
++	if (!rtk || !rtk->ipa || !netdev || netdev->type != ARPHRD_ETHER)
++		return -EINVAL;
++	ipa = rtk->ipa;
++	mutex_lock(&ipa->gsi.mutex);
++	if (rtk->netdev) {
++		mutex_unlock(&ipa->gsi.mutex);
++		return -EBUSY;
++	}
++	dev_hold(netdev);
++	rtk->netdev = netdev;
++	rcu_assign_pointer(ipa->rtk_netdev, netdev);
++	mutex_unlock(&ipa->gsi.mutex);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipa_endpoint_rtk_attach_netdev);
++
++void ipa_endpoint_rtk_restore(struct ipa_rtk_endpoints *rtk)
++{
++	struct ipa *ipa;
++	unsigned int direction, i;
++
++	if (!rtk || !rtk->ipa)
++		return;
++	ipa = rtk->ipa;
++	mutex_lock(&ipa->gsi.mutex);
++	RCU_INIT_POINTER(ipa->rtk_netdev, NULL);
++	for (direction = 0; direction < 2; direction++) {
++		u32 id = direction == 0 ? 8 : 26;
++
++		for (i = 0; i < IPA_RTK_SAVED_REGS; i++) {
++			const struct reg *reg;
++
++			if (!ipa_rtk_register_valid(i, direction == 0))
++				continue;
++			reg = ipa_reg(ipa, ipa_rtk_saved_regs[i]);
++			iowrite32(rtk->saved[direction][i], ipa->reg_virt +
++				  reg_n_offset(reg, id));
++		}
++	}
++	ipa->rtk_endpoints = NULL;
++	mutex_unlock(&ipa->gsi.mutex);
++	synchronize_net();
++	if (rtk->netdev)
++		dev_put(rtk->netdev);
++	memset(rtk, 0, sizeof(*rtk));
++}
++EXPORT_SYMBOL_GPL(ipa_endpoint_rtk_restore);
+--- /dev/null
++++ b/drivers/net/ipa/ipa_endpoint_rtk.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_ENDPOINT_RTK_H_
++#define _IPA_ENDPOINT_RTK_H_
++
++#include <linux/types.h>
++
++struct ipa;
++struct net_device;
++
++#define IPA_RTK_SAVED_REGS 16
++struct ipa_rtk_endpoints {
++	struct ipa *ipa;
++	u32 saved[2][IPA_RTK_SAVED_REGS];
++	struct net_device *netdev;
++};
++
++struct ipa_rtk_rx_stats {
++	u64 packets;
++	u64 bytes;
++	u64 invalid;
++};
++void ipa_endpoint_rtk_stats(struct ipa_rtk_rx_stats *stats);
++
++/* Caller retains IPA power; prepare while both external DMA channels are off. */
++int ipa_endpoint_rtk_prepare(struct ipa *ipa, struct ipa_rtk_endpoints *rtk);
++int ipa_endpoint_rtk_attach_netdev(struct ipa_rtk_endpoints *rtk,
++				  struct net_device *netdev);
++/* Stop both engines before restore. This also drains exception RX readers. */
++void ipa_endpoint_rtk_restore(struct ipa_rtk_endpoints *rtk);
++
++#endif
+--- a/drivers/net/ipa/ipa_cmd.c
++++ b/drivers/net/ipa/ipa_cmd.c
+@@ -14,6 +14,9 @@
+ #include "gsi_trans.h"
+ #include "ipa.h"
+ #include "ipa_cmd.h"
++#include "ipa_rtk_nat.h"
++#include "ipa_rtk_tx.h"
++#include <linux/if_ether.h>
+ #include "ipa_endpoint.h"
+ #include "ipa_mem.h"
+ #include "ipa_reg.h"
+@@ -136,6 +139,7 @@
+ 
+ /* Immediate command payload */
+ union ipa_cmd_payload {
++	__le64 rtk_nat_init[5];
+ 	struct ipa_cmd_hw_ip_fltrt_init table_init;
+ 	struct ipa_cmd_hw_hdr_init_local hdr_init_local;
+ 	struct ipa_cmd_register_write register_write;
+@@ -646,3 +650,141 @@
+ 
+ 	return 0;
+ }
++
++/* Stock IPA v5.0 immediate opcodes: IPv4 NAT init5, TABLE_DMA14. */
++struct ipa_rtk_nat_init_wire {
++	__le64 base;
++	__le64 expansion;
++	__le64 index;
++	__le64 index_expansion;
++	__le64 flags;
++};
++
++int ipa_cmd_rtk_nat_init(struct ipa *ipa, const struct ipa_rtk_nat_layout *layout,
++			 dma_addr_t pdn_record)
++{
++	struct ipa_rtk_nat_init_wire *payload;
++	const struct ipa_mem *pdn;
++	struct gsi_trans *trans;
++	union ipa_cmd_payload *buffer;
++	dma_addr_t address;
++	u64 flags;
++
++	if (!ipa || !layout || ipa->version != IPA_VERSION_5_0 || !ipa->setup_complete)
++		return -EINVAL;
++	if (!is_power_of_2((u32)layout->base_mask + 1) || !layout->base_mask ||
++	    layout->base_mask > 4095 || layout->expansion_count > 1023 ||
++	    !IS_ALIGNED(layout->base, 8) || !IS_ALIGNED(layout->expansion, 8) ||
++	    !IS_ALIGNED(layout->index, 8) || !IS_ALIGNED(layout->index_expansion, 8) ||
++	    !IS_ALIGNED(pdn_record, 8))
++		return -EINVAL;
++	pdn = ipa_mem_find(ipa, IPA_MEM_PDN_CONFIG);
++	if (!pdn || pdn->size < sizeof(struct ipa_rtk_pdn))
++		return -ENODEV;
++	trans = ipa_cmd_trans_alloc(ipa, 3);
++	if (!trans)
++		return -EBUSY;
++	/* Mask0 register write is a NOP with full pipeline drain. */
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	ipa_cmd_dma_shared_mem_add(trans, pdn->offset, sizeof(struct ipa_rtk_pdn),
++				   pdn_record, true);
++	buffer = ipa_cmd_payload_alloc(ipa, &address);
++	payload = (void *)buffer;
++	memset(payload, 0, sizeof(*payload));
++	payload->base = cpu_to_le64(layout->base);
++	payload->expansion = cpu_to_le64(layout->expansion);
++	payload->index = cpu_to_le64(layout->index);
++	payload->index_expansion = cpu_to_le64(layout->index_expansion);
++	/* Address-type bits4..7 = 0 select system memory for all four tables. */
++	flags = (u64)layout->base_mask << 8;
++	flags |= (u64)layout->expansion_count << 20;
++	flags |= (u64)pdn->offset << 32;
++	payload->flags = cpu_to_le64(flags);
++	/* Publish coherent NAT/index records before hardware can follow them. */
++	dma_wmb();
++	gsi_trans_cmd_add(trans, payload, sizeof(*payload), address, 5);
++	gsi_trans_commit_wait(trans);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipa_cmd_rtk_nat_init);
++
++int ipa_cmd_rtk_nat_dma(struct ipa *ipa, u8 table, u32 offset, u16 value)
++{
++	struct gsi_trans *trans;
++	union ipa_cmd_payload *buffer;
++	dma_addr_t address;
++	__le64 *payload;
++	u64 word;
++
++	if (!ipa || ipa->version != IPA_VERSION_5_0 || !ipa->setup_complete ||
++	    table > 3 || !IS_ALIGNED(offset, sizeof(u16)))
++		return -EINVAL;
++	trans = ipa_cmd_trans_alloc(ipa, 2);
++	if (!trans)
++		return -EBUSY;
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	buffer = ipa_cmd_payload_alloc(ipa, &address);
++	payload = (void *)buffer;
++	word = (u64)table << 4 | (u64)offset << 8 | (u64)value << 40;
++	*payload = cpu_to_le64(word);
++	/* Commit CPU-written rule contents before the enable/chain update. */
++	dma_wmb();
++	gsi_trans_cmd_add(trans, payload, sizeof(*payload), address, 14);
++	gsi_trans_commit_wait(trans);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipa_cmd_rtk_nat_dma);
++
++/* Stock deletion reinitializes all four tables with size0 and an owned zero
++ * buffer. Never free old table memory before this replacement has completed.
++ */
++int ipa_cmd_rtk_nat_disable(struct ipa *ipa)
++{
++	struct ipa_rtk_nat_init_wire *payload;
++	union ipa_cmd_payload *buffer;
++	struct gsi_trans *trans;
++	dma_addr_t address;
++
++	if (!ipa || ipa->version != IPA_VERSION_5_0 || !ipa->setup_complete ||
++	    !ipa->zero_addr || ipa->zero_size < 32)
++		return -EINVAL;
++	trans = ipa_cmd_trans_alloc(ipa, 2);
++	if (!trans)
++		return -EBUSY;
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	buffer = ipa_cmd_payload_alloc(ipa, &address);
++	payload = (void *)buffer;
++	memset(payload, 0, sizeof(*payload));
++	payload->base = cpu_to_le64(ipa->zero_addr);
++	payload->expansion = payload->base;
++	payload->index = payload->base;
++	payload->index_expansion = payload->base;
++	dma_wmb();
++	gsi_trans_cmd_add(trans, payload, sizeof(*payload), address, 5);
++	gsi_trans_commit_wait(trans);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipa_cmd_rtk_nat_disable);
++
++/* SPDX-License-Identifier: GPL-2.0-only */
++int ipa_cmd_rtk_packet_tx(struct ipa *ipa, dma_addr_t frame, u32 length)
++{
++	struct gsi_trans *trans;
++
++	if (!ipa || ipa->version != IPA_VERSION_5_0 || !ipa->setup_complete ||
++	    !ipa->rtk_endpoints || !frame || !IS_ALIGNED(frame, 8) ||
++	    length < ETH_ZLEN || length > 2048)
++		return -EINVAL;
++	trans = ipa_cmd_trans_alloc(ipa, 2);
++	if (!trans)
++		return -EBUSY;
++	ipa_cmd_ip_packet_init_add(trans, 26);
++	/* DMA_NONE command transactions use only the supplied DMA address and
++	 * length, not a page mapping or a pool buffer ownership transfer.
++	 */
++	gsi_trans_cmd_add(trans, NULL, length, frame, IPA_CMD_NONE);
++	dma_wmb();
++	gsi_trans_commit_wait(trans);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipa_cmd_rtk_packet_tx);
+--- /dev/null
++++ b/drivers/net/ipa/ipa_rtk_nat.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_RTK_NAT_H_
++#define _IPA_RTK_NAT_H_
++
++#include <linux/dma-mapping.h>
++#include <linux/types.h>
++
++struct ipa;
++
++struct ipa_rtk_nat_layout {
++	dma_addr_t base;
++	dma_addr_t expansion;
++	dma_addr_t index;
++	dma_addr_t index_expansion;
++	u16 base_mask;
++	u16 expansion_count;
++};
++
++/* A single 16-byte PDN record, in IPA wire order. */
++struct ipa_rtk_pdn {
++	__le32 public_ip;
++	__le32 source_metadata;
++	__le32 destination_metadata;
++	__le32 reserved;
++};
++
++/* Coherent buffers remain owned by hardware until a replacement init and drain. */
++int ipa_cmd_rtk_nat_init(struct ipa *ipa, const struct ipa_rtk_nat_layout *layout,
++			 dma_addr_t pdn_record);
++int ipa_cmd_rtk_nat_dma(struct ipa *ipa, u8 table, u32 offset, u16 value);
++int ipa_cmd_rtk_nat_disable(struct ipa *ipa);
++
++#endif
+--- a/drivers/net/ipa/ipa_qmi.c
++++ b/drivers/net/ipa/ipa_qmi.c
+@@ -12,7 +12,13 @@
+ #include "ipa.h"
+ #include "ipa_mem.h"
+ #include "ipa_modem.h"
++#include <linux/soc/qcom/smem.h>
+ #include "ipa_qmi_msg.h"
++#define H5_IPA_QMI_SCHEMA_DEFINE
++#include "ipa_qmi_filter_schema.h"
++#include "ipa_qmi_rtk.h"
++#include <linux/slab.h>
++#include <linux/mutex.h>
+ 
+ /**
+  * DOC: AP/Modem QMI Handshake
+@@ -77,6 +83,211 @@
+ 
+ #define QMI_INIT_DRIVER_TIMEOUT		60000	/* A minute in milliseconds */
+ 
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Stock H5 QMI0x23/0x24 control plane, not a data-path fastpath. */
++static DEFINE_MUTEX(ipa_rtk_qmi_lock);
++static struct ipa *ipa_rtk_qmi_owner;
++static struct h5_install_fltr_rule_req_msg *ipa_rtk_qmi_rules;
++static u32 ipa_rtk_qmi_generation;
++
++static void ipa_qmi_rtk_reset(struct ipa *ipa)
++{
++	mutex_lock(&ipa_rtk_qmi_lock);
++	if (ipa_rtk_qmi_owner == ipa) {
++		kfree(ipa_rtk_qmi_rules);
++		ipa_rtk_qmi_rules = NULL;
++		ipa_rtk_qmi_owner = NULL;
++		ipa_rtk_qmi_generation++;
++	}
++	mutex_unlock(&ipa_rtk_qmi_lock);
++}
++
++int ipa_qmi_rtk_rules_copy(struct ipa *ipa, struct h5_install_fltr_rule_req_msg *rules,
++			 u32 *generation)
++{
++	int ret = -ENODATA;
++
++	if (!ipa || !rules || !generation)
++		return -EINVAL;
++	mutex_lock(&ipa_rtk_qmi_lock);
++	if (ipa_rtk_qmi_owner == ipa && ipa_rtk_qmi_rules) {
++		memcpy(rules, ipa_rtk_qmi_rules, sizeof(*rules));
++		*generation = ipa_rtk_qmi_generation;
++		ret = 0;
++	}
++	mutex_unlock(&ipa_rtk_qmi_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_qmi_rtk_rules_copy);
++
++int ipa_qmi_rtk_rules_notify(struct ipa *ipa,
++		const struct h5_fltr_installed_notif_req_msg *notification, u32 generation)
++{
++	struct h5_fltr_installed_notif_resp_msg response = {};
++	struct qmi_handle *handle;
++	struct qmi_txn txn;
++	bool generation_matches;
++	int ret;
++
++	if (!ipa || !notification || notification->source_pipe_index != 8 ||
++	    notification->filter_index_list_len > 64 || notification->rule_id_len > 64 ||
++	    notification->rule_id_ex_len > 256 || notification->dst_pipe_id_len > 8)
++		return -EINVAL;
++	if (!READ_ONCE(ipa->qmi.modem_ready) || !READ_ONCE(ipa->qmi.uc_ready) ||
++	    READ_ONCE(ipa->qmi.initial_boot))
++		return -ENODEV;
++	mutex_lock(&ipa_rtk_qmi_lock);
++	generation_matches = ipa_rtk_qmi_owner == ipa && ipa_rtk_qmi_rules &&
++		  ipa_rtk_qmi_generation == generation;
++	mutex_unlock(&ipa_rtk_qmi_lock);
++	if (!generation_matches)
++		return -ESTALE;
++	handle = &ipa->qmi.client_handle;
++	ret = qmi_txn_init(handle, &txn, h5_fltr_installed_notif_resp_msg_ei, &response);
++	/* qmi_txn_init returns a non-negative transaction ID, not zero-only. */
++	if (ret < 0)
++		return ret;
++	ret = qmi_send_request(handle, &ipa->qmi.modem_sq, &txn,
++		H5_FLTR_INSTALLED_NOTIF_REQ_MSG_ID, H5_FLTR_INSTALLED_NOTIF_REQ_MSG_MAX_LEN,
++		h5_fltr_installed_notif_req_msg_ei, notification);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		return ret;
++	}
++	ret = qmi_txn_wait(&txn, msecs_to_jiffies(5000));
++	if (ret < 0)
++		return ret;
++	if (response.resp.result != QMI_RESULT_SUCCESS_V01)
++		return -EREMOTEIO;
++	mutex_lock(&ipa_rtk_qmi_lock);
++	generation_matches = ipa_rtk_qmi_owner == ipa && ipa_rtk_qmi_rules &&
++		  ipa_rtk_qmi_generation == generation;
++	mutex_unlock(&ipa_rtk_qmi_lock);
++	return generation_matches ? 0 : -ESTALE;
++}
++EXPORT_SYMBOL_GPL(ipa_qmi_rtk_rules_notify);
++
++static bool ipa_qmi_rtk_eq_valid(const struct h5_filter_rule_type *eq)
++{
++	return eq->num_ihl_offset_range_16 <= 2 && eq->num_offset_meq_32 <= 2 &&
++	       eq->num_ihl_offset_meq_32 <= 2 && eq->num_offset_meq_128 <= 2;
++}
++
++static bool ipa_qmi_rtk_request_valid(const struct h5_install_fltr_rule_req_msg *req)
++{
++	u32 i;
++
++	if (req->filter_spec_list_len > 64 || req->filter_spec_ex_list_len > 64 ||
++	    req->filter_spec_ex2_list_len > 64 || req->xlat_filter_indices_list_len > 64 ||
++	    req->ul_firewall_indices_list_len > 64)
++		return false;
++	if (req->filter_spec_list_valid)
++		for (i = 0; i < req->filter_spec_list_len; i++)
++			if (!ipa_qmi_rtk_eq_valid(&req->filter_spec_list[i].filter_rule))
++				return false;
++	if (req->filter_spec_ex_list_valid)
++		for (i = 0; i < req->filter_spec_ex_list_len; i++)
++			if (!ipa_qmi_rtk_eq_valid(&req->filter_spec_ex_list[i].filter_rule))
++				return false;
++	if (req->filter_spec_ex2_list_valid)
++		for (i = 0; i < req->filter_spec_ex2_list_len; i++) {
++			const struct h5_filter_rule_req2_type *eq =
++				&req->filter_spec_ex2_list[i].filter_rule;
++
++			if (eq->num_ihl_offset_range_16 > 2 || eq->num_offset_meq_32 > 2 ||
++			    eq->num_ihl_offset_meq_32 > 2 || eq->num_offset_meq_128 > 2)
++				return false;
++		}
++	return true;
++}
++
++static void ipa_server_rtk_filter_request(struct qmi_handle *qmi,
++		struct sockaddr_qrtr *sq, struct qmi_txn *txn, const void *decoded)
++{
++	struct ipa_qmi *iq = container_of(qmi, struct ipa_qmi, server_handle);
++	struct ipa *ipa = container_of(iq, struct ipa, qmi);
++	const struct h5_install_fltr_rule_req_msg *req = decoded;
++	struct h5_install_fltr_rule_resp_msg resp = {};
++	struct h5_install_fltr_rule_req_msg *copy = NULL;
++	u32 i, generation = 0;
++	int ret;
++
++	resp.resp.result = QMI_RESULT_FAILURE_V01;
++	resp.resp.error = QMI_ERR_MALFORMED_MSG_V01;
++	if (!of_machine_is_compatible("greenpacket,h5-200q1")) {
++		resp.resp.error = QMI_ERR_NOT_SUPPORTED_V01;
++		goto reply;
++	}
++	if (!ipa_qmi_rtk_request_valid(req))
++		goto reply;
++	copy = kmemdup(req, sizeof(*req), GFP_KERNEL);
++	if (!copy) {
++		resp.resp.error = QMI_ERR_NO_MEMORY_V01;
++		goto reply;
++	}
++	mutex_lock(&ipa_rtk_qmi_lock);
++	if (ipa_rtk_qmi_owner && ipa_rtk_qmi_owner != ipa) {
++		mutex_unlock(&ipa_rtk_qmi_lock);
++		kfree(copy);
++		resp.resp.error = QMI_ERR_INCOMPATIBLE_STATE_V01;
++		goto reply;
++	}
++	kfree(ipa_rtk_qmi_rules);
++	ipa_rtk_qmi_rules = copy;
++	ipa_rtk_qmi_owner = ipa;
++	generation = ++ipa_rtk_qmi_generation;
++	mutex_unlock(&ipa_rtk_qmi_lock);
++	resp.resp.result = QMI_RESULT_SUCCESS_V01;
++	resp.resp.error = QMI_ERR_NONE_V01;
++	/* Like stock, acknowledge received rule IDs. Installed-index notification
++	 * is a separate transaction after the data-path rules really exist.
++	 */
++	if (req->filter_spec_ex2_list_valid) {
++		resp.rule_id_valid = 1;
++		resp.rule_id_len = req->filter_spec_ex2_list_len;
++		for (i = 0; i < resp.rule_id_len; i++)
++			resp.rule_id[i] = req->filter_spec_ex2_list[i].rule_id;
++	} else if (req->filter_spec_ex_list_valid) {
++		resp.rule_id_valid = 1;
++		resp.rule_id_len = req->filter_spec_ex_list_len;
++		for (i = 0; i < resp.rule_id_len; i++)
++			resp.rule_id[i] = req->filter_spec_ex_list[i].rule_id;
++	} else if (req->filter_spec_list_valid) {
++		resp.filter_handle_list_valid = 1;
++		resp.filter_handle_list_len = req->filter_spec_list_len;
++		for (i = 0; i < resp.filter_handle_list_len; i++) {
++			resp.filter_handle_list[i].filter_spec_identifier =
++				req->filter_spec_list[i].filter_spec_identifier;
++			resp.filter_handle_list[i].filter_handle = i + 1;
++		}
++	}
++	dev_info(ipa->dev, "RTK QMI cached modem rules generation=%u legacy=%u ex=%u ex2=%u\n",
++		generation, req->filter_spec_list_valid ? req->filter_spec_list_len : 0,
++		req->filter_spec_ex_list_valid ? req->filter_spec_ex_list_len : 0,
++		req->filter_spec_ex2_list_valid ? req->filter_spec_ex2_list_len : 0);
++reply:
++	ret = qmi_send_response(qmi, sq, txn, H5_INSTALL_FLTR_RULE_REQ_MSG_ID,
++		H5_INSTALL_FLTR_RULE_RESP_MSG_MAX_LEN, h5_install_fltr_rule_resp_msg_ei, &resp);
++	if (ret)
++		dev_err(ipa->dev, "RTK QMI filter response failed: %d\n", ret);
++}
++
++static void ipa_server_rtk_installed_notify(struct qmi_handle *qmi,
++		struct sockaddr_qrtr *sq, struct qmi_txn *txn, const void *decoded)
++{
++	struct ipa_qmi *iq = container_of(qmi, struct ipa_qmi, server_handle);
++	struct ipa *ipa = container_of(iq, struct ipa, qmi);
++	struct h5_fltr_installed_notif_resp_msg resp = {};
++	int ret;
++
++	resp.resp.result = QMI_RESULT_SUCCESS_V01;
++	ret = qmi_send_response(qmi, sq, txn, H5_FLTR_INSTALLED_NOTIF_REQ_MSG_ID,
++		H5_FLTR_INSTALLED_NOTIF_RESP_MSG_MAX_LEN,
++		h5_fltr_installed_notif_resp_msg_ei, &resp);
++	if (ret)
++		dev_err(ipa->dev, "RTK QMI installed response failed: %d\n", ret);
++}
++
+ /* Send an INIT_COMPLETE indication message to the modem */
+ static void ipa_server_init_complete(struct ipa_qmi *ipa_qmi)
+ {
+@@ -154,6 +365,8 @@
+ 	struct ipa_qmi *ipa_qmi;
+ 
+ 	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
++
++	ipa_qmi_rtk_reset(container_of(ipa_qmi, struct ipa, qmi));
+ 
+ 	/* The modem client and server go away at the same time */
+ 	memset(&ipa_qmi->modem_sq, 0, sizeof(ipa_qmi->modem_sq));
+@@ -249,6 +462,20 @@
+ 		.decoded_size	= IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ,
+ 		.fn		= ipa_server_driver_init_complete,
+ 	},
++	{
++		.type = QMI_REQUEST,
++		.msg_id = H5_INSTALL_FLTR_RULE_REQ_MSG_ID,
++		.ei = h5_install_fltr_rule_req_msg_ei,
++		.decoded_size = sizeof(struct h5_install_fltr_rule_req_msg),
++		.fn = ipa_server_rtk_filter_request,
++	},
++	{
++		.type = QMI_REQUEST,
++		.msg_id = H5_FLTR_INSTALLED_NOTIF_REQ_MSG_ID,
++		.ei = h5_fltr_installed_notif_req_msg_ei,
++		.decoded_size = sizeof(struct h5_fltr_installed_notif_req_msg),
++		.fn = ipa_server_rtk_installed_notify,
++	},
+ 	{ },
+ };
+ 
+@@ -275,6 +502,54 @@
+ 	{ },
+ };
+ 
++/* Match the H5 stock INIT_DRIVER contract. These are statistics regions,
++ * not evidence that NLO forwarding is enabled or that Internet NAT works.
++ */
++static void ipa_qmi_h5_init_stats(struct ipa *ipa,
++				struct ipa_init_modem_driver_req *req)
++{
++	const struct ipa_mem *mem;
++	phys_addr_t phys;
++	size_t actual;
++	void *virt;
++
++	if (ipa->version != IPA_VERSION_5_0 ||
++	    !of_machine_is_compatible("greenpacket,h5-200q1"))
++		return;
++
++	/* Stock ipa3_q6_clnt_svc_arrive: 52 sixteen-byte counters, IDs128..179.
++	 * The address is the whole FNR region base, not base plus128 records.
++	 */
++	mem = ipa_mem_find(ipa, IPA_MEM_STATS_FILTER_ROUTE);
++	if (mem && mem->size >= 180 * 16) {
++		req->hw_filter_stats_info_valid = 1;
++		req->hw_filter_stats_info.start = mem->offset;
++		req->hw_filter_stats_info.size = 0x340;
++		req->hw_filter_stats_info.start_index = 128;
++		req->hw_filter_stats_info.end_index = 179;
++	}
++
++	/* ipa_mem_init already allocates/maps item497 for H5. Advertise only
++	 * its first2KiB, as stock does, and verify it lies in that IPA mapping.
++	 * Do not advertise optional TLV0x24: H5 stock leaves its valid flag0.
++	 */
++	virt = qcom_smem_get(1 /* modem host, as in ipa_mem.c */, 497, &actual);
++	if (IS_ERR(virt) || actual < 0x800)
++		return;
++	phys = qcom_smem_virt_to_phys(virt);
++	if (phys > U32_MAX || phys < ipa->smem_iova || ipa->smem_size < 0x800 ||
++	    phys - ipa->smem_iova > ipa->smem_size - 0x800)
++		return;
++	req->per_stats_smem_info_valid = 1;
++	req->per_stats_smem_info.start = phys;
++	req->per_stats_smem_info.size = 0x800;
++	dev_info(ipa->dev, "H5 INIT_DRIVER statistics FNR=%u base=%#x bytes=%#x IDs=%u..%u peripheral=%u bytes=%#x\n",
++		 req->hw_filter_stats_info_valid, req->hw_filter_stats_info.start,
++		 req->hw_filter_stats_info.size, req->hw_filter_stats_info.start_index,
++		 req->hw_filter_stats_info.end_index, req->per_stats_smem_info_valid,
++		 req->per_stats_smem_info.size);
++}
++
+ /* Return a pointer to an init modem driver request structure, which contains
+  * configuration parameters for the modem.  The modem may be started multiple
+  * times, but generally these parameters don't change so we can reuse the
+@@ -403,6 +678,8 @@
+ 		}
+ 	}
+ 
++	ipa_qmi_h5_init_stats(ipa, &req);
++
+ 	return &req;
+ }
+ 
+@@ -489,7 +766,9 @@
+ 	 * sent over the server handle if requested.
+ 	 */
+ 	ret = qmi_handle_init(&ipa_qmi->server_handle,
+-			      IPA_QMI_SERVER_MAX_RCV_SZ, &ipa_server_ops,
++			      of_machine_is_compatible("greenpacket,h5-200q1") ?
++			      H5_INSTALL_FLTR_RULE_REQ_MSG_MAX_LEN : IPA_QMI_SERVER_MAX_RCV_SZ,
++			      &ipa_server_ops,
+ 			      ipa_server_msg_handlers);
+ 	if (ret)
+ 		return ret;
+@@ -540,4 +819,5 @@
+ 
+ 	qmi_handle_release(&ipa->qmi.server_handle);
+ 	memset(&ipa->qmi.server_handle, 0, sizeof(ipa->qmi.server_handle));
+-}
++	ipa_qmi_rtk_reset(ipa);
++}
+--- a/drivers/net/ipa/ipa_qmi_msg.c
++++ b/drivers/net/ipa/ipa_qmi_msg.c
+@@ -250,6 +250,38 @@
+ 	},
+ };
+ 
++static const struct qmi_elem_info ipa_filter_stats_info_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_filter_stats_info, start),
++		.tlv_type = 0x00,
++		.offset = offsetof(struct ipa_filter_stats_info, start),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_filter_stats_info, size),
++		.tlv_type = 0x00,
++		.offset = offsetof(struct ipa_filter_stats_info, size),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_filter_stats_info, start_index),
++		.tlv_type = 0x00,
++		.offset = offsetof(struct ipa_filter_stats_info, start_index),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_filter_stats_info, end_index),
++		.tlv_type = 0x00,
++		.offset = offsetof(struct ipa_filter_stats_info, end_index),
++	},
++	{ .data_type = QMI_EOTI },
++};
++
+ /* QMI message structure definition for struct ipa_init_modem_driver_req */
+ const struct qmi_elem_info ipa_init_modem_driver_req_ei[] = {
+ 	{
+@@ -639,6 +671,51 @@
+ 		.tlv_type	= 0x22,
+ 		.offset		= offsetof(struct ipa_init_modem_driver_req,
+ 					   hw_stats_drop_size),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_init_modem_driver_req, hw_filter_stats_info_valid),
++		.tlv_type = 0x23,
++		.offset = offsetof(struct ipa_init_modem_driver_req, hw_filter_stats_info_valid),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_init_modem_driver_req, hw_filter_stats_info),
++		.tlv_type = 0x23,
++		.offset = offsetof(struct ipa_init_modem_driver_req, hw_filter_stats_info),
++		.ei_array = ipa_filter_stats_info_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_init_modem_driver_req, smem_info_valid),
++		.tlv_type = 0x24,
++		.offset = offsetof(struct ipa_init_modem_driver_req, smem_info_valid),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_init_modem_driver_req, smem_info),
++		.tlv_type = 0x24,
++		.offset = offsetof(struct ipa_init_modem_driver_req, smem_info),
++		.ei_array = ipa_mem_range_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_init_modem_driver_req, per_stats_smem_info_valid),
++		.tlv_type = 0x25,
++		.offset = offsetof(struct ipa_init_modem_driver_req, per_stats_smem_info_valid),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof_field(struct ipa_init_modem_driver_req, per_stats_smem_info),
++		.tlv_type = 0x25,
++		.offset = offsetof(struct ipa_init_modem_driver_req, per_stats_smem_info),
++		.ei_array = ipa_mem_range_ei,
+ 	},
+ 	{
+ 		.data_type	= QMI_EOTI,
+--- a/drivers/net/ipa/ipa_qmi_msg.h
++++ b/drivers/net/ipa/ipa_qmi_msg.h
+@@ -27,7 +27,7 @@
+  */
+ #define IPA_QMI_INDICATION_REGISTER_REQ_SZ	20	/* -> server handle */
+ #define IPA_QMI_INDICATION_REGISTER_RSP_SZ	7	/* <- server handle */
+-#define IPA_QMI_INIT_DRIVER_REQ_SZ		162	/* client handle -> */
++#define IPA_QMI_INIT_DRIVER_REQ_SZ		197	/* client handle -> */
+ #define IPA_QMI_INIT_DRIVER_RSP_SZ		25	/* client handle <- */
+ #define IPA_QMI_INIT_COMPLETE_IND_SZ		7	/* <- server handle */
+ #define IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ	4	/* -> server handle */
+@@ -122,6 +122,14 @@
+ /* The message for the IPA_QMI_INIT_DRIVER request contains information
+  * from the AP that affects modem initialization.
+  */
++/* Stock TLV0x23: two u32 values and two u8 indices, 10 wire bytes. */
++struct ipa_filter_stats_info {
++	u32 start;
++	u32 size;
++	u8 start_index;
++	u8 end_index;
++};
++
+ struct ipa_init_modem_driver_req {
+ 	u8			platform_type_valid;
+ 	u32			platform_type;	/* enum ipa_platform_type */
+@@ -216,6 +224,13 @@
+ 	u32			hw_stats_drop_base_addr;
+ 	u8			hw_stats_drop_size_valid;
+ 	u32			hw_stats_drop_size;
++
++	u8 hw_filter_stats_info_valid;
++	struct ipa_filter_stats_info hw_filter_stats_info;
++	u8 smem_info_valid;
++	struct ipa_mem_range smem_info;
++	u8 per_stats_smem_info_valid;
++	struct ipa_mem_range per_stats_smem_info;
+ };
+ 
+ /* The response to a IPA_QMI_INIT_DRIVER request begins with a standard
+--- /dev/null
++++ b/drivers/net/ipa/ipa_qmi_rtk.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_QMI_RTK_H_
++#define _IPA_QMI_RTK_H_
++
++#include <linux/types.h>
++struct ipa;
++struct h5_install_fltr_rule_req_msg;
++struct h5_fltr_installed_notif_req_msg;
++
++/* Returns a coherent snapshot; generation changes on rule update or SSR.
++ * A successful QMI reply acknowledges caching, not hardware installation.
++ */
++int ipa_qmi_rtk_rules_copy(struct ipa *ipa, struct h5_install_fltr_rule_req_msg *rules,
++			 u32 *generation);
++/* Call from process context after installing/removing the real hardware rules.
++ * An update/SSR during the transaction returns ESTALE; caller must quiesce
++ * stale hardware state. This function never creates or authorizes a flow.
++ */
++int ipa_qmi_rtk_rules_notify(struct ipa *ipa,
++		const struct h5_fltr_installed_notif_req_msg *notification, u32 generation);
++#endif
+--- /dev/null
++++ b/drivers/net/ipa/ipa_qmi_filter_schema.h
+@@ -0,0 +1,1727 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Generated from Qualcomm QMI wire descriptions and verified stock H5 offsets. */
++#ifndef _H5_IPA_QMI_FILTER_SCHEMA_H_
++#define _H5_IPA_QMI_FILTER_SCHEMA_H_
++#include <linux/build_bug.h>
++#include <linux/soc/qcom/qmi.h>
++
++struct h5_ipfltr_range_eq_16_type {
++	u8 offset;
++	u8 reserved_1[1];
++	u16 range_low;
++	u16 range_high;
++} __packed;
++static_assert(sizeof(struct h5_ipfltr_range_eq_16_type) == 6);
++static_assert(offsetof(struct h5_ipfltr_range_eq_16_type, offset) == 0);
++static_assert(offsetof(struct h5_ipfltr_range_eq_16_type, range_low) == 2);
++static_assert(offsetof(struct h5_ipfltr_range_eq_16_type, range_high) == 4);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_ipfltr_range_eq_16_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_range_eq_16_type, offset),
++	},
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_range_eq_16_type, range_low),
++	},
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_range_eq_16_type, range_high),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_ipfltr_mask_eq_32_type {
++	u8 offset;
++	u8 reserved_1[3];
++	u32 mask;
++	u32 value;
++} __packed;
++static_assert(sizeof(struct h5_ipfltr_mask_eq_32_type) == 12);
++static_assert(offsetof(struct h5_ipfltr_mask_eq_32_type, offset) == 0);
++static_assert(offsetof(struct h5_ipfltr_mask_eq_32_type, mask) == 4);
++static_assert(offsetof(struct h5_ipfltr_mask_eq_32_type, value) == 8);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_ipfltr_mask_eq_32_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_mask_eq_32_type, offset),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_mask_eq_32_type, mask),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_mask_eq_32_type, value),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_ipfltr_eq_16_type {
++	u8 offset;
++	u8 reserved_1[1];
++	u16 value;
++} __packed;
++static_assert(sizeof(struct h5_ipfltr_eq_16_type) == 4);
++static_assert(offsetof(struct h5_ipfltr_eq_16_type, offset) == 0);
++static_assert(offsetof(struct h5_ipfltr_eq_16_type, value) == 2);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_ipfltr_eq_16_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_eq_16_type, offset),
++	},
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_eq_16_type, value),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_ipfltr_eq_32_type {
++	u8 offset;
++	u8 reserved_1[3];
++	u32 value;
++} __packed;
++static_assert(sizeof(struct h5_ipfltr_eq_32_type) == 8);
++static_assert(offsetof(struct h5_ipfltr_eq_32_type, offset) == 0);
++static_assert(offsetof(struct h5_ipfltr_eq_32_type, value) == 4);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_ipfltr_eq_32_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_eq_32_type, offset),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_eq_32_type, value),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_ipfltr_mask_eq_128_type {
++	u8 offset;
++	u8 mask[16];
++	u8 value[16];
++} __packed;
++static_assert(sizeof(struct h5_ipfltr_mask_eq_128_type) == 33);
++static_assert(offsetof(struct h5_ipfltr_mask_eq_128_type, offset) == 0);
++static_assert(offsetof(struct h5_ipfltr_mask_eq_128_type, mask) == 1);
++static_assert(offsetof(struct h5_ipfltr_mask_eq_128_type, value) == 17);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_ipfltr_mask_eq_128_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_mask_eq_128_type, offset),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 16,
++		.elem_size = 1,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_mask_eq_128_type, mask),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 16,
++		.elem_size = 1,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_ipfltr_mask_eq_128_type, value),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_filter_rule_type {
++	u16 rule_eq_bitmap;
++	u8 tos_eq_present;
++	u8 tos_eq;
++	u8 protocol_eq_present;
++	u8 protocol_eq;
++	u8 num_ihl_offset_range_16;
++	u8 reserved_6[1];
++	struct h5_ipfltr_range_eq_16_type ihl_offset_range_16[2];
++	u8 num_offset_meq_32;
++	u8 reserved_8[3];
++	struct h5_ipfltr_mask_eq_32_type offset_meq_32[2];
++	u8 tc_eq_present;
++	u8 tc_eq;
++	u8 flow_eq_present;
++	u8 reserved_12[1];
++	u32 flow_eq;
++	u8 ihl_offset_eq_16_present;
++	u8 reserved_14[1];
++	struct h5_ipfltr_eq_16_type ihl_offset_eq_16;
++	u8 ihl_offset_eq_32_present;
++	u8 reserved_16[1];
++	struct h5_ipfltr_eq_32_type ihl_offset_eq_32;
++	u8 num_ihl_offset_meq_32;
++	u8 reserved_18[3];
++	struct h5_ipfltr_mask_eq_32_type ihl_offset_meq_32[2];
++	u8 num_offset_meq_128;
++	struct h5_ipfltr_mask_eq_128_type offset_meq_128[2];
++	u8 metadata_meq32_present;
++	struct h5_ipfltr_mask_eq_32_type metadata_meq32;
++	u8 ipv4_frag_eq_present;
++	u8 reserved_tail[3];
++} __packed;
++static_assert(sizeof(struct h5_filter_rule_type) == 184);
++static_assert(offsetof(struct h5_filter_rule_type, rule_eq_bitmap) == 0);
++static_assert(offsetof(struct h5_filter_rule_type, tos_eq_present) == 2);
++static_assert(offsetof(struct h5_filter_rule_type, tos_eq) == 3);
++static_assert(offsetof(struct h5_filter_rule_type, protocol_eq_present) == 4);
++static_assert(offsetof(struct h5_filter_rule_type, protocol_eq) == 5);
++static_assert(offsetof(struct h5_filter_rule_type, num_ihl_offset_range_16) == 6);
++static_assert(offsetof(struct h5_filter_rule_type, ihl_offset_range_16) == 8);
++static_assert(offsetof(struct h5_filter_rule_type, num_offset_meq_32) == 20);
++static_assert(offsetof(struct h5_filter_rule_type, offset_meq_32) == 24);
++static_assert(offsetof(struct h5_filter_rule_type, tc_eq_present) == 48);
++static_assert(offsetof(struct h5_filter_rule_type, tc_eq) == 49);
++static_assert(offsetof(struct h5_filter_rule_type, flow_eq_present) == 50);
++static_assert(offsetof(struct h5_filter_rule_type, flow_eq) == 52);
++static_assert(offsetof(struct h5_filter_rule_type, ihl_offset_eq_16_present) == 56);
++static_assert(offsetof(struct h5_filter_rule_type, ihl_offset_eq_16) == 58);
++static_assert(offsetof(struct h5_filter_rule_type, ihl_offset_eq_32_present) == 62);
++static_assert(offsetof(struct h5_filter_rule_type, ihl_offset_eq_32) == 64);
++static_assert(offsetof(struct h5_filter_rule_type, num_ihl_offset_meq_32) == 72);
++static_assert(offsetof(struct h5_filter_rule_type, ihl_offset_meq_32) == 76);
++static_assert(offsetof(struct h5_filter_rule_type, num_offset_meq_128) == 100);
++static_assert(offsetof(struct h5_filter_rule_type, offset_meq_128) == 101);
++static_assert(offsetof(struct h5_filter_rule_type, metadata_meq32_present) == 167);
++static_assert(offsetof(struct h5_filter_rule_type, metadata_meq32) == 168);
++static_assert(offsetof(struct h5_filter_rule_type, ipv4_frag_eq_present) == 180);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_rule_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, rule_eq_bitmap),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, tos_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, tos_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, protocol_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, protocol_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, num_ihl_offset_range_16),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 6,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ihl_offset_range_16),
++		.ei_array = h5_ipfltr_range_eq_16_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, num_offset_meq_32),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 12,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, offset_meq_32),
++		.ei_array = h5_ipfltr_mask_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, tc_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, tc_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, flow_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, flow_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ihl_offset_eq_16_present),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ihl_offset_eq_16),
++		.ei_array = h5_ipfltr_eq_16_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ihl_offset_eq_32_present),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 8,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ihl_offset_eq_32),
++		.ei_array = h5_ipfltr_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, num_ihl_offset_meq_32),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 12,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ihl_offset_meq_32),
++		.ei_array = h5_ipfltr_mask_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, num_offset_meq_128),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 33,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, offset_meq_128),
++		.ei_array = h5_ipfltr_mask_eq_128_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, metadata_meq32_present),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 12,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, metadata_meq32),
++		.ei_array = h5_ipfltr_mask_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_type, ipv4_frag_eq_present),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_filter_spec_type {
++	u32 filter_spec_identifier;
++	u32 ip_type;
++	struct h5_filter_rule_type filter_rule;
++	u32 filter_action;
++	u8 is_routing_table_index_valid;
++	u8 reserved_5[3];
++	u32 route_table_index;
++	u8 is_mux_id_valid;
++	u8 reserved_7[3];
++	u32 mux_id;
++} __packed;
++static_assert(sizeof(struct h5_filter_spec_type) == 212);
++static_assert(offsetof(struct h5_filter_spec_type, filter_spec_identifier) == 0);
++static_assert(offsetof(struct h5_filter_spec_type, ip_type) == 4);
++static_assert(offsetof(struct h5_filter_spec_type, filter_rule) == 8);
++static_assert(offsetof(struct h5_filter_spec_type, filter_action) == 192);
++static_assert(offsetof(struct h5_filter_spec_type, is_routing_table_index_valid) == 196);
++static_assert(offsetof(struct h5_filter_spec_type, route_table_index) == 200);
++static_assert(offsetof(struct h5_filter_spec_type, is_mux_id_valid) == 204);
++static_assert(offsetof(struct h5_filter_spec_type, mux_id) == 208);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_spec_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, filter_spec_identifier),
++	},
++	{
++		.data_type = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, ip_type),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 184,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, filter_rule),
++		.ei_array = h5_filter_rule_type_ei,
++	},
++	{
++		.data_type = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, filter_action),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, is_routing_table_index_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, route_table_index),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, is_mux_id_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_type, mux_id),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_filter_spec_ex_type {
++	u32 ip_type;
++	struct h5_filter_rule_type filter_rule;
++	u32 filter_action;
++	u8 is_routing_table_index_valid;
++	u8 reserved_4[3];
++	u32 route_table_index;
++	u8 is_mux_id_valid;
++	u8 reserved_6[3];
++	u32 mux_id;
++	u32 rule_id;
++	u8 is_rule_hashable;
++	u8 reserved_tail[3];
++} __packed;
++static_assert(sizeof(struct h5_filter_spec_ex_type) == 216);
++static_assert(offsetof(struct h5_filter_spec_ex_type, ip_type) == 0);
++static_assert(offsetof(struct h5_filter_spec_ex_type, filter_rule) == 4);
++static_assert(offsetof(struct h5_filter_spec_ex_type, filter_action) == 188);
++static_assert(offsetof(struct h5_filter_spec_ex_type, is_routing_table_index_valid) == 192);
++static_assert(offsetof(struct h5_filter_spec_ex_type, route_table_index) == 196);
++static_assert(offsetof(struct h5_filter_spec_ex_type, is_mux_id_valid) == 200);
++static_assert(offsetof(struct h5_filter_spec_ex_type, mux_id) == 204);
++static_assert(offsetof(struct h5_filter_spec_ex_type, rule_id) == 208);
++static_assert(offsetof(struct h5_filter_spec_ex_type, is_rule_hashable) == 212);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_spec_ex_type_ei[] = {
++	{
++		.data_type = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, ip_type),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 184,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, filter_rule),
++		.ei_array = h5_filter_rule_type_ei,
++	},
++	{
++		.data_type = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, filter_action),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, is_routing_table_index_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, route_table_index),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, is_mux_id_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, mux_id),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, rule_id),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex_type, is_rule_hashable),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_filter_rule_req2_type {
++	u16 rule_eq_bitmap;
++	u8 pure_ack_eq_present;
++	u8 pure_ack_eq;
++	u8 protocol_eq_present;
++	u8 protocol_eq;
++	u8 num_ihl_offset_range_16;
++	u8 reserved_6[1];
++	struct h5_ipfltr_range_eq_16_type ihl_offset_range_16[2];
++	u8 num_offset_meq_32;
++	u8 reserved_8[3];
++	struct h5_ipfltr_mask_eq_32_type offset_meq_32[2];
++	u8 tc_eq_present;
++	u8 tc_eq;
++	u8 flow_eq_present;
++	u8 reserved_12[1];
++	u32 flow_eq;
++	u8 ihl_offset_eq_16_present;
++	u8 reserved_14[1];
++	struct h5_ipfltr_eq_16_type ihl_offset_eq_16;
++	u8 ihl_offset_eq_32_present;
++	u8 reserved_16[1];
++	struct h5_ipfltr_eq_32_type ihl_offset_eq_32;
++	u8 num_ihl_offset_meq_32;
++	u8 reserved_18[3];
++	struct h5_ipfltr_mask_eq_32_type ihl_offset_meq_32[2];
++	u8 num_offset_meq_128;
++	struct h5_ipfltr_mask_eq_128_type offset_meq_128[2];
++	u8 metadata_meq32_present;
++	struct h5_ipfltr_mask_eq_32_type metadata_meq32;
++	u8 ipv4_frag_eq_present;
++	u8 reserved_tail[3];
++} __packed;
++static_assert(sizeof(struct h5_filter_rule_req2_type) == 184);
++static_assert(offsetof(struct h5_filter_rule_req2_type, rule_eq_bitmap) == 0);
++static_assert(offsetof(struct h5_filter_rule_req2_type, pure_ack_eq_present) == 2);
++static_assert(offsetof(struct h5_filter_rule_req2_type, pure_ack_eq) == 3);
++static_assert(offsetof(struct h5_filter_rule_req2_type, protocol_eq_present) == 4);
++static_assert(offsetof(struct h5_filter_rule_req2_type, protocol_eq) == 5);
++static_assert(offsetof(struct h5_filter_rule_req2_type, num_ihl_offset_range_16) == 6);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ihl_offset_range_16) == 8);
++static_assert(offsetof(struct h5_filter_rule_req2_type, num_offset_meq_32) == 20);
++static_assert(offsetof(struct h5_filter_rule_req2_type, offset_meq_32) == 24);
++static_assert(offsetof(struct h5_filter_rule_req2_type, tc_eq_present) == 48);
++static_assert(offsetof(struct h5_filter_rule_req2_type, tc_eq) == 49);
++static_assert(offsetof(struct h5_filter_rule_req2_type, flow_eq_present) == 50);
++static_assert(offsetof(struct h5_filter_rule_req2_type, flow_eq) == 52);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_16_present) == 56);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_16) == 58);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_32_present) == 62);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_32) == 64);
++static_assert(offsetof(struct h5_filter_rule_req2_type, num_ihl_offset_meq_32) == 72);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ihl_offset_meq_32) == 76);
++static_assert(offsetof(struct h5_filter_rule_req2_type, num_offset_meq_128) == 100);
++static_assert(offsetof(struct h5_filter_rule_req2_type, offset_meq_128) == 101);
++static_assert(offsetof(struct h5_filter_rule_req2_type, metadata_meq32_present) == 167);
++static_assert(offsetof(struct h5_filter_rule_req2_type, metadata_meq32) == 168);
++static_assert(offsetof(struct h5_filter_rule_req2_type, ipv4_frag_eq_present) == 180);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_rule_req2_type_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, rule_eq_bitmap),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, pure_ack_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, pure_ack_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, protocol_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, protocol_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, num_ihl_offset_range_16),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 6,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ihl_offset_range_16),
++		.ei_array = h5_ipfltr_range_eq_16_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, num_offset_meq_32),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 12,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, offset_meq_32),
++		.ei_array = h5_ipfltr_mask_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, tc_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, tc_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, flow_eq_present),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, flow_eq),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_16_present),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_16),
++		.ei_array = h5_ipfltr_eq_16_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_32_present),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 8,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ihl_offset_eq_32),
++		.ei_array = h5_ipfltr_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, num_ihl_offset_meq_32),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 12,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ihl_offset_meq_32),
++		.ei_array = h5_ipfltr_mask_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, num_offset_meq_128),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 2,
++		.elem_size = 33,
++		.array_type = 1,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, offset_meq_128),
++		.ei_array = h5_ipfltr_mask_eq_128_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, metadata_meq32_present),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 12,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, metadata_meq32),
++		.ei_array = h5_ipfltr_mask_eq_32_type_ei,
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_req2_type, ipv4_frag_eq_present),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_filter_spec_ex2_type {
++	u32 ip_type;
++	struct h5_filter_rule_req2_type filter_rule;
++	u32 filter_action;
++	u8 is_routing_table_index_valid;
++	u8 reserved_4[3];
++	u32 route_table_index;
++	u8 is_mux_id_valid;
++	u8 reserved_6[3];
++	u32 mux_id;
++	u32 rule_id;
++	u8 is_rule_hashable;
++	u8 reserved_tail[3];
++} __packed;
++static_assert(sizeof(struct h5_filter_spec_ex2_type) == 216);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, ip_type) == 0);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, filter_rule) == 4);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, filter_action) == 188);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, is_routing_table_index_valid) == 192);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, route_table_index) == 196);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, is_mux_id_valid) == 200);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, mux_id) == 204);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, rule_id) == 208);
++static_assert(offsetof(struct h5_filter_spec_ex2_type, is_rule_hashable) == 212);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_spec_ex2_type_ei[] = {
++	{
++		.data_type = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, ip_type),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 184,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, filter_rule),
++		.ei_array = h5_filter_rule_req2_type_ei,
++	},
++	{
++		.data_type = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, filter_action),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, is_routing_table_index_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, route_table_index),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, is_mux_id_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, mux_id),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, rule_id),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_spec_ex2_type, is_rule_hashable),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_install_fltr_rule_req_msg {
++	u8 filter_spec_list_valid;
++	u8 reserved_1[3];
++	u32 filter_spec_list_len;
++	struct h5_filter_spec_type filter_spec_list[64];
++	u8 source_pipe_index_valid;
++	u8 reserved_4[3];
++	u32 source_pipe_index;
++	u8 num_ipv4_filters_valid;
++	u8 reserved_6[3];
++	u32 num_ipv4_filters;
++	u8 num_ipv6_filters_valid;
++	u8 reserved_8[3];
++	u32 num_ipv6_filters;
++	u8 xlat_filter_indices_list_valid;
++	u8 reserved_10[3];
++	u32 xlat_filter_indices_list_len;
++	u32 xlat_filter_indices_list[64];
++	u8 filter_spec_ex_list_valid;
++	u8 reserved_13[3];
++	u32 filter_spec_ex_list_len;
++	struct h5_filter_spec_ex_type filter_spec_ex_list[64];
++	u8 filter_spec_ex2_list_valid;
++	u8 reserved_16[3];
++	u32 filter_spec_ex2_list_len;
++	struct h5_filter_spec_ex2_type filter_spec_ex2_list[64];
++	u8 ul_firewall_indices_list_valid;
++	u8 reserved_19[3];
++	u32 ul_firewall_indices_list_len;
++	u32 ul_firewall_indices_list[64];
++} __packed;
++static_assert(sizeof(struct h5_install_fltr_rule_req_msg) == 41792);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_list_valid) == 0);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_list_len) == 4);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_list) == 8);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, source_pipe_index_valid) == 13576);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, source_pipe_index) == 13580);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, num_ipv4_filters_valid) == 13584);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, num_ipv4_filters) == 13588);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, num_ipv6_filters_valid) == 13592);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, num_ipv6_filters) == 13596);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, xlat_filter_indices_list_valid) == 13600);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, xlat_filter_indices_list_len) == 13604);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, xlat_filter_indices_list) == 13608);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex_list_valid) == 13864);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex_list_len) == 13868);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex_list) == 13872);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex2_list_valid) == 27696);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex2_list_len) == 27700);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex2_list) == 27704);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, ul_firewall_indices_list_valid) == 41528);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, ul_firewall_indices_list_len) == 41532);
++static_assert(offsetof(struct h5_install_fltr_rule_req_msg, ul_firewall_indices_list) == 41536);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_install_fltr_rule_req_msg_ei[] = {
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_list_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_list_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 64,
++		.elem_size = 212,
++		.array_type = 2,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_list),
++		.ei_array = h5_filter_spec_type_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, source_pipe_index_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, source_pipe_index),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 18,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, num_ipv4_filters_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 18,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, num_ipv4_filters),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 19,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, num_ipv6_filters_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 19,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, num_ipv6_filters),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 20,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, xlat_filter_indices_list_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 20,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, xlat_filter_indices_list_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 64,
++		.elem_size = 4,
++		.array_type = 2,
++		.tlv_type = 20,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, xlat_filter_indices_list),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 21,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex_list_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 21,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex_list_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 64,
++		.elem_size = 216,
++		.array_type = 2,
++		.tlv_type = 21,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex_list),
++		.ei_array = h5_filter_spec_ex_type_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 22,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex2_list_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 22,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex2_list_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 64,
++		.elem_size = 216,
++		.array_type = 2,
++		.tlv_type = 22,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, filter_spec_ex2_list),
++		.ei_array = h5_filter_spec_ex2_type_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 23,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, ul_firewall_indices_list_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 23,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, ul_firewall_indices_list_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 64,
++		.elem_size = 4,
++		.array_type = 2,
++		.tlv_type = 23,
++		.offset = offsetof(struct h5_install_fltr_rule_req_msg, ul_firewall_indices_list),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++#define H5_INSTALL_FLTR_RULE_REQ_MSG_MAX_LEN 33705
++#define H5_INSTALL_FLTR_RULE_REQ_MSG_ID 35
++struct h5_qmi_response_type {
++	u16 result;
++	u16 error;
++} __packed;
++static_assert(sizeof(struct h5_qmi_response_type) == 4);
++static_assert(offsetof(struct h5_qmi_response_type, result) == 0);
++static_assert(offsetof(struct h5_qmi_response_type, error) == 2);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_qmi_response_type_ei[] = {
++	{
++		.data_type = QMI_SIGNED_2_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_qmi_response_type, result),
++	},
++	{
++		.data_type = QMI_SIGNED_2_BYTE_ENUM,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_qmi_response_type, error),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_filter_rule_identifier_to_handle_map {
++	u32 filter_spec_identifier;
++	u32 filter_handle;
++} __packed;
++static_assert(sizeof(struct h5_filter_rule_identifier_to_handle_map) == 8);
++static_assert(offsetof(struct h5_filter_rule_identifier_to_handle_map, filter_spec_identifier) == 0);
++static_assert(offsetof(struct h5_filter_rule_identifier_to_handle_map, filter_handle) == 4);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_rule_identifier_to_handle_map_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_identifier_to_handle_map, filter_spec_identifier),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_rule_identifier_to_handle_map, filter_handle),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_install_fltr_rule_resp_msg {
++	struct h5_qmi_response_type resp;
++	u8 filter_handle_list_valid;
++	u8 reserved_2[3];
++	u32 filter_handle_list_len;
++	struct h5_filter_rule_identifier_to_handle_map filter_handle_list[64];
++	u8 rule_id_valid;
++	u8 reserved_5[3];
++	u32 rule_id_len;
++	u32 rule_id[64];
++} __packed;
++static_assert(sizeof(struct h5_install_fltr_rule_resp_msg) == 788);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, resp) == 0);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, filter_handle_list_valid) == 4);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, filter_handle_list_len) == 8);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, filter_handle_list) == 12);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, rule_id_valid) == 524);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, rule_id_len) == 528);
++static_assert(offsetof(struct h5_install_fltr_rule_resp_msg, rule_id) == 532);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_install_fltr_rule_resp_msg_ei[] = {
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 2,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, resp),
++		.ei_array = h5_qmi_response_type_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, filter_handle_list_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, filter_handle_list_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 64,
++		.elem_size = 8,
++		.array_type = 2,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, filter_handle_list),
++		.ei_array = h5_filter_rule_identifier_to_handle_map_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, rule_id_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, rule_id_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 64,
++		.elem_size = 4,
++		.array_type = 2,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_install_fltr_rule_resp_msg, rule_id),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++#define H5_INSTALL_FLTR_RULE_RESP_MSG_MAX_LEN 783
++struct h5_filter_handle_to_index_map {
++	u32 filter_handle;
++	u32 filter_index;
++} __packed;
++static_assert(sizeof(struct h5_filter_handle_to_index_map) == 8);
++static_assert(offsetof(struct h5_filter_handle_to_index_map, filter_handle) == 0);
++static_assert(offsetof(struct h5_filter_handle_to_index_map, filter_index) == 4);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_filter_handle_to_index_map_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_handle_to_index_map, filter_handle),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 0,
++		.offset = offsetof(struct h5_filter_handle_to_index_map, filter_index),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++struct h5_fltr_installed_notif_req_msg {
++	u32 source_pipe_index;
++	u16 install_status;
++	u8 reserved_2[2];
++	u32 filter_index_list_len;
++	struct h5_filter_handle_to_index_map filter_index_list[64];
++	u8 embedded_pipe_index_valid;
++	u8 reserved_5[3];
++	u32 embedded_pipe_index;
++	u8 retain_header_valid;
++	u8 retain_header;
++	u8 embedded_call_mux_id_valid;
++	u8 reserved_9[1];
++	u32 embedded_call_mux_id;
++	u8 num_ipv4_filters_valid;
++	u8 reserved_11[3];
++	u32 num_ipv4_filters;
++	u8 num_ipv6_filters_valid;
++	u8 reserved_13[3];
++	u32 num_ipv6_filters;
++	u8 start_ipv4_filter_idx_valid;
++	u8 reserved_15[3];
++	u32 start_ipv4_filter_idx;
++	u8 start_ipv6_filter_idx_valid;
++	u8 reserved_17[3];
++	u32 start_ipv6_filter_idx;
++	u8 rule_id_valid;
++	u8 reserved_19[3];
++	u32 rule_id_len;
++	u32 rule_id[64];
++	u8 dst_pipe_id_valid;
++	u8 reserved_22[3];
++	u32 dst_pipe_id_len;
++	u32 dst_pipe_id[8];
++	u8 rule_id_ex_valid;
++	u8 reserved_25[3];
++	u32 rule_id_ex_len;
++	u32 rule_id_ex[256];
++} __packed;
++static_assert(sizeof(struct h5_fltr_installed_notif_req_msg) == 1908);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, source_pipe_index) == 0);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, install_status) == 4);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, filter_index_list_len) == 8);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, filter_index_list) == 12);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, embedded_pipe_index_valid) == 524);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, embedded_pipe_index) == 528);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, retain_header_valid) == 532);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, retain_header) == 533);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, embedded_call_mux_id_valid) == 534);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, embedded_call_mux_id) == 536);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv4_filters_valid) == 540);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv4_filters) == 544);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv6_filters_valid) == 548);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv6_filters) == 552);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv4_filter_idx_valid) == 556);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv4_filter_idx) == 560);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv6_filter_idx_valid) == 564);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv6_filter_idx) == 568);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_valid) == 572);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_len) == 576);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, rule_id) == 580);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, dst_pipe_id_valid) == 836);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, dst_pipe_id_len) == 840);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, dst_pipe_id) == 844);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_ex_valid) == 876);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_ex_len) == 880);
++static_assert(offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_ex) == 884);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_fltr_installed_notif_req_msg_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 1,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, source_pipe_index),
++	},
++	{
++		.data_type = QMI_UNSIGNED_2_BYTE,
++		.elem_len = 1,
++		.elem_size = 2,
++		.array_type = 0,
++		.tlv_type = 2,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, install_status),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 3,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, filter_index_list_len),
++	},
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 64,
++		.elem_size = 8,
++		.array_type = 2,
++		.tlv_type = 3,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, filter_index_list),
++		.ei_array = h5_filter_handle_to_index_map_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, embedded_pipe_index_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 16,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, embedded_pipe_index),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, retain_header_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 17,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, retain_header),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 18,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, embedded_call_mux_id_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 18,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, embedded_call_mux_id),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 19,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv4_filters_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 19,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv4_filters),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 20,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv6_filters_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 20,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, num_ipv6_filters),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 21,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv4_filter_idx_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 21,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv4_filter_idx),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 22,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv6_filter_idx_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 22,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, start_ipv6_filter_idx),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 23,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 23,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 64,
++		.elem_size = 4,
++		.array_type = 2,
++		.tlv_type = 23,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, rule_id),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 24,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, dst_pipe_id_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 24,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, dst_pipe_id_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 8,
++		.elem_size = 4,
++		.array_type = 2,
++		.tlv_type = 24,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, dst_pipe_id),
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = 1,
++		.array_type = 0,
++		.tlv_type = 25,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_ex_valid),
++	},
++	{
++		.data_type = QMI_DATA_LEN,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 25,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_ex_len),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 256,
++		.elem_size = 4,
++		.array_type = 2,
++		.tlv_type = 25,
++		.offset = offsetof(struct h5_fltr_installed_notif_req_msg, rule_id_ex),
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++#define H5_FLTR_INSTALLED_NOTIF_REQ_MSG_MAX_LEN 1899
++#define H5_FLTR_INSTALLED_NOTIF_REQ_MSG_ID 36
++struct h5_fltr_installed_notif_resp_msg {
++	struct h5_qmi_response_type resp;
++} __packed;
++static_assert(sizeof(struct h5_fltr_installed_notif_resp_msg) == 4);
++static_assert(offsetof(struct h5_fltr_installed_notif_resp_msg, resp) == 0);
++#ifdef H5_IPA_QMI_SCHEMA_DEFINE
++static const struct qmi_elem_info h5_fltr_installed_notif_resp_msg_ei[] = {
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = 4,
++		.array_type = 0,
++		.tlv_type = 2,
++		.offset = offsetof(struct h5_fltr_installed_notif_resp_msg, resp),
++		.ei_array = h5_qmi_response_type_ei,
++	},
++	{ .data_type = QMI_EOTI },
++};
++#endif
++
++#define H5_FLTR_INSTALLED_NOTIF_RESP_MSG_MAX_LEN 7
++#endif
+--- a/drivers/net/ipa/ipa_table.c
++++ b/drivers/net/ipa/ipa_table.c
+@@ -10,6 +10,9 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/io.h>
+ #include <linux/types.h>
++#include <linux/of.h>
++#include <linux/export.h>
++#include <linux/mutex.h>
+ 
+ #include "gsi.h"
+ #include "gsi_trans.h"
+@@ -19,6 +22,8 @@
+ #include "ipa_mem.h"
+ #include "ipa_reg.h"
+ #include "ipa_table.h"
++#include "ipa_table_rtk.h"
++#include "ipa_rtk_rule_wire.h"
+ #include "ipa_version.h"
+ 
+ /**
+@@ -255,7 +260,9 @@
+ 		if (endpoint->ee_id != ee_id)
+ 			continue;
+ 
+-		ipa_table_reset_add(trans, true, hashed, ipv6, endpoint_id, 1);
++		/* Slots follow set bits in the filter bitmap, not endpoint IDs. */
++		ipa_table_reset_add(trans, true, hashed, ipv6,
++			hweight64(ipa->filtered & (BIT_ULL(endpoint_id) - 1)), 1);
+ 	}
+ 
+ 	gsi_trans_commit_wait(trans);
+@@ -773,3 +780,323 @@
+ 	ipa->table_addr = 0;
+ 	ipa->table_virt = NULL;
+ }
++
++/* SPDX-License-Identifier: GPL-2.0-only */
++static DEFINE_MUTEX(ipa_rtk_table_lock);
++static LIST_HEAD(ipa_rtk_table_owners);
++static LIST_HEAD(ipa_rtk_header_owners);
++
++static u64 ipa_rtk_table_pointer(const struct ipa_rtk_table *table)
++{
++	__le64 pointer;
++	memcpy_fromio(&pointer, table->ipa->mem_virt + table->ipa->mem_offset +
++		      table->offset, sizeof(pointer));
++	return le64_to_cpu(pointer);
++}
++
++/* A modem update must not be overwritten while releasing an older handle.
++ * Drain previous readers/cache entries without writing the pointer slot.
++ */
++static int ipa_rtk_table_drain(struct ipa *ipa)
++{
++	struct gsi_trans *trans = ipa_cmd_trans_alloc(ipa, 2);
++	const struct reg *reg = ipa_reg(ipa, FILT_ROUT_CACHE_FLUSH);
++	u32 flush = reg_bit(reg, ROUTER_CACHE) | reg_bit(reg, FILTER_CACHE);
++	if (!trans)
++		return -EBUSY;
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	ipa_cmd_register_write_add(trans, reg_offset(reg), flush, flush, false);
++	gsi_trans_commit_wait(trans);
++	return 0;
++}
++
++static int ipa_rtk_table_write(struct ipa_rtk_table *table, u64 encoded_pointer)
++{
++	struct ipa *ipa = table->ipa;
++	struct gsi_trans *trans;
++	const struct reg *reg;
++	dma_addr_t address;
++	__le64 *pointer;
++	u32 flush;
++	pointer = dma_alloc_coherent(ipa->dev, sizeof(*pointer), &address, GFP_KERNEL);
++	if (!pointer)
++		return -ENOMEM;
++	*pointer = cpu_to_le64(encoded_pointer);
++	trans = ipa_cmd_trans_alloc(ipa, 3);
++	if (!trans) {
++		dma_free_coherent(ipa->dev, sizeof(*pointer), pointer, address);
++		return -EBUSY;
++	}
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	ipa_cmd_dma_shared_mem_add(trans, table->offset, sizeof(*pointer), address, true);
++	reg = ipa_reg(ipa, FILT_ROUT_CACHE_FLUSH);
++	flush = reg_bit(reg, ROUTER_CACHE) | reg_bit(reg, FILTER_CACHE);
++	ipa_cmd_register_write_add(trans, reg_offset(reg), flush, flush, false);
++	dma_wmb();
++	gsi_trans_commit_wait(trans);
++	dma_free_coherent(ipa->dev, sizeof(*pointer), pointer, address);
++	return 0;
++}
++
++static int ipa_table_rtk_acquire_mode(struct ipa *ipa, bool filter, bool hashed,
++				    bool ipv6, u32 id, bool modem,
++				    struct ipa_rtk_table *table)
++{
++	const struct ipa_mem *mem;
++	struct ipa_rtk_table *owner;
++	__le64 original;
++	u32 offset;
++
++	if (!ipa || !table || table->ipa || ipa->version != IPA_VERSION_5_0 ||
++	    !ipa->setup_complete || !of_machine_is_compatible("greenpacket,h5-200q1"))
++		return -EINVAL;
++	if (filter) {
++		if ((id != 8 && !(modem && id == 12 && !hashed && !ipv6)) ||
++		    !(ipa->filtered & BIT_ULL(id)))
++			return -EINVAL;
++		offset = (1 + hweight64(ipa->filtered & (BIT_ULL(id) - 1))) * 8;
++	} else {
++		if (id < ipa->modem_route_count || id >= ipa->route_count)
++			return -EINVAL;
++		offset = id * 8;
++	}
++	mem = ipa_table_mem(ipa, filter, hashed, ipv6);
++	if (!mem || offset + 8 > mem->size)
++		return -ERANGE;
++	offset += mem->offset;
++	mutex_lock(&ipa_rtk_table_lock);
++	list_for_each_entry(owner, &ipa_rtk_table_owners, node)
++		if (owner->ipa == ipa && owner->offset == offset) {
++			mutex_unlock(&ipa_rtk_table_lock);
++			return -EBUSY;
++		}
++	memcpy_fromio(&original, ipa->mem_virt + ipa->mem_offset + offset, sizeof(original));
++	table->ipa = ipa;
++	table->offset = offset;
++	table->original_pointer = le64_to_cpu(original);
++	table->installed = false;
++	table->installed_pointer = 0;
++	table->base_offset = mem->offset;
++	table->modem = modem;
++	list_add_tail(&table->node, &ipa_rtk_table_owners);
++	mutex_unlock(&ipa_rtk_table_lock);
++	return 0;
++}
++int ipa_table_rtk_acquire(struct ipa *ipa, bool filter, bool ipv6,
++			  u32 id, struct ipa_rtk_table *table)
++{
++	return ipa_table_rtk_acquire_mode(ipa, filter, false, ipv6, id, false, table);
++}
++EXPORT_SYMBOL_GPL(ipa_table_rtk_acquire);
++
++int ipa_table_rtk_acquire_hashed(struct ipa *ipa, bool filter, bool ipv6,
++				 u32 id, struct ipa_rtk_table *table)
++{
++	return ipa_table_rtk_acquire_mode(ipa, filter, true, ipv6, id, false, table);
++}
++EXPORT_SYMBOL_GPL(ipa_table_rtk_acquire_hashed);
++
++int ipa_table_rtk_acquire_downlink(struct ipa *ipa, struct ipa_rtk_table *table)
++{
++	return ipa_table_rtk_acquire_mode(ipa, true, false, false, 12, true, table);
++}
++EXPORT_SYMBOL_GPL(ipa_table_rtk_acquire_downlink);
++
++int ipa_table_rtk_copy_local(struct ipa_rtk_table *table, void *buffer, size_t capacity)
++{
++	struct ipa *ipa;
++	u64 pointer, relative;
++	u32 offset, cursor = 0;
++	int ret = -EINVAL;
++	if (!table || !buffer || capacity < 8 || capacity > 65536)
++		return ret;
++	mutex_lock(&ipa_rtk_table_lock);
++	ipa = table->ipa;
++	if (!ipa || table->installed)
++		goto unlock;
++	pointer = ipa_rtk_table_pointer(table);
++	if (pointer != table->original_pointer) { ret = -ESTALE; goto unlock; }
++	if (!(pointer & 1) || (pointer & 126)) { ret = -EOPNOTSUPP; goto unlock; }
++	relative = (pointer & ~127ULL) >> 4;
++	if (relative > ipa->mem_size || table->base_offset > ipa->mem_size - relative) {
++		ret = -ERANGE;
++		goto unlock;
++	}
++	offset = table->base_offset + relative;
++	while (cursor + 8 <= capacity) {
++		__le64 word;
++		u64 header;
++		u32 length;
++		if (ipa->mem_offset + offset + cursor + 8 > ipa->mem_size) {
++			ret = -ERANGE;
++			goto unlock;
++		}
++		memcpy_fromio(&word, ipa->mem_virt + ipa->mem_offset + offset + cursor, 8);
++		header = le64_to_cpu(word);
++		length = ipa_rtk_rule_size(header);
++		if (length > capacity - cursor ||
++		    ipa->mem_offset + offset + cursor + length > ipa->mem_size) {
++			ret = -ENOSPC;
++			goto unlock;
++		}
++		memcpy_fromio(buffer + cursor,
++			      ipa->mem_virt + ipa->mem_offset + offset + cursor, length);
++		cursor += length;
++		if (!header) {
++			ret = ipa_rtk_table_pointer(table) == pointer ? cursor : -ESTALE;
++			goto unlock;
++		}
++	}
++	ret = -ENOSPC;
++unlock:
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_table_rtk_copy_local);
++
++int ipa_table_rtk_replace(struct ipa_rtk_table *table, dma_addr_t rule_address)
++{
++	int ret;
++
++	if (!table || !rule_address || !IS_ALIGNED(rule_address, 128))
++		return -EINVAL;
++	mutex_lock(&ipa_rtk_table_lock);
++	if (!table->ipa) {
++		ret = -EINVAL;
++	} else if (table->modem && ipa_rtk_table_pointer(table) !=
++		   (table->installed ? table->installed_pointer : table->original_pointer)) {
++		ret = -ESTALE;
++	} else {
++		ret = ipa_rtk_table_write(table, rule_address);
++	}
++	if (!ret) {
++		table->installed = true;
++		table->installed_pointer = rule_address;
++	}
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_table_rtk_replace);
++
++int ipa_table_rtk_release(struct ipa_rtk_table *table)
++{
++	int ret = 0;
++
++	if (!table)
++		return -EINVAL;
++	mutex_lock(&ipa_rtk_table_lock);
++	if (table->ipa) {
++		if (table->installed) {
++			if (table->modem && ipa_rtk_table_pointer(table) != table->installed_pointer)
++				ret = ipa_rtk_table_drain(table->ipa);
++			else
++				ret = ipa_rtk_table_write(table, table->original_pointer);
++		}
++		if (!ret) {
++			list_del(&table->node);
++			memset(table, 0, sizeof(*table));
++		}
++	}
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_table_rtk_release);
++
++static int ipa_rtk_header_write(struct ipa_rtk_header *header, const u8 data[16])
++{
++	struct ipa *ipa = header->ipa;
++	struct gsi_trans *trans;
++	dma_addr_t address;
++	u8 *buffer;
++
++	buffer = dma_alloc_coherent(ipa->dev, 16, &address, GFP_KERNEL);
++	if (!buffer)
++		return -ENOMEM;
++	memcpy(buffer, data, 16);
++	trans = ipa_cmd_trans_alloc(ipa, 2);
++	if (!trans) {
++		dma_free_coherent(ipa->dev, 16, buffer, address);
++		return -EBUSY;
++	}
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	ipa_cmd_dma_shared_mem_add(trans, header->offset, 16, address, true);
++	dma_wmb();
++	gsi_trans_commit_wait(trans);
++	dma_free_coherent(ipa->dev, 16, buffer, address);
++	return 0;
++}
++
++int ipa_header_rtk_acquire(struct ipa *ipa, const u8 ethernet[14],
++			   struct ipa_rtk_header *header)
++{
++	const struct ipa_mem *ap, *modem;
++	struct ipa_rtk_header *owner;
++	u32 slot, offset;
++	u8 data[16] = {};
++	bool occupied;
++	int ret = -ENOSPC;
++
++	if (!ipa || !ethernet || !header || header->ipa ||
++	    ipa->version != IPA_VERSION_5_0 || !ipa->setup_complete ||
++	    !of_machine_is_compatible("greenpacket,h5-200q1"))
++		return -EINVAL;
++	ap = ipa_mem_find(ipa, IPA_MEM_AP_HEADER);
++	modem = ipa_mem_find(ipa, IPA_MEM_MODEM_HEADER);
++	if (!ap || !modem || ap->offset < modem->offset || ap->size < 32)
++		return -ENODEV;
++	mutex_lock(&ipa_rtk_table_lock);
++	/* Keep the first slot reserved for any default/empty header. */
++	for (slot = 16; slot + 16 <= ap->size; slot += 16) {
++		offset = ap->offset + slot;
++		occupied = false;
++		list_for_each_entry(owner, &ipa_rtk_header_owners, node)
++			if (owner->ipa == ipa && owner->offset == offset) {
++				occupied = true;
++				break;
++			}
++		if (!occupied)
++			break;
++	}
++	if (slot + 16 > ap->size)
++		goto out;
++	if ((offset - modem->offset) % 4 || (offset - modem->offset) / 4 > 511) {
++		ret = -ERANGE;
++		goto out;
++	}
++	header->ipa = ipa;
++	header->offset = offset;
++	header->route_offset = offset - modem->offset;
++	memcpy_fromio(header->original, ipa->mem_virt + ipa->mem_offset + offset, 16);
++	list_add_tail(&header->node, &ipa_rtk_header_owners);
++	memcpy(data, ethernet, 14);
++	ret = ipa_rtk_header_write(header, data);
++	if (ret) {
++		list_del(&header->node);
++		memset(header, 0, sizeof(*header));
++	}
++out:
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_header_rtk_acquire);
++
++/* Caller removes every route referencing this slot and drains its pipeline
++ * before releasing. A failed restoration keeps the handle reserved.
++ */
++int ipa_header_rtk_release(struct ipa_rtk_header *header)
++{
++	int ret = 0;
++	if (!header)
++		return -EINVAL;
++	mutex_lock(&ipa_rtk_table_lock);
++	if (header->ipa) {
++		ret = ipa_rtk_header_write(header, header->original);
++		if (!ret) {
++			list_del(&header->node);
++			memset(header, 0, sizeof(*header));
++		}
++	}
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_header_rtk_release);
+--- /dev/null
++++ b/drivers/net/ipa/ipa_table_rtk.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_TABLE_RTK_H_
++#define _IPA_TABLE_RTK_H_
++#include <linux/dma-mapping.h>
++#include <linux/list.h>
++struct ipa;
++
++struct ipa_rtk_table {
++	struct list_head node;
++	struct ipa *ipa;
++	u32 offset;
++	u64 original_pointer;
++	bool installed;
++	u64 installed_pointer;
++	u32 base_offset;
++	bool modem;
++};
++
++/* A 16-byte local AP header slot. Routes reference route_offset, relative to
++ * the complete modem+AP local header table, not the raw SRAM offset.
++ */
++struct ipa_rtk_header {
++	struct list_head node;
++	struct ipa *ipa;
++	u32 offset;
++	u16 route_offset;
++	u8 original[16];
++};
++
++/* Handles must be zero-initialized and remain alive until release succeeds.
++ * Caller holds IPA power and retains rule DMA until successful replacement
++ * or release. Release restores the exact original, possibly local, pointer.
++ */
++int ipa_table_rtk_acquire(struct ipa *ipa, bool filter, bool ipv6,
++			  u32 id, struct ipa_rtk_table *table);
++int ipa_table_rtk_acquire_hashed(struct ipa *ipa, bool filter, bool ipv6,
++				 u32 id, struct ipa_rtk_table *table);
++/* Non-hashed IPv4 modem downlink only. Preserve its original rule bytes and
++ * leave its hashed table untouched. Concurrent modem replacement is ESTALE.
++ */
++int ipa_table_rtk_acquire_downlink(struct ipa *ipa, struct ipa_rtk_table *table);
++int ipa_table_rtk_copy_local(struct ipa_rtk_table *table, void *buffer, size_t capacity);
++int ipa_table_rtk_replace(struct ipa_rtk_table *table, dma_addr_t rule_address);
++int ipa_table_rtk_release(struct ipa_rtk_table *table);
++int ipa_header_rtk_acquire(struct ipa *ipa, const u8 ethernet[14],
++			   struct ipa_rtk_header *header);
++int ipa_header_rtk_release(struct ipa_rtk_header *header);
++#endif
+--- /dev/null
++++ b/drivers/net/ipa/ipa_rtk_tx.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_RTK_TX_H_
++#define _IPA_RTK_TX_H_
++#include <linux/dma-mapping.h>
++struct ipa;
++
++/* Caller serializes with RTK stop and owns a coherent AP DMA frame buffer.
++ * Returns after the command-channel transfer completes; RTK must be running.
++ */
++int ipa_cmd_rtk_packet_tx(struct ipa *ipa, dma_addr_t frame, u32 length);
++#endif
+--- /dev/null
++++ b/drivers/net/ipa/ipa_rtk_debug.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_RTK_DEBUG_H_
++#define _IPA_RTK_DEBUG_H_
++#include <linux/types.h>
++struct ipa;
++/* Temporary kernel-only diagnostic. No packet bytes are exposed to userspace. */
++int ipa_rtk_test_tx_copy(struct ipa *ipa, u32 index, void *data, size_t capacity);
++int ipa_rtk_test_nat_direction(struct ipa *ipa, bool destination);
++/* Stop new external RX while keeping NIC TX/GSI alive to drain DL rules. */
++int ipa_rtk_test_rx_pause(struct ipa *ipa);
++#endif
+--- /dev/null
++++ b/drivers/net/ipa/ipa_rtk_rule_wire.h
+@@ -0,0 +1,199 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_RTK_RULE_WIRE_H_
++#define _IPA_RTK_RULE_WIRE_H_
++
++#include <linux/types.h>
++#ifdef __KERNEL__
++#include <linux/errno.h>
++#include <linux/string.h>
++#else
++#include <errno.h>
++#include <string.h>
++#endif
++
++/* IPA 5.0 equations, independent of QMI C layout and compiler bitfields. */
++struct ipa_rtk_eq32 { __u8 offset; __u32 mask, value; };
++struct ipa_rtk_eq128 { __u8 offset, mask[16], value[16]; };
++struct ipa_rtk_range16 { __u8 offset; __u16 low, high; };
++struct ipa_rtk_equations {
++	__u16 bitmap;
++	__u8 pure_ack, protocol_present, protocol, tc_present, tc;
++	__u8 meq128_count, meq32_count, ihl_meq32_count, range16_count;
++	struct ipa_rtk_eq128 meq128[2];
++	struct ipa_rtk_eq32 meq32[2], ihl_meq32[2], metadata;
++	struct ipa_rtk_range16 range16[2];
++	__u8 metadata_present, ihl_eq32_present, ihl_eq32_offset;
++	__u32 ihl_eq32;
++	__u8 ihl_eq16_present, ihl_eq16_offset;
++	__u16 ihl_eq16;
++	__u8 flow_present, fragment;
++	__u32 flow;
++};
++
++static inline void ipa_rtk_put16(__u8 *p, __u16 value)
++{
++	p[0] = value; p[1] = value >> 8;
++}
++static inline void ipa_rtk_put32(__u8 *p, __u32 value)
++{
++	ipa_rtk_put16(p, value); ipa_rtk_put16(p + 2, value >> 16);
++}
++static inline void ipa_rtk_put64(__u8 *p, __u64 value)
++{
++	ipa_rtk_put32(p, value); ipa_rtk_put32(p + 4, value >> 32);
++}
++
++/* Includes the eight-byte header; zero header is the eight-byte terminator.
++ * Local table offsets are relative to that table's header block, not SRAM.
++ */
++static inline unsigned int ipa_rtk_rule_size(__u64 header)
++{
++	unsigned int extra = 0, payload = 0, bit;
++	__u16 bitmap = header;
++	if (!header)
++		return 8;
++	for (bit = 0; bit < 16; bit++) {
++		if (!(bitmap & (1U << bit)))
++			continue;
++		if (bit <= 8 || (bit >= 10 && bit <= 13))
++			extra++;
++		if (bit == 3 || bit == 4)
++			payload += 32;
++		else if (bit >= 5 && bit <= 9)
++			payload += 8;
++		else if (bit >= 10 && bit <= 12)
++			payload += 4;
++		else if (bit == 13)
++			payload += 2;
++		else if (bit == 14)
++			payload += 4;
++	}
++	return 8 + ((((extra + 7) & ~7U) + payload + 7) & ~7U);
++}
++
++/* dst must have 248 bytes available and start at an eight-byte boundary.
++ * The caller publishes it to hardware only after this function succeeds.
++ */
++static inline int ipa_rtk_equations_encode(__u8 *dst,
++					 const struct ipa_rtk_equations *eq)
++{
++	unsigned int extra, cursor, payload, i, half;
++	__u16 bitmap;
++
++	if (eq->meq128_count > 2 || eq->meq32_count > 2 ||
++	    eq->ihl_meq32_count > 2 || eq->range16_count > 2 ||
++	    eq->pure_ack > 1 || eq->protocol_present > 1 || eq->tc_present > 1 ||
++	    eq->metadata_present > 1 || eq->ihl_eq32_present > 1 ||
++	    eq->ihl_eq16_present > 1 || eq->flow_present > 1 || eq->fragment > 1)
++		return -EINVAL;
++	bitmap = eq->pure_ack | eq->protocol_present << 1 | eq->tc_present << 2 |
++		(eq->meq128_count > 0) << 3 | (eq->meq128_count > 1) << 4 |
++		(eq->meq32_count > 0) << 5 | (eq->meq32_count > 1) << 6 |
++		(eq->ihl_meq32_count > 0) << 7 | (eq->ihl_meq32_count > 1) << 8 |
++		eq->metadata_present << 9 | (eq->range16_count > 0) << 10 |
++		(eq->range16_count > 1) << 11 | eq->ihl_eq32_present << 12 |
++		eq->ihl_eq16_present << 13 | eq->flow_present << 14 | eq->fragment << 15;
++	if (bitmap != eq->bitmap)
++		return -EINVAL;
++	extra = eq->pure_ack + eq->protocol_present + eq->tc_present +
++		eq->meq128_count + eq->meq32_count + eq->ihl_meq32_count +
++		eq->range16_count + eq->ihl_eq32_present + eq->ihl_eq16_present;
++	if (extra > 13)
++		return -EINVAL;
++	memset(dst, 0, 248);
++	cursor = 0;
++	payload = (extra + 7) & ~7U;
++	if (eq->pure_ack) dst[cursor++] = 0;
++	if (eq->protocol_present) dst[cursor++] = eq->protocol;
++	if (eq->tc_present) dst[cursor++] = eq->tc;
++	for (i = 0; i < eq->meq128_count; i++) {
++		dst[cursor++] = eq->meq128[i].offset;
++		/* Hardware interleaves each 64-bit mask with its 64-bit value. */
++		for (half = 0; half < 2; half++) {
++			memcpy(dst + payload, eq->meq128[i].mask + half * 8, 8);
++			memcpy(dst + payload + 8, eq->meq128[i].value + half * 8, 8);
++			payload += 16;
++		}
++	}
++	for (i = 0; i < eq->meq32_count; i++) {
++		dst[cursor++] = eq->meq32[i].offset;
++		ipa_rtk_put32(dst + payload, eq->meq32[i].mask);
++		ipa_rtk_put32(dst + payload + 4, eq->meq32[i].value);
++		payload += 8;
++	}
++	for (i = 0; i < eq->ihl_meq32_count; i++) {
++		dst[cursor++] = eq->ihl_meq32[i].offset;
++		ipa_rtk_put32(dst + payload, eq->ihl_meq32[i].mask);
++		ipa_rtk_put32(dst + payload + 4, eq->ihl_meq32[i].value);
++		payload += 8;
++	}
++	if (eq->metadata_present) {
++		ipa_rtk_put32(dst + payload, eq->metadata.mask);
++		ipa_rtk_put32(dst + payload + 4, eq->metadata.value);
++		payload += 8;
++	}
++	for (i = 0; i < eq->range16_count; i++) {
++		if (eq->range16[i].low > eq->range16[i].high)
++			return -EINVAL;
++		dst[cursor++] = eq->range16[i].offset;
++		ipa_rtk_put16(dst + payload, eq->range16[i].high);
++		ipa_rtk_put16(dst + payload + 2, eq->range16[i].low);
++		payload += 4;
++	}
++	if (eq->ihl_eq32_present) {
++		dst[cursor++] = eq->ihl_eq32_offset;
++		ipa_rtk_put32(dst + payload, eq->ihl_eq32);
++		payload += 4;
++	}
++	if (eq->ihl_eq16_present) {
++		dst[cursor++] = eq->ihl_eq16_offset;
++		ipa_rtk_put16(dst + payload, eq->ihl_eq16);
++		payload += 4;
++	}
++	if (eq->flow_present) {
++		ipa_rtk_put32(dst + payload, eq->flow & 0xfffff);
++		payload += 4;
++	}
++	return (payload + 7) & ~7U;
++}
++
++/* Both rule headers are eight bytes on IPA 5.0. Rule ID 1023 is reserved. */
++static inline int ipa_rtk_filter_encode(__u8 *dst, const struct ipa_rtk_equations *eq,
++		__u8 route, __u8 action, __u8 pdn, __u8 priority, __u16 id,
++		__u8 counter, __u8 retain, __u8 metadata)
++{
++	__u64 header;
++	int length;
++	if (id >= 1023 || action > 3 || pdn > 15 || retain > 1 || metadata > 1)
++		return -EINVAL;
++	length = ipa_rtk_equations_encode(dst + 8, eq);
++	if (length < 0) return length;
++	header = eq->bitmap | (__u64)route << 16 | (__u64)counter << 24 |
++		(__u64)priority << 32 | (__u64)id << 42 | (__u64)action << 52 |
++		(__u64)pdn << 57 | (__u64)metadata << 61 | (__u64)retain << 62;
++	ipa_rtk_put64(dst, header);
++	return length + 8;
++}
++
++static inline int ipa_rtk_route_encode(__u8 *dst, const struct ipa_rtk_equations *eq,
++		__u8 endpoint, __u16 header_offset, __u8 process_context,
++		__u8 system, __u8 priority, __u16 id, __u8 counter, __u8 retain)
++{
++	__u64 header;
++	unsigned int alignment;
++	int length;
++	if (id >= 1023 || process_context > 1 || system > 1 || retain > 1)
++		return -EINVAL;
++	alignment = process_context ? 32 : 4;
++	if (header_offset % alignment || header_offset / alignment > 511)
++		return -EINVAL;
++	length = ipa_rtk_equations_encode(dst + 8, eq);
++	if (length < 0) return length;
++	header = eq->bitmap | (__u64)endpoint << 16 | (__u64)counter << 24 |
++		(__u64)priority << 32 | (__u64)id << 42 |
++		(__u64)(header_offset / alignment) << 52 |
++		(__u64)process_context << 61 | (__u64)retain << 62 | (__u64)system << 63;
++	ipa_rtk_put64(dst, header);
++	return length + 8;
++}
++#endif
+--- /dev/null
++++ b/drivers/net/ipa/ipa_rtk_nat_wire.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _IPA_RTK_NAT_WIRE_H_
++#define _IPA_RTK_NAT_WIRE_H_
++
++#include <linux/types.h>
++#ifdef __KERNEL__
++#include <linux/byteorder/generic.h>
++#else
++#include <endian.h>
++#define cpu_to_le32(x) htole32(x)
++#define be32_to_cpu(x) be32toh(x)
++#define be16_to_cpu(x) be16toh(x)
++#endif
++
++/* Wire layout from Qualcomm ipanat ipa_nat_rule; use words, not C bitfields. */
++struct ipa_rtk_nat_entry {
++	__le32 word[8];
++};
++
++struct ipa_rtk_nat_tuple {
++	__be32 private_ip;
++	__be32 remote_ip;
++	__be32 public_ip;
++	__be16 private_port;
++	__be16 remote_port;
++	__be16 public_port;
++	__u8 protocol;
++	__u8 pdn;
++};
++
++static inline __u16 ipa_rtk_nat_checksum_delta(__u32 public_ip, __u16 public_port,
++					     __u32 private_ip, __u16 private_port)
++{
++	__u32 sum = (public_ip & 0xffff) + (public_ip >> 16) + public_port;
++
++	sum += (~private_ip & 0xffff) + ((~private_ip) >> 16);
++	sum += (__u16)~private_port;
++	while (sum >> 16)
++		sum = (sum & 0xffff) + (sum >> 16);
++	return sum;
++}
++
++static inline __u16 ipa_rtk_nat_destination_hash(const struct ipa_rtk_nat_tuple *t,
++					       __u16 mask)
++{
++	__u32 remote = be32_to_cpu(t->remote_ip);
++	__u32 public = be32_to_cpu(t->public_ip);
++	__u16 hash;
++
++	hash = remote ^ (remote >> 16) ^ public ^ (public >> 16) ^
++		be16_to_cpu(t->remote_port) ^ be16_to_cpu(t->public_port) ^ t->protocol;
++	hash &= mask;
++	return hash ? hash : mask;
++}
++
++static inline __u16 ipa_rtk_nat_source_hash(const struct ipa_rtk_nat_tuple *t, __u16 mask)
++{
++	__u32 remote = be32_to_cpu(t->remote_ip);
++	__u32 private = be32_to_cpu(t->private_ip);
++	__u16 hash;
++
++	hash = remote ^ (remote >> 16) ^ private ^ (private >> 16) ^
++		be16_to_cpu(t->remote_port) ^ be16_to_cpu(t->private_port) ^ t->protocol;
++	hash &= mask;
++	return hash ? hash : mask;
++}
++
++static inline void ipa_rtk_nat_encode(struct ipa_rtk_nat_entry *entry,
++				     const struct ipa_rtk_nat_tuple *t,
++				     __u16 next, __u16 flags)
++{
++	__u32 public = be32_to_cpu(t->public_ip);
++	__u32 private = be32_to_cpu(t->private_ip);
++	__u16 public_port = be16_to_cpu(t->public_port);
++	__u16 private_port = be16_to_cpu(t->private_port);
++	__u16 ip_delta, transport_delta;
++
++	ip_delta = ipa_rtk_nat_checksum_delta(public, 0, private, 0);
++	transport_delta = ipa_rtk_nat_checksum_delta(public, public_port, private, private_port);
++	entry->word[0] = cpu_to_le32(private);
++	entry->word[1] = cpu_to_le32(be32_to_cpu(t->remote_ip));
++	entry->word[2] = cpu_to_le32(next | (__u32)public_port << 16);
++	entry->word[3] = cpu_to_le32(private_port | (__u32)be16_to_cpu(t->remote_port) << 16);
++	entry->word[4] = cpu_to_le32(ip_delta | (__u32)flags << 16);
++	entry->word[5] = cpu_to_le32((__u32)t->protocol << 24);
++	entry->word[6] = 0;
++	entry->word[7] = cpu_to_le32((__u32)(t->pdn & 0xf) << 12 |
++				   (__u32)transport_delta << 16);
++}
++
++#endif

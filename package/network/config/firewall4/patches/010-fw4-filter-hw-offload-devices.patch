@@ -1,0 +1,11 @@
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -618,7 +618,7 @@
+ 				let net = {
+ 					up: ifc.up,
+ 					device: ifc.l3_device ?? ifc.device,
+-					physdev: ifc.device,
++					physdev: ifc.device ?? ifc.l3_device,
+ 					zone: ifc.data?.zone
+ 				};
+ 

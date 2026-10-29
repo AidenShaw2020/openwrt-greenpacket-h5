@@ -31,6 +31,10 @@ platform_do_upgrade() {
 	case "$(board_name)" in
 	greenpacket,h5-200q1)
 		platform_check_image "$1" || return 1
+		stage=/sys/bus/platform/devices/soc:ipa-ethernet/stage
+		if [ -f "$stage" ]; then
+			echo 0 >"$stage" 2>/dev/null || true
+		fi
 		# procd stops userspace before this RAM-stage hook. Stop MPSS too,
 		# before erasing system, so it cannot access shared NAND during it.
 		state=/sys/class/remoteproc/remoteproc0/state

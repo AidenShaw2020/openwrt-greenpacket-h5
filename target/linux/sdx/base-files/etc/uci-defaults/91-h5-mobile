@@ -20,4 +20,9 @@ for zone in $(uci show firewall | sed -n 's/^\(firewall\.[^=]*\)=zone$/\1/p'); d
 		*) uci add_list "$zone.network=mobile"; uci commit firewall ;;
 	esac
 done
+if [ -z "$(uci -q get firewall.@defaults[0].flow_offloading)" ]; then
+	uci set firewall.@defaults[0].flow_offloading='1'
+	uci set firewall.@defaults[0].flow_offloading_hw='1'
+	uci commit firewall
+fi
 exit 0

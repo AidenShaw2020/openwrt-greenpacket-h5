@@ -161,11 +161,21 @@ Live tests used one physical LAN computer. Two hundred different MAC/IP clients
 were exercised in the production-code model, not on 200 physical devices.
 
 In 200-stream cleartext HTTP close/FIN bursts, raising `netdev_max_backlog` to
-4096 eliminated `qmapmux0.0` `gro_cells_receive` queue drops (`rx_dropped` delta 0)
-and expanding the external TX1 ring to 1024 descriptors achieved 200/200
-completions (130.64 Mbps in 12.25 s) in two runs, though occasional tail drops
-on the single USB Ethernet test client can still leave a few streams waiting for
-final segments when `FIN` arrives ahead of data.
+4096 eliminated `qmapmux0.0` `gro_cells_receive` queue drops (`rx_dropped` delta 0).
+With the 1024-descriptor TX1 ring, single runs reached 200/200 (130.64 Mbps in
+12.25 s) and 198/200. With the 2-second teardown grace, two runs completed only
+185/200 and 181/200 without new queue drops. The cleartext HTTP failure remains
+unresolved and its cause is not established.
+
+Release r5 restricts the diagnostic `stage` attribute to root (mode 0600) and
+stops the board default script from clearing a locked root password or
+overwriting existing SSH/HTTPS settings after a config-preserving sysupgrade.
+Its image (SHA256 `0a7c840aea52456375193452060c39c8010d2501c1ef23f7dd547424ba484e30`,
+controller `ae40985be8928ad99700b1710e3e8e771b9929e80243152cf927a7d1f76bb46c`)
+was installed by sysupgrade with configuration preserved. It reached stage 4 with
+failed=0 automatically and completed a 200-stream HTTPS batch 200/200 at
+183.07 Mbps in 8.740 s. The new default script was verified on copies of the
+live configuration; unsolicited WAN traffic handling is still not validated.
 
 ## Source Checks
 

@@ -323,6 +323,7 @@ index 00000000..475aeb57
 ++ 
 diff --git a/package/kernel/h5-ipa-rtk/Makefile b/package/kernel/h5-ipa-rtk/Makefile
 new file mode 100644
+index 00000000..406b8a20
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/Makefile
 @@ -0,0 +1,39 @@
@@ -333,7 +334,7 @@ new file mode 100644
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=4
++PKG_RELEASE:=5
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -4055,9 +4056,10 @@ index 00000000..f9e17b77
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
 new file mode 100644
+index 00000000..bb52f07e
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
-@@ -0,0 +1,1350 @@
+@@ -0,0 +1,1351 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* SDX65/RTL8125 external DMA controller. Stage 0 is passive domain attachment. */
 +#include <linux/dma-mapping.h>
@@ -5149,7 +5151,8 @@ new file mode 100644
 +	mutex_unlock(&c->lock);
 +	return ret ? ret : count;
 +}
-+static DEVICE_ATTR_RW(stage);
++/* Root only: exposes the WAN address, DMA ring addresses and NIC registers. */
++static DEVICE_ATTR(stage, 0600, stage_show, stage_store);
 +
 +static void ipa_rtk_netdev_down_work(struct work_struct *work)
 +{
@@ -8049,31 +8052,26 @@ index 00000000..955e040b
 +ttyMSM0::askfirst:/usr/libexec/login.sh
 diff --git a/target/linux/sdx/base-files/etc/uci-defaults/90-h5-initial-access b/target/linux/sdx/base-files/etc/uci-defaults/90-h5-initial-access
 new file mode 100755
-index 00000000..e642a4bb
+index 00000000..33ba450e
 --- /dev/null
 +++ b/target/linux/sdx/base-files/etc/uci-defaults/90-h5-initial-access
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,17 @@
 +#!/bin/sh
-+# User-requested fresh-install defaults. Existing configured passwords survive.
++# Runs again after config-preserving sysupgrade: never weaken existing settings.
 +case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
 +	greenpacket,h5-200q1) ;;
 +	*) exit 0 ;;
 +esac
-+root_hash="$(sed -n 's/^root:\([^:]*\):.*/\1/p' /etc/shadow)"
-+case "$root_hash" in
-+	''|'!'|'*')
-+	passwd -d root >/dev/null 2>&1
-+	;;
-+esac
 +uci set system.@system[0].ttylogin='1'
 +uci commit system
-+uci -q batch <<'EOF'
-+set dropbear.@dropbear[0].PasswordAuth='on'
-+set dropbear.@dropbear[0].RootPasswordAuth='on'
-+set uhttpd.main.redirect_https='0'
-+commit dropbear
-+commit uhttpd
-+EOF
++set_default() {
++	[ -n "$(uci -q get "$1")" ] || uci set "$1=$2"
++}
++set_default dropbear.@dropbear[0].PasswordAuth on
++set_default dropbear.@dropbear[0].RootPasswordAuth on
++set_default uhttpd.main.redirect_https 0
++uci commit dropbear
++uci commit uhttpd
 +exit 0
 diff --git a/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile b/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile
 new file mode 100755

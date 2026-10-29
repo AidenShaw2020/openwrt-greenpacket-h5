@@ -1089,7 +1089,8 @@ out:
 	mutex_unlock(&c->lock);
 	return ret ? ret : count;
 }
-static DEVICE_ATTR_RW(stage);
+/* Root only: exposes the WAN address, DMA ring addresses and NIC registers. */
+static DEVICE_ATTR(stage, 0600, stage_show, stage_store);
 
 static void ipa_rtk_netdev_down_work(struct work_struct *work)
 {

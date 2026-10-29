@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=h5-ipa-rtk
 PKG_VERSION:=1
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk

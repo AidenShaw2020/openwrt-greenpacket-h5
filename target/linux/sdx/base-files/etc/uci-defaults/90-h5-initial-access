@@ -1,22 +1,17 @@
 #!/bin/sh
-# User-requested fresh-install defaults. Existing configured passwords survive.
+# Runs again after config-preserving sysupgrade: never weaken existing settings.
 case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
 	greenpacket,h5-200q1) ;;
 	*) exit 0 ;;
 esac
-root_hash="$(sed -n 's/^root:\([^:]*\):.*/\1/p' /etc/shadow)"
-case "$root_hash" in
-	''|'!'|'*')
-	passwd -d root >/dev/null 2>&1
-	;;
-esac
 uci set system.@system[0].ttylogin='1'
 uci commit system
-uci -q batch <<'EOF'
-set dropbear.@dropbear[0].PasswordAuth='on'
-set dropbear.@dropbear[0].RootPasswordAuth='on'
-set uhttpd.main.redirect_https='0'
-commit dropbear
-commit uhttpd
-EOF
+set_default() {
+	[ -n "$(uci -q get "$1")" ] || uci set "$1=$2"
+}
+set_default dropbear.@dropbear[0].PasswordAuth on
+set_default dropbear.@dropbear[0].RootPasswordAuth on
+set_default uhttpd.main.redirect_https 0
+uci commit dropbear
+uci commit uhttpd
 exit 0

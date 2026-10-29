@@ -27,13 +27,16 @@
 #include "ipa_rtk_flow_manager.h"
 
 #define H5_EP8_METADATA (0x101c + 8 * 0x80)
-#define IPA_RTK_MAX_HEADERS 6
+#define IPA_RTK_MAX_HEADERS IPA_RTK_HEADER_CAPACITY
+#define IPA_RTK_DL_POLICY_COUNT 2
+#define IPA_RTK_ROUTE_SIZE 8192
+#define IPA_RTK_OFFLOAD_SIZE (4096 + 2 * IPA_RTK_ROUTE_SIZE)
 
 struct h5_dl_fltr_req_ex_msg {
 	u8 filter_spec_ex_list_valid;
 	u8 reserved_1[3];
 	u32 filter_spec_ex_list_len;
-	struct h5_filter_spec_ex_type filter_spec_ex_list[IPA_RTK_FLOW_LIMIT];
+	struct h5_filter_spec_ex_type filter_spec_ex_list[IPA_RTK_DL_POLICY_COUNT];
 } __packed;
 
 static const struct qmi_elem_info h5_dl_fltr_req_ex_msg_ei[] = {
@@ -55,7 +58,7 @@ static const struct qmi_elem_info h5_dl_fltr_req_ex_msg_ei[] = {
 	},
 	{
 		.data_type = QMI_STRUCT,
-		.elem_len = IPA_RTK_FLOW_LIMIT,
+		.elem_len = IPA_RTK_DL_POLICY_COUNT,
 		.elem_size = sizeof(struct h5_filter_spec_ex_type),
 		.array_type = VAR_LEN_ARRAY,
 		.tlv_type = 0x10,
@@ -146,15 +149,20 @@ out:
 static const u32 dl_nat_eps[3] = { 5, 12, 15 };
 
 struct ipa_rtk_header_ref {
-	struct ipa_rtk_header header;
+	u16 route_offset;
 	u8 ethernet[ETH_HLEN];
 	unsigned int refcount;
 };
 
 struct ipa_rtk_offload_slot {
 	struct ipa_rtk_nat_tuple nat;
-	unsigned int header_index;
+	unsigned int client_index;
 	bool active;
+};
+
+struct ipa_rtk_client {
+	__be32 address;
+	unsigned int header_index, refcount;
 };
 
 struct ipa_rtk_controller {
@@ -178,7 +186,9 @@ struct ipa_rtk_controller {
 	struct work_struct netdev_down_work;
 	struct ipa_rtk_table ul[4], route, route_hash;
 	struct ipa_rtk_header_ref headers[IPA_RTK_MAX_HEADERS];
-	struct ipa_rtk_offload_slot flows[IPA_RTK_FLOW_LIMIT];
+	struct ipa_rtk_offload_slot *flows;
+	struct ipa_rtk_client clients[IPA_RTK_HEADER_CAPACITY];
+	struct ipa_rtk_header_bank header_bank;
 	struct h5_fltr_installed_notif_req_msg *notification;
 	void *offload_buf;
 	dma_addr_t offload_addr;
@@ -364,66 +374,52 @@ static int ipa_rtk_header_get(struct ipa_rtk_controller *c,
 	}
 	if (free_idx == IPA_RTK_MAX_HEADERS)
 		return -ENOSPC;
-	ret = ipa_header_rtk_acquire(c->ipa, ethernet, &c->headers[free_idx].header);
+	ret = ipa_header_rtk_bank_set(&c->header_bank, free_idx, ethernet);
 	if (ret)
 		return ret;
 	memcpy(c->headers[free_idx].ethernet, ethernet, ETH_HLEN);
 	c->headers[free_idx].refcount = 1;
+	c->headers[free_idx].route_offset = free_idx * 32;
 	*out_idx = free_idx;
 	return 0;
 }
 
 static int ipa_rtk_header_put(struct ipa_rtk_controller *c, unsigned int idx)
 {
-	int ret;
-
 	if (idx >= IPA_RTK_MAX_HEADERS || !c->headers[idx].refcount)
 		return -EINVAL;
 	if (--c->headers[idx].refcount > 0)
 		return 0;
-	ret = ipa_header_rtk_release(&c->headers[idx].header);
-	if (ret) {
-		c->headers[idx].refcount = 1;
-		return ret;
-	}
 	memset(&c->headers[idx], 0, sizeof(c->headers[idx]));
 	return 0;
 }
 
 static int ipa_rtk_rebuild_routes(struct ipa_rtk_controller *c)
 {
-	unsigned int off = 4096 + (c->route_flip ? 1024 : 0);
-	unsigned int i, j, cursor = 0, prio = 0;
+	unsigned int off = 4096 + (c->route_flip ? IPA_RTK_ROUTE_SIZE : 0);
+	unsigned int i, cursor = 0, prio = 0;
 	int ret;
 
-	memset(c->offload_buf + off, 0, 1024);
-	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
+	memset(c->offload_buf + off, 0, IPA_RTK_ROUTE_SIZE);
+	for (i = 0; i < IPA_RTK_HEADER_CAPACITY; i++) {
 		struct ipa_rtk_equations eq = {};
-		bool dup = false;
+		struct ipa_rtk_client *client = &c->clients[i];
 		int len;
-
-		if (!c->flows[i].active)
+		if (!client->refcount)
 			continue;
-		for (j = 0; j < i; j++) {
-			if (c->flows[j].active &&
-			    c->flows[j].nat.private_ip == c->flows[i].nat.private_ip &&
-			    c->flows[j].header_index == c->flows[i].header_index) {
-				dup = true;
-				break;
-			}
-		}
-		if (dup)
-			continue;
-		if (cursor + 256 > 1024)
+		/* The generic encoder clears up to 256 bytes, even for a 24B rule.
+		 * Preserve eight zero terminator bytes beyond its maximum write.
+		 */
+		if (cursor + 256 + 8 > IPA_RTK_ROUTE_SIZE)
 			return -ENOSPC;
 		eq.bitmap = BIT(5);
 		eq.meq32_count = 1;
 		eq.meq32[0].offset = 16;
 		eq.meq32[0].mask = U32_MAX;
-		eq.meq32[0].value = be32_to_cpu(c->flows[i].nat.private_ip);
+		eq.meq32[0].value = be32_to_cpu(client->address);
 		len = ipa_rtk_route_encode(c->offload_buf + off + cursor, &eq, 26,
-			c->headers[c->flows[i].header_index].header.route_offset,
-			0, 0, prio, 711 + prio, 0, 0);
+			c->headers[client->header_index].route_offset,
+			1, 1, prio, 711 + prio, 0, 0);
 		if (len < 0)
 			return len;
 		cursor += len;
@@ -472,51 +468,31 @@ static int ipa_rtk_sync_dl_qmi(struct ipa_rtk_controller *c)
 		kfree(qreq);
 		return -ENOMEM;
 	}
-	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-		const struct ipa_rtk_nat_tuple *t = &c->flows[i].nat;
-		struct h5_filter_spec_ex_type *spec;
-
-		if (!c->flows[i].active)
-			continue;
-		spec = &qreq->filter_spec_ex_list[count++];
+	/* One WAN policy per supported protocol, as in stock. Linux authorizes
+	 * exact tuples through the independent NAT table; NAT misses must take
+	 * the IPA exception/CPU path. TCP FIN/RST remain under conntrack control.
+	 */
+	for (i = 0; i < IPA_RTK_DL_POLICY_COUNT; i++) {
+		struct h5_filter_spec_ex_type *spec = &qreq->filter_spec_ex_list[count++];
 		spec->ip_type = 1;
-		spec->filter_action = 2; /* HW action=2 (DST_NAT) */
+		spec->filter_action = 2;
 		spec->is_routing_table_index_valid = 1;
 		spec->route_table_index = 11;
 		spec->is_mux_id_valid = 1;
 		spec->mux_id = 1;
-		spec->rule_id = 0;
 		spec->is_rule_hashable = 1;
-		spec->filter_rule.rule_eq_bitmap =
-			BIT(1) | BIT(5) | BIT(6) | BIT(10) | BIT(11);
+		spec->filter_rule.rule_eq_bitmap = BIT(1) | BIT(5);
 		spec->filter_rule.protocol_eq_present = 1;
-		spec->filter_rule.protocol_eq = t->protocol;
-		spec->filter_rule.num_ihl_offset_range_16 = 2;
-		spec->filter_rule.ihl_offset_range_16[0].offset = 0;
-		spec->filter_rule.ihl_offset_range_16[0].range_low =
-			be16_to_cpu(t->remote_port);
-		spec->filter_rule.ihl_offset_range_16[0].range_high =
-			be16_to_cpu(t->remote_port);
-		spec->filter_rule.ihl_offset_range_16[1].offset = 2;
-		spec->filter_rule.ihl_offset_range_16[1].range_low =
-			be16_to_cpu(t->public_port);
-		spec->filter_rule.ihl_offset_range_16[1].range_high =
-			be16_to_cpu(t->public_port);
-		spec->filter_rule.num_offset_meq_32 = 2;
-		spec->filter_rule.offset_meq_32[0].offset = 12;
+		spec->filter_rule.protocol_eq = i ? IPPROTO_TCP : IPPROTO_UDP;
+		spec->filter_rule.num_offset_meq_32 = 1;
+		spec->filter_rule.offset_meq_32[0].offset = 16;
 		spec->filter_rule.offset_meq_32[0].mask = U32_MAX;
-		spec->filter_rule.offset_meq_32[0].value =
-			be32_to_cpu(t->remote_ip);
-		spec->filter_rule.offset_meq_32[1].offset = 16;
-		spec->filter_rule.offset_meq_32[1].mask = U32_MAX;
-		spec->filter_rule.offset_meq_32[1].value =
-			be32_to_cpu(t->public_ip);
-		if (t->protocol == IPPROTO_TCP) {
+		spec->filter_rule.offset_meq_32[0].value = be32_to_cpu(c->flow_manager.pool.public_ip);
+		if (i) {
 			spec->filter_rule.rule_eq_bitmap |= BIT(7);
 			spec->filter_rule.num_ihl_offset_meq_32 = 1;
 			spec->filter_rule.ihl_offset_meq_32[0].offset = 12;
 			spec->filter_rule.ihl_offset_meq_32[0].mask = 0x00050000U;
-			spec->filter_rule.ihl_offset_meq_32[0].value = 0;
 		}
 	}
 	qreq->filter_spec_ex_list_valid = count > 0;
@@ -536,25 +512,41 @@ static int ipa_rtk_flow_install(void *private, unsigned int index,
 				const struct ipa_rtk_flow flow[2])
 {
 	struct ipa_rtk_controller *c = private;
-	unsigned int hdr_idx;
+	unsigned int i, free = IPA_RTK_HEADER_CAPACITY, hdr;
 	int ret;
-
 	if (index >= IPA_RTK_FLOW_LIMIT || c->flows[index].active)
 		return -EINVAL;
-	ret = ipa_rtk_header_get(c, flow[1].ethernet, &hdr_idx);
+	for (i = 0; i < IPA_RTK_HEADER_CAPACITY; i++) {
+		struct ipa_rtk_client *client = &c->clients[i];
+		if (!client->refcount) { free = i; continue; }
+		if (client->address != flow[1].nat.private_ip)
+			continue;
+		/* A conflicting L2 destination must wait for old flows to drain. */
+		if (memcmp(c->headers[client->header_index].ethernet, flow[1].ethernet, ETH_HLEN))
+			return -ESTALE;
+		client->refcount++;
+		goto installed;
+	}
+	if (free == IPA_RTK_HEADER_CAPACITY)
+		return -ENOSPC;
+	ret = ipa_rtk_header_get(c, flow[1].ethernet, &hdr);
 	if (ret)
 		return ret;
+	i = free;
+	c->clients[i].address = flow[1].nat.private_ip;
+	c->clients[i].header_index = hdr;
+	c->clients[i].refcount = 1;
+	/* Record partial state before publication; manager remove handles any
+	 * failure. Never release a header when route rollback has failed.
+	 */
+installed:
 	c->flows[index].nat = flow[1].nat;
-	c->flows[index].header_index = hdr_idx;
+	c->flows[index].client_index = i;
 	c->flows[index].active = true;
-	ret = ipa_rtk_rebuild_routes(c);
-	if (!ret)
-		ret = ipa_rtk_sync_dl_qmi(c);
-	if (ret) {
-		c->flows[index].active = false;
-		ipa_rtk_rebuild_routes(c);
-		ipa_rtk_header_put(c, hdr_idx);
-		return ret;
+	if (c->clients[i].refcount == 1) {
+		ret = ipa_rtk_rebuild_routes(c);
+		if (ret)
+			return ret;
 	}
 	c->total_installs++;
 	return 0;
@@ -563,23 +555,23 @@ static int ipa_rtk_flow_install(void *private, unsigned int index,
 static int ipa_rtk_flow_remove(void *private, unsigned int index)
 {
 	struct ipa_rtk_controller *c = private;
-	unsigned int hdr_idx;
-	int ret, ret2;
-
+	struct ipa_rtk_client *client;
+	int ret;
 	if (index >= IPA_RTK_FLOW_LIMIT || !c->flows[index].active)
 		return 0;
-	hdr_idx = c->flows[index].header_index;
-	c->flows[index].active = false;
-	ret = ipa_rtk_sync_dl_qmi(c);
-	ret2 = ipa_rtk_rebuild_routes(c);
-	if (!ret && ret2)
-		ret = ret2;
-	ret2 = ipa_rtk_header_put(c, hdr_idx);
-	if (!ret && ret2)
-		ret = ret2;
-	if (!ret)
-		c->total_removes++;
-	return ret;
+	client = &c->clients[c->flows[index].client_index];
+	if (!client->refcount)
+		return -EUCLEAN;
+	if (--client->refcount == 0) {
+		ret = ipa_rtk_rebuild_routes(c);
+		if (ret) { client->refcount = 1; return ret; }
+		ret = ipa_rtk_header_put(c, client->header_index);
+		if (ret) { client->refcount = 1; return ret; }
+		memset(client, 0, sizeof(*client));
+	}
+	memset(&c->flows[index], 0, sizeof(c->flows[index]));
+	c->total_removes++;
+	return 0;
 }
 
 static int ipa_rtk_quiesce(struct ipa_rtk_controller *c)
@@ -681,10 +673,11 @@ static int ipa_rtk_offload_stop(struct ipa_rtk_controller *c)
 		struct h5_dl_fltr_req_ex_msg *qreq = kzalloc(sizeof(*qreq), GFP_KERNEL);
 		struct h5_dl_fltr_resp_ex_msg *qresp = kzalloc(sizeof(*qresp), GFP_KERNEL);
 
-		if (qreq && qresp)
-			send_dl_qmi(c->ipa, qreq, qresp);
+		ret = qreq && qresp ? send_dl_qmi(c->ipa, qreq, qresp) : -ENOMEM;
 		kfree(qresp);
 		kfree(qreq);
+		if (ret)
+			return ret;
 		c->dl_qmi_installed = false;
 	}
 	if (c->nat_changed) {
@@ -708,16 +701,15 @@ static int ipa_rtk_offload_stop(struct ipa_rtk_controller *c)
 		ret = ipa_table_rtk_release(&c->route_hash);
 	if (ret)
 		return ret;
-	for (i = 0; i < IPA_RTK_MAX_HEADERS; i++) {
-		if (c->headers[i].header.ipa) {
-			ret = ipa_header_rtk_release(&c->headers[i].header);
-			if (ret)
-				return ret;
-			memset(&c->headers[i], 0, sizeof(c->headers[i]));
-		}
-	}
+	ret = ipa_header_rtk_bank_release(&c->header_bank);
+	if (ret)
+		return ret;
+	memset(c->headers, 0, sizeof(c->headers));
+	memset(c->clients, 0, sizeof(c->clients));
+	kvfree(c->flows);
+	c->flows = NULL;
 	if (c->offload_buf) {
-		dma_free_coherent(&c->ipa_pdev->dev, 8192,
+		dma_free_coherent(&c->ipa_pdev->dev, IPA_RTK_OFFLOAD_SIZE,
 				  c->offload_buf, c->offload_addr);
 		c->offload_buf = NULL;
 	}
@@ -758,13 +750,17 @@ static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 
 	rules = kzalloc(sizeof(*rules), GFP_KERNEL);
 	c->notification = kzalloc(sizeof(*c->notification), GFP_KERNEL);
-	c->offload_buf = dma_alloc_coherent(&c->ipa_pdev->dev, 8192,
+	c->flows = kvcalloc(IPA_RTK_FLOW_LIMIT, sizeof(*c->flows), GFP_KERNEL);
+	c->offload_buf = dma_alloc_coherent(&c->ipa_pdev->dev, IPA_RTK_OFFLOAD_SIZE,
 					    &c->offload_addr, GFP_KERNEL);
-	if (!rules || !c->notification || !c->offload_buf) {
+	if (!rules || !c->notification || !c->offload_buf || !c->flows) {
 		ret = -ENOMEM;
 		goto fail;
 	}
-	memset(c->offload_buf, 0, 8192);
+	memset(c->offload_buf, 0, IPA_RTK_OFFLOAD_SIZE);
+	ret = ipa_header_rtk_bank_acquire(c->ipa, &c->header_bank);
+	if (ret)
+		goto fail;
 	ret = ipa_qmi_rtk_rules_copy(c->ipa, rules, &c->qmi_generation);
 	if (ret)
 		goto fail;
@@ -977,15 +973,27 @@ static ssize_t stage_show(struct device *dev, struct device_attribute *attr, cha
 			  READ_ONCE(c->stage), READ_ONCE(c->failed),
 			  stats.packets, stats.bytes, stats.invalid);
 	if (c->stage == 4) {
-		unsigned int i, active_flows = 0;
+		unsigned int i, active_flows = 0, clients = 0, pending = 0;
 
 		for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++)
 			if (READ_ONCE(c->flows[i].active))
 				active_flows++;
+		for (i = 0; i < IPA_RTK_HEADER_CAPACITY; i++)
+			if (READ_ONCE(c->clients[i].refcount))
+				clients++;
+		for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++)
+			if (READ_ONCE(c->flow_manager.entries[i].used) &&
+			    !READ_ONCE(c->flow_manager.entries[i].hardware))
+				pending++;
 		length += sysfs_emit_at(buf, length,
 			"offload active_flows=%u installs=%llu removes=%llu wan_ip=%pI4\n",
 			active_flows, READ_ONCE(c->total_installs),
 			READ_ONCE(c->total_removes), &c->flow_manager.pool.public_ip);
+		length += sysfs_emit_at(buf, length,
+			"capacity flows=%u clients=%u/%u pending=%u nat_base=%u nat_expansion=%u dl_policies=%u\n",
+			IPA_RTK_FLOW_LIMIT, clients, IPA_RTK_HEADER_CAPACITY, pending,
+			c->flow_manager.pool.count, c->flow_manager.pool.layout.expansion_count,
+			IPA_RTK_DL_POLICY_COUNT);
 	}
 	for (dir = 0; dir < 2; dir++) {
 		void __iomem *context;

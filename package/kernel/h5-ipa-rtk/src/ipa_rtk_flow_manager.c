@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/in.h>
 #include <linux/jiffies.h>
+#include <linux/slab.h>
+#include <linux/bitmap.h>
+#include <linux/jhash.h>
 #include "ipa_rtk_flow_manager.h"
 
 static bool same_tuple(const struct ipa_rtk_nat_tuple *a, const struct ipa_rtk_nat_tuple *b)
@@ -16,6 +19,67 @@ static bool same_flow(const struct ipa_rtk_flow *a, const struct ipa_rtk_flow *b
 	return same_tuple(&a->nat, &b->nat) && a->ingress_ifindex == b->ingress_ifindex &&
 		a->egress_ifindex == b->egress_ifindex && a->destination == b->destination &&
 		!memcmp(a->ethernet, b->ethernet, ETH_HLEN);
+}
+
+static u32 cookie_bucket(const void *binding, unsigned long cookie)
+{
+	return jhash_2words((u32)(unsigned long)binding, (u32)cookie, 0) &
+		(IPA_RTK_FLOW_BUCKETS - 1);
+}
+
+static u32 tuple_bucket(const void *binding, const struct ipa_rtk_nat_tuple *tuple)
+{
+	return jhash(tuple, sizeof(*tuple), (u32)(unsigned long)binding) &
+		(IPA_RTK_FLOW_BUCKETS - 1);
+}
+
+static struct ipa_rtk_managed_flow *find_cookie(struct ipa_rtk_flow_manager *m,
+		const void *binding, unsigned long cookie, unsigned int direction)
+{
+	struct ipa_rtk_cookie_ref *ref;
+	hlist_for_each_entry(ref, &m->cookies[cookie_bucket(binding, cookie)], node)
+		if ((direction > 1 || ref->direction == direction) &&
+		    ref->entry->binding == binding &&
+		    ref->entry->cookie[ref->direction] == cookie)
+			return ref->entry;
+	return NULL;
+}
+
+static struct ipa_rtk_managed_flow *find_tuple(struct ipa_rtk_flow_manager *m,
+		const void *binding, const struct ipa_rtk_nat_tuple *tuple)
+{
+	struct ipa_rtk_managed_flow *entry;
+	hlist_for_each_entry(entry, &m->tuples[tuple_bucket(binding, tuple)], tuple_node)
+		if (entry->binding == binding &&
+		    same_tuple(&entry->flow[entry->present[0] ? 0 : 1].nat, tuple))
+			return entry;
+	return NULL;
+}
+
+/* Called only after hardware references are gone, or for a never-published
+ * half-pair. No installed flow is evicted to make room for a new connection.
+ */
+static void forget_entry(struct ipa_rtk_flow_manager *m, struct ipa_rtk_managed_flow *entry)
+{
+	unsigned int dir;
+	hlist_del_init(&entry->tuple_node);
+	for (dir = 0; dir < 2; dir++)
+		hlist_del_init(&entry->refs[dir].node);
+	if (!list_empty(&entry->pending))
+		list_del_init(&entry->pending);
+	clear_bit(entry - m->entries, m->used);
+	memset(entry, 0, sizeof(*entry));
+}
+
+static void expire_pending(struct ipa_rtk_flow_manager *m)
+{
+	while (!list_empty(&m->pending)) {
+		struct ipa_rtk_managed_flow *entry =
+			list_first_entry(&m->pending, struct ipa_rtk_managed_flow, pending);
+		if (!time_after(jiffies, entry->lastused + 30 * HZ))
+			break;
+		forget_entry(m, entry);
+	}
 }
 
 static void fail_closed(struct ipa_rtk_flow_manager *m)
@@ -44,7 +108,7 @@ static int remove_entry(struct ipa_rtk_flow_manager *m, unsigned int index)
 		if (ret)
 			goto fail;
 	}
-	memset(entry, 0, sizeof(*entry));
+	forget_entry(m, entry);
 	return 0;
 fail:
 	fail_closed(m);
@@ -56,7 +120,7 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 {
 	struct ipa_rtk_flow_manager *m = private;
 	struct ipa_rtk_managed_flow *entry = NULL;
-	unsigned int dir, i, free_index = IPA_RTK_FLOW_LIMIT;
+	unsigned int dir;
 	int index = -1, ret = -EOPNOTSUPP;
 	bool lan_in, lan_out;
 
@@ -72,28 +136,26 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 	    (!dir && (!lan_in || flow->egress_ifindex != m->wan)) ||
 	    (dir && (flow->ingress_ifindex != m->wan || !lan_out)))
 		goto out;
-	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-		struct ipa_rtk_managed_flow *candidate = &m->entries[i];
-		if (!candidate->used) { free_index = i; continue; }
-		if (candidate->binding != binding)
-			continue;
-		if (candidate->present[dir] && candidate->cookie[dir] == cookie &&
-		    !same_tuple(&candidate->flow[dir].nat, &flow->nat)) {
-			ret = -ESTALE;
-			goto out;
-		}
-		if (same_tuple(&candidate->flow[candidate->present[0] ? 0 : 1].nat, &flow->nat)) {
-			index = i;
-			entry = candidate;
-			break;
-		}
+	expire_pending(m);
+	entry = find_cookie(m, binding, cookie, dir);
+	if (entry && !same_tuple(&entry->flow[dir].nat, &flow->nat)) {
+		ret = -ESTALE;
+		goto out;
 	}
+	if (!entry)
+		entry = find_tuple(m, binding, &flow->nat);
 	if (!entry) {
-		if (free_index == IPA_RTK_FLOW_LIMIT) { ret = -ENOSPC; goto out; }
-		index = free_index;
+		index = find_first_zero_bit(m->used, IPA_RTK_FLOW_LIMIT);
+		if (index == IPA_RTK_FLOW_LIMIT) { ret = -ENOSPC; goto out; }
 		entry = &m->entries[index];
+		INIT_LIST_HEAD(&entry->pending);
 		entry->binding = binding;
 		entry->used = true;
+		entry->lastused = jiffies;
+		set_bit(index, m->used);
+		list_add_tail(&entry->pending, &m->pending);
+	} else {
+		index = entry - m->entries;
 	}
 	if (entry->present[dir]) {
 		/* A cookie is one direction of one NF flow, not a replaceable tuple
@@ -107,7 +169,15 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 	entry->flow[dir] = *flow;
 	entry->cookie[dir] = cookie;
 	entry->present[dir] = true;
-	if (!entry->present[!dir]) { ret = -EAGAIN; goto out; }
+	entry->refs[dir].entry = entry;
+	entry->refs[dir].direction = dir;
+	hlist_add_head(&entry->refs[dir].node, &m->cookies[cookie_bucket(binding, cookie)]);
+	if (!entry->present[!dir]) {
+		hlist_add_head(&entry->tuple_node, &m->tuples[tuple_bucket(binding, &flow->nat)]);
+		ret = -EAGAIN;
+		goto out;
+	}
+	list_del_init(&entry->pending);
 	/* No success is reported for a pending half-pair. Only the callback that
 	 * has both independently supplied directions may activate hardware.
 	 */
@@ -116,7 +186,7 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 		if (m->pool.failed)
 			fail_closed(m);
 		else
-			memset(entry, 0, sizeof(*entry));
+			forget_entry(m, entry);
 		goto out;
 	}
 	/* install must roll back partial classifiers or remove must handle them. */
@@ -138,20 +208,13 @@ out:
 static int managed_destroy(void *private, const void *binding, unsigned long cookie)
 {
 	struct ipa_rtk_flow_manager *m = private;
-	unsigned int i, dir;
+	struct ipa_rtk_managed_flow *entry;
 	int ret = -ENOENT;
 	mutex_lock(&m->lock);
 	if (!m->active || m->failed) { ret = m->failed ? -ESHUTDOWN : -ENOENT; goto out; }
-	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-		struct ipa_rtk_managed_flow *entry = &m->entries[i];
-		if (!entry->used || entry->binding != binding)
-			continue;
-		for (dir = 0; dir < 2; dir++)
-			if (entry->present[dir] && entry->cookie[dir] == cookie) {
-				ret = remove_entry(m, i);
-				goto out;
-			}
-	}
+	entry = find_cookie(m, binding, cookie, 2);
+	if (entry)
+		ret = remove_entry(m, entry - m->entries);
 out:
 	mutex_unlock(&m->lock);
 	return ret;
@@ -161,28 +224,22 @@ static int managed_stats(void *private, const void *binding, unsigned long cooki
 			 struct flow_stats *stats)
 {
 	struct ipa_rtk_flow_manager *m = private;
-	unsigned int i;
+	struct ipa_rtk_managed_flow *entry;
+	u32 timestamp;
 	int ret = -ENOENT;
 	mutex_lock(&m->lock);
 	if (!m->active || m->failed) { ret = m->failed ? -ESHUTDOWN : -ENOENT; goto out; }
-	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-		struct ipa_rtk_managed_flow *entry = &m->entries[i];
-		u32 timestamp;
-		if (!entry->used || !entry->hardware || entry->binding != binding ||
-		    (entry->cookie[0] != cookie && entry->cookie[1] != cookie))
-			continue;
-		timestamp = ipa_rtk_nat_pool_timestamp(&m->pool, &entry->nat);
-		if (timestamp != entry->timestamp) {
-			entry->timestamp = timestamp;
-			entry->lastused = jiffies;
-		}
-		/* IPA NAT timestamp is shared by the two directions. Never invent
-		 * packet/byte counters; report only the activity actually observed.
-		 */
-		flow_stats_update(stats, 0, 0, 0, entry->lastused, FLOW_ACTION_HW_STATS_DELAYED);
-		ret = 0;
-		break;
+	entry = find_cookie(m, binding, cookie, 2);
+	if (!entry || !entry->hardware)
+		goto out;
+	timestamp = ipa_rtk_nat_pool_timestamp(&m->pool, &entry->nat);
+	if (timestamp != entry->timestamp) {
+		entry->timestamp = timestamp;
+		entry->lastused = jiffies;
 	}
+	/* IPA timestamps are shared by both directions; never invent counters. */
+	flow_stats_update(stats, 0, 0, 0, entry->lastused, FLOW_ACTION_HW_STATS_DELAYED);
+	ret = 0;
 out:
 	mutex_unlock(&m->lock);
 	return ret;
@@ -193,6 +250,10 @@ static void managed_flush(void *private, const void *binding)
 	struct ipa_rtk_flow_manager *m = private;
 	unsigned int i;
 	mutex_lock(&m->lock);
+	if (!m->active) {
+		mutex_unlock(&m->lock);
+		return;
+	}
 	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++)
 		if (m->entries[i].used && m->entries[i].binding == binding) {
 			if (!m->failed)
@@ -221,17 +282,30 @@ int ipa_rtk_flow_manager_start(struct ipa_rtk_flow_manager *m, struct ipa *ipa,
 	    lan <= 0 || wan <= 0 || lan == wan || bridge == wan)
 		return -EINVAL;
 	mutex_lock(&m->lock);
-	ret = ipa_rtk_nat_pool_create(&m->pool, ipa, public_ip, source_metadata, destination_metadata);
-	if (ret) {
-		mutex_unlock(&m->lock);
-		return ret;
+	m->entries = kvcalloc(IPA_RTK_FLOW_LIMIT, sizeof(*m->entries), GFP_KERNEL);
+	m->tuples = kvcalloc(IPA_RTK_FLOW_BUCKETS, sizeof(*m->tuples), GFP_KERNEL);
+	m->cookies = kvcalloc(IPA_RTK_FLOW_BUCKETS, sizeof(*m->cookies), GFP_KERNEL);
+	m->used = bitmap_zalloc(IPA_RTK_FLOW_LIMIT, GFP_KERNEL);
+	if (!m->entries || !m->tuples || !m->cookies || !m->used) {
+		ret = -ENOMEM;
+		goto free;
 	}
+	INIT_LIST_HEAD(&m->pending);
+	ret = ipa_rtk_nat_pool_create(&m->pool, ipa, public_ip, source_metadata, destination_metadata);
+	if (ret)
+		goto free;
 	m->lan = lan; m->bridge = bridge; m->wan = wan;
 	m->ops = ops; m->private = private;
 	m->failed = false;
 	m->active = true;
 	mutex_unlock(&m->lock);
 	return 0;
+free:
+	kvfree(m->entries); kvfree(m->tuples); kvfree(m->cookies);
+	bitmap_free(m->used);
+	m->entries = NULL; m->tuples = NULL; m->cookies = NULL; m->used = NULL;
+	mutex_unlock(&m->lock);
+	return ret;
 }
 
 int ipa_rtk_flow_manager_stop(struct ipa_rtk_flow_manager *m)
@@ -250,8 +324,12 @@ int ipa_rtk_flow_manager_stop(struct ipa_rtk_flow_manager *m)
 	ret = ipa_rtk_nat_pool_destroy(&m->pool);
 	if (ret)
 		fail_closed(m);
-	else
+	else {
 		m->active = false;
+		kvfree(m->entries); kvfree(m->tuples); kvfree(m->cookies);
+		bitmap_free(m->used);
+		m->entries = NULL; m->tuples = NULL; m->cookies = NULL; m->used = NULL;
+	}
 out:
 	mutex_unlock(&m->lock);
 	return ret;

@@ -3,8 +3,16 @@
 #define _IPA_RTK_FLOW_MANAGER_H_
 #include "ipa_rtk_flowtable.h"
 #include "ipa_rtk_nat_pool.h"
+#include <linux/list.h>
 
-#define IPA_RTK_FLOW_LIMIT 16
+#define IPA_RTK_FLOW_LIMIT 4000
+#define IPA_RTK_FLOW_BUCKETS 1024
+struct ipa_rtk_managed_flow;
+struct ipa_rtk_cookie_ref {
+	struct hlist_node node;
+	struct ipa_rtk_managed_flow *entry;
+	unsigned int direction;
+};
 struct ipa_rtk_flow_manager_ops {
 	/* Publish/remove ONLY exact per-flow classifiers and route/header state.
 	 * NAT pool owns translation and remains alive until every filter is gone.
@@ -17,6 +25,9 @@ struct ipa_rtk_flow_manager_ops {
 	void (*quiesce)(void *private);
 };
 struct ipa_rtk_managed_flow {
+	struct hlist_node tuple_node;
+	struct ipa_rtk_cookie_ref refs[2];
+	struct list_head pending;
 	const void *binding;
 	unsigned long cookie[2], lastused;
 	struct ipa_rtk_flow flow[2];
@@ -27,7 +38,10 @@ struct ipa_rtk_managed_flow {
 struct ipa_rtk_flow_manager {
 	struct mutex lock;
 	struct ipa_rtk_nat_pool pool;
-	struct ipa_rtk_managed_flow entries[IPA_RTK_FLOW_LIMIT];
+	struct ipa_rtk_managed_flow *entries;
+	struct hlist_head *tuples, *cookies;
+	unsigned long *used;
+	struct list_head pending;
 	const struct ipa_rtk_flow_manager_ops *ops;
 	void *private;
 	int lan, bridge, wan;

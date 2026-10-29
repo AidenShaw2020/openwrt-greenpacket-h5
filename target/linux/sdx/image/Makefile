@@ -48,7 +48,7 @@ TARGET_DEVICES += greenpacket_h5-200q1-usb-pcie-compat
 define Device/greenpacket_h5-200q1-web
   $(call Device/greenpacket_h5-200q1-usb-pcie-compat)
   DEVICE_VARIANT := Experimental LuCI HTTP RAM test
-  DEVICE_PACKAGES += luci
+  DEVICE_PACKAGES += luci uhttpd-mod-ucode
 endef
 TARGET_DEVICES += greenpacket_h5-200q1-web
 

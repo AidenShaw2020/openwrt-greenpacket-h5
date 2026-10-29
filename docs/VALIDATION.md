@@ -81,40 +81,90 @@ with `flowtable ft { devices = { "eth0", "qmapmux0.0" }; flags offload; }`, and 
 live TCP/UDP `[HW_OFFLOAD]` forwarding as well as `stage 4 -> 0 -> 4` cycling under
 active offloaded flows.
 
-### Constraints & Pitfalls of Higher Parallel Flow Limits (`IPA_RTK_FLOW_LIMIT`)
+### Capacity implementation (2026-10-29)
 
-The driver defaults to `IPA_RTK_FLOW_LIMIT = 16` simultaneous hardware-offloaded
-5-tuples (excess flows transparently remain on Linux software `nf_flowtable` / normal
-routing). Raising `IPA_RTK_FLOW_LIMIT` significantly higher carries four hardware and
-protocol trade-offs:
+The revised IPv4 offload implementation replaces the original 16-flow limit with
+an admission limit of 4000 paired connections and 200 distinct LAN IPv4 clients.
+These are resource limits, not a measured guarantee of throughput for 200 users.
+IPv6 continues through the software path.
 
-1. **NAT Table Birthday-Paradox Hash Collisions (`ipa_rtk_nat_pool`)**:
-   The hardware IPv4 NAT table allocated in DMA memory has `4096` entries (`12-bit` index)
-   with `expansion_count = 0` (no collision chaining in the direct index table). Each flow
-   hashes both `(private_ip, private_port, target_ip, target_port, proto)` and
-   `(target_ip, target_port, public_ip, public_port, proto)`. By the birthday paradox,
-   the probability that at least one new flow collides with an existing slot is
-   approximately $1 - e^{-N^2 / 4096}$ (~6% at $N=16$, ~32% at $N=40$, ~63% at $N=64$).
-   Colliding flows are safely rejected with `-ENOSPC` and fall back to software forwarding.
-2. **QMI `0x0037` Full-Table Rewrite Latency**:
-   `QMI_IPA_INSTALL_FILTER_RULE_EX_REQ_V01` (`0x0037`) is a full-table replacement RPC:
-   every flow insertion or removal sends the entire active rule set (each `h5_filter_spec_ex_type`
-   is 216 bytes, up to `H5_QMI_IPA_MAX_FILTERS_EX = 192` / ~33 KB payload) over QRTR to
-   the modem DSP, which rebuilds the modem-side IMEM filter table and responds with `0x0024`.
-   At high flow counts ($N \ge 64$), connection bursts incur higher per-flow QMI serialization
-   and DSP table-rebuild latency.
-3. **AP Header Insertion SRAM Capacity (`IPA_MEM_AP_HEADER`, 480 bytes)**:
-   The AP-owned header insertion partition (`offset 0x0528`, `size 0x01e0` = 480 bytes)
-   holds 30 slots of 16 bytes (slot 0 reserved, leaving **29 usable 14-byte Ethernet L2
-   header slots**). Because `h5_ipa_rtk` deduplicates and reference-counts headers by
-   `(dst_mac, src_mac)`, all flows to the same LAN host or downstream L2 switch share a
-   single header slot; however, more than 29 simultaneous distinct LAN client MAC addresses
-   cannot be offloaded in hardware at the same time.
-4. **AP Route Table Ping-Pong Buffer Size (`offload_buf`, 1024 bytes)**:
-   Route table index `11` (`LAN_RTK`) uses two 1024-byte DMA ping-pong buffers. Each unique
-   `(private_ip, header_index)` pair emits one 24-byte route rule (plus an 8-byte terminator),
-   bounding simultaneous distinct hardware-offloaded LAN IPv4 hosts to `42` per 1 KB buffer
-   (multiple flows from the same LAN IPv4 share one route rule).
+The exact H5 stock configuration requests 4000 NAT entries in HYBRID mode. Its
+original NAT library calculates a DDR layout of 4096 base and 800 expansion
+entries. The revised port uses that DDR layout with independent destination NAT
+and source-index collision chains. Exhaustion of either expansion graph can
+occur before the 4000 admission limit; those connections remain in software.
+Duplicate lookup keys are rejected, and uncertain DMA publication failures
+quarantine the pool until reset. Head deletion preserves surviving successors.
+
+Two fixed modem downlink policies (UDP and TCP excluding FIN/RST) replace the
+per-connection QMI table updates. Exact translations are still authorized by
+Linux flowtable callbacks. Hardware NAT miss handling and unsolicited traffic
+must be verified during the device test before treating this policy as validated.
+
+Connection cookies and normalized tuples use separate hash indexes; periodic
+hardware statistics do not scan all 4000 entries. Unpaired directions use a
+bounded pending queue and expire without evicting active Linux-authorized flows.
+
+Client routes are reference-counted separately from connections and rebuilt
+only when a client appears or disappears. Two 8192-byte route buffers replace
+the original 1024-byte buffers. Two hundred system-memory header processing
+contexts use the stock IPA5 NONE/HDR_ADD format with absolute header addresses.
+The system context base is leased only when unused; modem-owned DDR is never
+followed or replaced. Routes are drained before a context slot is reused.
+
+The production NAT pool and manager passed host tests with ASan/UBSan:
+
+- 200 clients deliberately sharing both hash buckets;
+- 15000 insertion/deletion churn operations with independent wire-graph lookups;
+- all 800 expansion entries, exhaustion, duplicate keys and head promotion;
+- 4000 paired connections, deletion, pending-pair expiry and callbacks after stop;
+- injected publication-command failures retaining uncertain DMA state;
+- production client/header/route code with 200 distinct MAC/IP destinations and
+  4000 referencing flows, all system-context offsets, randomized teardown and
+  failed route-publication retention.
+
+The backend/controller passed ARM kernel compilation and the complete source
+export passed a clean-index application check against the pinned vanilla OpenWrt.
+A complete r3 image was installed with configuration preserved by sysupgrade:
+
+- image SHA256: `96d16bfe7b5db9b940efb1df1a9d7218db899fb1b9499e5a8849c3af35d88755`;
+- installed controller SHA256: `11f8d576522eb4af04c354e011e5e2f34aae30e06e6757d72b009471759fe8cd`;
+- installed IPA SHA256: `2a36612aad0ef3d07bda4df3e892bda098843a87fa1238171a26a0c940be37a9`.
+
+The hashes were checked in the image and again in the device's read-only `/rom`.
+Main-system boot, mobile registration, WAN data, stage4/failed0 and connection
+cleanup passed. Independent recovery remained read-only and matched its earlier
+verified SHA256 `63ee6f820c5eb66862bfc0fa85a966683e00d0ce7bb126151fba338cb663a968`.
+Do not replace IPA while restarting an already-running modem: that diagnostic
+attempt hit the modem HWP initialization timeout. Complete-image boots passed.
+
+Two live batches of 200 simultaneous HTTPS downloads (1 MB each) completed
+200/200. Both the driver and conntrack reported 200 simultaneous hardware flows.
+The last batch transferred 200 MB in 18.016 s (88.81 Mbps including 200 TLS
+handshakes and connection setup/teardown). In two fully populated steady samples,
+CPU was 23.42% and 11.93%, softirq 0.90% and 0.92%. Other samples include setup,
+teardown and concurrent management work; aggregate CPU peaks alone are not a
+measurement of forwarding cost. The device owner observed peaks while opening
+LuCI.
+
+A separate 4 MB HTTPS transfer advanced the dedicated Realtek external TX1
+hardware tail/close counters from 63062 to 282, i.e. 2756 completions modulo
+65536. This verifies actual payload movement through the IPA-to-Realtek ring in
+addition to the software HW_OFFLOAD flags. Deliberately colliding TCP source
+ports also completed 12/12 HTTP transfers in the preceding capacity revision.
+
+Live tests used one physical LAN computer. Two hundred different MAC/IP clients
+were exercised in the production-code model, not on 200 physical devices.
+
+A high-concurrency cleartext HTTP close/FIN test remains a known diagnostic
+limitation: some responses stop before their advertised length. This occurred
+with hardware offload, software flowtable, and also classic CPU NAT with both
+flowtable modes disabled (198/200 classic completions in one batch). A direct
+control through the PC's other Internet connection completed 200/200. HTTP
+keep-alive and the two HTTPS batches completed 200/200 through H5. Header-only
+captures show repeated incoming server FIN packets on affected connections;
+the root cause is not established. Do not attribute this to the operator or
+claim that it has been fixed by the capacity change.
 
 ## Source Checks
 
@@ -174,3 +224,26 @@ keeps the final sysupgrade as a separate manual command.
 - Bridge/IP passthrough.
 - Automatic stock-to-OpenWrt installation for third-party devices.
 - Bit-for-bit reproducibility or privacy of a new third-party build.
+
+## Native LuCI handler (2026-10-29)
+
+The device owner reported 436/70 Mbps through the accelerated CPE and a brief
+CPU peak when opening even the LuCI login page. The device exposes one CPU at
+1497600 kHz with the performance governor. uhttpd was serving LuCI through
+`/www/cgi-bin/luci`, starting the ucode CGI interpreter for requests; its config
+retained the old Lua prefix and had no native ucode prefix/module.
+
+Installed the matching `uhttpd-mod-ucode` package and configured the standard
+`/cgi-bin/luci=/usr/share/ucode/luci/uhttpd.uc` handler. Only uhttpd restarted;
+radio, kernel modules, firewall and IPA were unchanged. Five baseline login
+requests averaged 0.368851 s. After switching, the first request was 0.314672 s
+and four warm requests averaged 0.183894 s. Both modes returned the normal
+HTTP403 login form; authentication fields remained present. The owner confirmed
+that the page became substantially faster. These are response-time results,
+not a measurement proving that all CPU peaks have disappeared.
+
+The package is selected by all LuCI H5 image profiles and the three seed configs.
+The idempotent board default adds the native handler to preserved configurations
+without replacing a custom handler. The currently running device received the
+package/config fix live; a complete image is also built for subsequent upgrades.
+No causal connection with the separate cleartext HTTP transfer issue is established.

@@ -1,0 +1,142 @@
+Subject: net: ipa: lease system header contexts for 200 H5 clients
+
+Use stock IPA5 NONE/HDR_ADD processing contexts with absolute header addresses.
+Refuse occupied system context bases and drain routes before releasing memory.
+
+--- a/drivers/net/ipa/ipa_table.c
++++ b/drivers/net/ipa/ipa_table.c
+@@ -782,9 +782,111 @@
+ }
+ 
+ /* SPDX-License-Identifier: GPL-2.0-only */
++/* SPDX-License-Identifier: GPL-2.0-only */
+ static DEFINE_MUTEX(ipa_rtk_table_lock);
+ static LIST_HEAD(ipa_rtk_table_owners);
+ static LIST_HEAD(ipa_rtk_header_owners);
++
++/* IPA5 register offset and NONE/HDR_ADD processing-context ABI are shared
++ * with stock ipahal. System contexts use 32-byte route-offset units and carry
++ * absolute header addresses, avoiding the raw header's 2044-byte offset cap.
++ */
++#define IPA_RTK_SYSTEM_CONTEXT_BASE 0x470
++#define IPA_RTK_HEADER_BANK_SIZE (IPA_RTK_HEADER_CAPACITY * (32 + 16))
++static struct ipa_rtk_header_bank *ipa_rtk_header_bank_owner;
++
++static int ipa_rtk_context_base_write(struct ipa *ipa, u32 value)
++{
++	struct gsi_trans *trans = ipa_cmd_trans_alloc(ipa, 2);
++	if (!trans)
++		return -EBUSY;
++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
++	ipa_cmd_register_write_add(trans, IPA_RTK_SYSTEM_CONTEXT_BASE, value, U32_MAX, false);
++	gsi_trans_commit_wait(trans);
++	return 0;
++}
++
++int ipa_header_rtk_bank_acquire(struct ipa *ipa, struct ipa_rtk_header_bank *bank)
++{
++	int ret = -EBUSY;
++	if (!ipa || !bank || bank->ipa || ipa->version != IPA_VERSION_5_0 ||
++	    !ipa->setup_complete || !of_machine_is_compatible("greenpacket,h5-200q1"))
++		return -EINVAL;
++	mutex_lock(&ipa_rtk_table_lock);
++	if (ipa_rtk_header_bank_owner || readl(ipa->reg_virt + IPA_RTK_SYSTEM_CONTEXT_BASE))
++		goto out;
++	bank->buffer = dma_alloc_coherent(ipa->dev, IPA_RTK_HEADER_BANK_SIZE,
++					 &bank->address, GFP_KERNEL);
++	if (!bank->buffer) { ret = -ENOMEM; goto out; }
++	if (upper_32_bits(bank->address) || !IS_ALIGNED(bank->address, 32)) {
++		ret = -ERANGE;
++		goto free;
++	}
++	memset(bank->buffer, 0, IPA_RTK_HEADER_BANK_SIZE);
++	dma_wmb();
++	ret = ipa_rtk_context_base_write(ipa, lower_32_bits(bank->address));
++	if (ret)
++		goto free;
++	bank->ipa = ipa;
++	ipa_rtk_header_bank_owner = bank;
++	goto out;
++free:
++	dma_free_coherent(ipa->dev, IPA_RTK_HEADER_BANK_SIZE, bank->buffer, bank->address);
++	bank->buffer = NULL;
++out:
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_header_rtk_bank_acquire);
++
++/* Caller must not reuse a slot until every previous route reader is drained. */
++int ipa_header_rtk_bank_set(struct ipa_rtk_header_bank *bank, unsigned int slot,
++			    const u8 ethernet[14])
++{
++	__le32 *context;
++	u32 header_offset;
++	if (!bank || !bank->ipa || !ethernet || slot >= IPA_RTK_HEADER_CAPACITY)
++		return -EINVAL;
++	if (readl(bank->ipa->reg_virt + IPA_RTK_SYSTEM_CONTEXT_BASE) != bank->address)
++		return -ESTALE;
++	header_offset = IPA_RTK_HEADER_CAPACITY * 32 + slot * 16;
++	memcpy(bank->buffer + header_offset, ethernet, 14);
++	context = bank->buffer + slot * 32;
++	memset(context, 0, 32);
++	/* TLV type=HDR_ADD(1), length=2, header length=14; address, high=0,
++	 * followed by the all-zero END TLV. Never insert a processing command.
++	 */
++	context[0] = cpu_to_le32(1 | 2 << 8 | 14 << 16);
++	context[1] = cpu_to_le32(lower_32_bits(bank->address) + header_offset);
++	dma_wmb();
++	return 0;
++}
++EXPORT_SYMBOL_GPL(ipa_header_rtk_bank_set);
++
++int ipa_header_rtk_bank_release(struct ipa_rtk_header_bank *bank)
++{
++	int ret = 0;
++	if (!bank)
++		return -EINVAL;
++	mutex_lock(&ipa_rtk_table_lock);
++	if (!bank->ipa)
++		goto out;
++	if (ipa_rtk_header_bank_owner != bank ||
++	    readl(bank->ipa->reg_virt + IPA_RTK_SYSTEM_CONTEXT_BASE) != bank->address) {
++		ret = -ESTALE;
++		goto out;
++	}
++	ret = ipa_rtk_context_base_write(bank->ipa, 0);
++	if (ret)
++		goto out;
++	dma_free_coherent(bank->ipa->dev, IPA_RTK_HEADER_BANK_SIZE, bank->buffer, bank->address);
++	memset(bank, 0, sizeof(*bank));
++	ipa_rtk_header_bank_owner = NULL;
++out:
++	mutex_unlock(&ipa_rtk_table_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ipa_header_rtk_bank_release);
+ 
+ static u64 ipa_rtk_table_pointer(const struct ipa_rtk_table *table)
+ {
+--- a/drivers/net/ipa/ipa_table_rtk.h
++++ b/drivers/net/ipa/ipa_table_rtk.h
+@@ -4,6 +4,20 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/list.h>
+ struct ipa;
++
++#define IPA_RTK_HEADER_CAPACITY 200
++/* Dedicated system processing contexts. The global base must be unused; the
++ * lease never follows, replaces, or frees modem-owned system memory.
++ */
++struct ipa_rtk_header_bank {
++	struct ipa *ipa;
++	void *buffer;
++	dma_addr_t address;
++};
++int ipa_header_rtk_bank_acquire(struct ipa *ipa, struct ipa_rtk_header_bank *bank);
++int ipa_header_rtk_bank_set(struct ipa_rtk_header_bank *bank, unsigned int slot,
++			    const u8 ethernet[14]);
++int ipa_header_rtk_bank_release(struct ipa_rtk_header_bank *bank);
+ 
+ struct ipa_rtk_table {
+ 	struct list_head node;

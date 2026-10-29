@@ -323,7 +323,6 @@ index 00000000..475aeb57
 ++ 
 diff --git a/package/kernel/h5-ipa-rtk/Makefile b/package/kernel/h5-ipa-rtk/Makefile
 new file mode 100644
-index 00000000..80be9e55
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/Makefile
 @@ -0,0 +1,39 @@
@@ -334,7 +333,7 @@ index 00000000..80be9e55
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=1
++PKG_RELEASE:=3
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -2736,13 +2735,15 @@ index 00000000..df1bb738
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c
 new file mode 100644
-index 00000000..ee453bb9
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,336 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/in.h>
 +#include <linux/jiffies.h>
++#include <linux/slab.h>
++#include <linux/bitmap.h>
++#include <linux/jhash.h>
 +#include "ipa_rtk_flow_manager.h"
 +
 +static bool same_tuple(const struct ipa_rtk_nat_tuple *a, const struct ipa_rtk_nat_tuple *b)
@@ -2758,6 +2759,67 @@ index 00000000..ee453bb9
 +	return same_tuple(&a->nat, &b->nat) && a->ingress_ifindex == b->ingress_ifindex &&
 +		a->egress_ifindex == b->egress_ifindex && a->destination == b->destination &&
 +		!memcmp(a->ethernet, b->ethernet, ETH_HLEN);
++}
++
++static u32 cookie_bucket(const void *binding, unsigned long cookie)
++{
++	return jhash_2words((u32)(unsigned long)binding, (u32)cookie, 0) &
++		(IPA_RTK_FLOW_BUCKETS - 1);
++}
++
++static u32 tuple_bucket(const void *binding, const struct ipa_rtk_nat_tuple *tuple)
++{
++	return jhash(tuple, sizeof(*tuple), (u32)(unsigned long)binding) &
++		(IPA_RTK_FLOW_BUCKETS - 1);
++}
++
++static struct ipa_rtk_managed_flow *find_cookie(struct ipa_rtk_flow_manager *m,
++		const void *binding, unsigned long cookie, unsigned int direction)
++{
++	struct ipa_rtk_cookie_ref *ref;
++	hlist_for_each_entry(ref, &m->cookies[cookie_bucket(binding, cookie)], node)
++		if ((direction > 1 || ref->direction == direction) &&
++		    ref->entry->binding == binding &&
++		    ref->entry->cookie[ref->direction] == cookie)
++			return ref->entry;
++	return NULL;
++}
++
++static struct ipa_rtk_managed_flow *find_tuple(struct ipa_rtk_flow_manager *m,
++		const void *binding, const struct ipa_rtk_nat_tuple *tuple)
++{
++	struct ipa_rtk_managed_flow *entry;
++	hlist_for_each_entry(entry, &m->tuples[tuple_bucket(binding, tuple)], tuple_node)
++		if (entry->binding == binding &&
++		    same_tuple(&entry->flow[entry->present[0] ? 0 : 1].nat, tuple))
++			return entry;
++	return NULL;
++}
++
++/* Called only after hardware references are gone, or for a never-published
++ * half-pair. No installed flow is evicted to make room for a new connection.
++ */
++static void forget_entry(struct ipa_rtk_flow_manager *m, struct ipa_rtk_managed_flow *entry)
++{
++	unsigned int dir;
++	hlist_del_init(&entry->tuple_node);
++	for (dir = 0; dir < 2; dir++)
++		hlist_del_init(&entry->refs[dir].node);
++	if (!list_empty(&entry->pending))
++		list_del_init(&entry->pending);
++	clear_bit(entry - m->entries, m->used);
++	memset(entry, 0, sizeof(*entry));
++}
++
++static void expire_pending(struct ipa_rtk_flow_manager *m)
++{
++	while (!list_empty(&m->pending)) {
++		struct ipa_rtk_managed_flow *entry =
++			list_first_entry(&m->pending, struct ipa_rtk_managed_flow, pending);
++		if (!time_after(jiffies, entry->lastused + 30 * HZ))
++			break;
++		forget_entry(m, entry);
++	}
 +}
 +
 +static void fail_closed(struct ipa_rtk_flow_manager *m)
@@ -2786,7 +2848,7 @@ index 00000000..ee453bb9
 +		if (ret)
 +			goto fail;
 +	}
-+	memset(entry, 0, sizeof(*entry));
++	forget_entry(m, entry);
 +	return 0;
 +fail:
 +	fail_closed(m);
@@ -2798,7 +2860,7 @@ index 00000000..ee453bb9
 +{
 +	struct ipa_rtk_flow_manager *m = private;
 +	struct ipa_rtk_managed_flow *entry = NULL;
-+	unsigned int dir, i, free_index = IPA_RTK_FLOW_LIMIT;
++	unsigned int dir;
 +	int index = -1, ret = -EOPNOTSUPP;
 +	bool lan_in, lan_out;
 +
@@ -2814,28 +2876,26 @@ index 00000000..ee453bb9
 +	    (!dir && (!lan_in || flow->egress_ifindex != m->wan)) ||
 +	    (dir && (flow->ingress_ifindex != m->wan || !lan_out)))
 +		goto out;
-+	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-+		struct ipa_rtk_managed_flow *candidate = &m->entries[i];
-+		if (!candidate->used) { free_index = i; continue; }
-+		if (candidate->binding != binding)
-+			continue;
-+		if (candidate->present[dir] && candidate->cookie[dir] == cookie &&
-+		    !same_tuple(&candidate->flow[dir].nat, &flow->nat)) {
-+			ret = -ESTALE;
-+			goto out;
-+		}
-+		if (same_tuple(&candidate->flow[candidate->present[0] ? 0 : 1].nat, &flow->nat)) {
-+			index = i;
-+			entry = candidate;
-+			break;
-+		}
++	expire_pending(m);
++	entry = find_cookie(m, binding, cookie, dir);
++	if (entry && !same_tuple(&entry->flow[dir].nat, &flow->nat)) {
++		ret = -ESTALE;
++		goto out;
 +	}
++	if (!entry)
++		entry = find_tuple(m, binding, &flow->nat);
 +	if (!entry) {
-+		if (free_index == IPA_RTK_FLOW_LIMIT) { ret = -ENOSPC; goto out; }
-+		index = free_index;
++		index = find_first_zero_bit(m->used, IPA_RTK_FLOW_LIMIT);
++		if (index == IPA_RTK_FLOW_LIMIT) { ret = -ENOSPC; goto out; }
 +		entry = &m->entries[index];
++		INIT_LIST_HEAD(&entry->pending);
 +		entry->binding = binding;
 +		entry->used = true;
++		entry->lastused = jiffies;
++		set_bit(index, m->used);
++		list_add_tail(&entry->pending, &m->pending);
++	} else {
++		index = entry - m->entries;
 +	}
 +	if (entry->present[dir]) {
 +		/* A cookie is one direction of one NF flow, not a replaceable tuple
@@ -2849,7 +2909,15 @@ index 00000000..ee453bb9
 +	entry->flow[dir] = *flow;
 +	entry->cookie[dir] = cookie;
 +	entry->present[dir] = true;
-+	if (!entry->present[!dir]) { ret = -EAGAIN; goto out; }
++	entry->refs[dir].entry = entry;
++	entry->refs[dir].direction = dir;
++	hlist_add_head(&entry->refs[dir].node, &m->cookies[cookie_bucket(binding, cookie)]);
++	if (!entry->present[!dir]) {
++		hlist_add_head(&entry->tuple_node, &m->tuples[tuple_bucket(binding, &flow->nat)]);
++		ret = -EAGAIN;
++		goto out;
++	}
++	list_del_init(&entry->pending);
 +	/* No success is reported for a pending half-pair. Only the callback that
 +	 * has both independently supplied directions may activate hardware.
 +	 */
@@ -2858,7 +2926,7 @@ index 00000000..ee453bb9
 +		if (m->pool.failed)
 +			fail_closed(m);
 +		else
-+			memset(entry, 0, sizeof(*entry));
++			forget_entry(m, entry);
 +		goto out;
 +	}
 +	/* install must roll back partial classifiers or remove must handle them. */
@@ -2880,20 +2948,13 @@ index 00000000..ee453bb9
 +static int managed_destroy(void *private, const void *binding, unsigned long cookie)
 +{
 +	struct ipa_rtk_flow_manager *m = private;
-+	unsigned int i, dir;
++	struct ipa_rtk_managed_flow *entry;
 +	int ret = -ENOENT;
 +	mutex_lock(&m->lock);
 +	if (!m->active || m->failed) { ret = m->failed ? -ESHUTDOWN : -ENOENT; goto out; }
-+	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-+		struct ipa_rtk_managed_flow *entry = &m->entries[i];
-+		if (!entry->used || entry->binding != binding)
-+			continue;
-+		for (dir = 0; dir < 2; dir++)
-+			if (entry->present[dir] && entry->cookie[dir] == cookie) {
-+				ret = remove_entry(m, i);
-+				goto out;
-+			}
-+	}
++	entry = find_cookie(m, binding, cookie, 2);
++	if (entry)
++		ret = remove_entry(m, entry - m->entries);
 +out:
 +	mutex_unlock(&m->lock);
 +	return ret;
@@ -2903,28 +2964,22 @@ index 00000000..ee453bb9
 +			 struct flow_stats *stats)
 +{
 +	struct ipa_rtk_flow_manager *m = private;
-+	unsigned int i;
++	struct ipa_rtk_managed_flow *entry;
++	u32 timestamp;
 +	int ret = -ENOENT;
 +	mutex_lock(&m->lock);
 +	if (!m->active || m->failed) { ret = m->failed ? -ESHUTDOWN : -ENOENT; goto out; }
-+	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-+		struct ipa_rtk_managed_flow *entry = &m->entries[i];
-+		u32 timestamp;
-+		if (!entry->used || !entry->hardware || entry->binding != binding ||
-+		    (entry->cookie[0] != cookie && entry->cookie[1] != cookie))
-+			continue;
-+		timestamp = ipa_rtk_nat_pool_timestamp(&m->pool, &entry->nat);
-+		if (timestamp != entry->timestamp) {
-+			entry->timestamp = timestamp;
-+			entry->lastused = jiffies;
-+		}
-+		/* IPA NAT timestamp is shared by the two directions. Never invent
-+		 * packet/byte counters; report only the activity actually observed.
-+		 */
-+		flow_stats_update(stats, 0, 0, 0, entry->lastused, FLOW_ACTION_HW_STATS_DELAYED);
-+		ret = 0;
-+		break;
++	entry = find_cookie(m, binding, cookie, 2);
++	if (!entry || !entry->hardware)
++		goto out;
++	timestamp = ipa_rtk_nat_pool_timestamp(&m->pool, &entry->nat);
++	if (timestamp != entry->timestamp) {
++		entry->timestamp = timestamp;
++		entry->lastused = jiffies;
 +	}
++	/* IPA timestamps are shared by both directions; never invent counters. */
++	flow_stats_update(stats, 0, 0, 0, entry->lastused, FLOW_ACTION_HW_STATS_DELAYED);
++	ret = 0;
 +out:
 +	mutex_unlock(&m->lock);
 +	return ret;
@@ -2935,6 +2990,10 @@ index 00000000..ee453bb9
 +	struct ipa_rtk_flow_manager *m = private;
 +	unsigned int i;
 +	mutex_lock(&m->lock);
++	if (!m->active) {
++		mutex_unlock(&m->lock);
++		return;
++	}
 +	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++)
 +		if (m->entries[i].used && m->entries[i].binding == binding) {
 +			if (!m->failed)
@@ -2963,17 +3022,30 @@ index 00000000..ee453bb9
 +	    lan <= 0 || wan <= 0 || lan == wan || bridge == wan)
 +		return -EINVAL;
 +	mutex_lock(&m->lock);
-+	ret = ipa_rtk_nat_pool_create(&m->pool, ipa, public_ip, source_metadata, destination_metadata);
-+	if (ret) {
-+		mutex_unlock(&m->lock);
-+		return ret;
++	m->entries = kvcalloc(IPA_RTK_FLOW_LIMIT, sizeof(*m->entries), GFP_KERNEL);
++	m->tuples = kvcalloc(IPA_RTK_FLOW_BUCKETS, sizeof(*m->tuples), GFP_KERNEL);
++	m->cookies = kvcalloc(IPA_RTK_FLOW_BUCKETS, sizeof(*m->cookies), GFP_KERNEL);
++	m->used = bitmap_zalloc(IPA_RTK_FLOW_LIMIT, GFP_KERNEL);
++	if (!m->entries || !m->tuples || !m->cookies || !m->used) {
++		ret = -ENOMEM;
++		goto free;
 +	}
++	INIT_LIST_HEAD(&m->pending);
++	ret = ipa_rtk_nat_pool_create(&m->pool, ipa, public_ip, source_metadata, destination_metadata);
++	if (ret)
++		goto free;
 +	m->lan = lan; m->bridge = bridge; m->wan = wan;
 +	m->ops = ops; m->private = private;
 +	m->failed = false;
 +	m->active = true;
 +	mutex_unlock(&m->lock);
 +	return 0;
++free:
++	kvfree(m->entries); kvfree(m->tuples); kvfree(m->cookies);
++	bitmap_free(m->used);
++	m->entries = NULL; m->tuples = NULL; m->cookies = NULL; m->used = NULL;
++	mutex_unlock(&m->lock);
++	return ret;
 +}
 +
 +int ipa_rtk_flow_manager_stop(struct ipa_rtk_flow_manager *m)
@@ -2992,25 +3064,36 @@ index 00000000..ee453bb9
 +	ret = ipa_rtk_nat_pool_destroy(&m->pool);
 +	if (ret)
 +		fail_closed(m);
-+	else
++	else {
 +		m->active = false;
++		kvfree(m->entries); kvfree(m->tuples); kvfree(m->cookies);
++		bitmap_free(m->used);
++		m->entries = NULL; m->tuples = NULL; m->cookies = NULL; m->used = NULL;
++	}
 +out:
 +	mutex_unlock(&m->lock);
 +	return ret;
 +}
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h
 new file mode 100644
-index 00000000..95fd104a
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,58 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _IPA_RTK_FLOW_MANAGER_H_
 +#define _IPA_RTK_FLOW_MANAGER_H_
 +#include "ipa_rtk_flowtable.h"
 +#include "ipa_rtk_nat_pool.h"
++#include <linux/list.h>
 +
-+#define IPA_RTK_FLOW_LIMIT 16
++#define IPA_RTK_FLOW_LIMIT 4000
++#define IPA_RTK_FLOW_BUCKETS 1024
++struct ipa_rtk_managed_flow;
++struct ipa_rtk_cookie_ref {
++	struct hlist_node node;
++	struct ipa_rtk_managed_flow *entry;
++	unsigned int direction;
++};
 +struct ipa_rtk_flow_manager_ops {
 +	/* Publish/remove ONLY exact per-flow classifiers and route/header state.
 +	 * NAT pool owns translation and remains alive until every filter is gone.
@@ -3023,6 +3106,9 @@ index 00000000..95fd104a
 +	void (*quiesce)(void *private);
 +};
 +struct ipa_rtk_managed_flow {
++	struct hlist_node tuple_node;
++	struct ipa_rtk_cookie_ref refs[2];
++	struct list_head pending;
 +	const void *binding;
 +	unsigned long cookie[2], lastused;
 +	struct ipa_rtk_flow flow[2];
@@ -3033,7 +3119,10 @@ index 00000000..95fd104a
 +struct ipa_rtk_flow_manager {
 +	struct mutex lock;
 +	struct ipa_rtk_nat_pool pool;
-+	struct ipa_rtk_managed_flow entries[IPA_RTK_FLOW_LIMIT];
++	struct ipa_rtk_managed_flow *entries;
++	struct hlist_head *tuples, *cookies;
++	unsigned long *used;
++	struct list_head pending;
 +	const struct ipa_rtk_flow_manager_ops *ops;
 +	void *private;
 +	int lan, bridge, wan;
@@ -3432,17 +3521,77 @@ index 00000000..87341b89
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.c
 new file mode 100644
-index 00000000..1167847b
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.c
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,300 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/bitmap.h>
 +#include <linux/dma-mapping.h>
 +#include <linux/in.h>
++#include <linux/slab.h>
 +#include "ipa.h"
 +#include "ipa_mem.h"
 +#include "ipa_rtk_nat_pool.h"
++
++#define IPA_RTK_NAT_BASE 4096
++#define IPA_RTK_NAT_EXPANSION 800
++#define IPA_RTK_NAT_LIMIT 4000
++
++struct ipa_rtk_nat_node {
++	u16 next[2], previous[2];
++	struct ipa_rtk_nat_slot *owner[2];
++	struct ipa_rtk_nat_tuple tuple;
++};
++
++/* dir 0 is the destination NAT graph; dir 1 is the source index graph. */
++static void *node_address(struct ipa_rtk_nat_pool *p, unsigned int dir, u16 n)
++{
++	return p->buffer + (dir ? p->total * 32 + n * 4 : n * 32);
++}
++
++static int write_node(struct ipa_rtk_nat_pool *p, unsigned int dir, u16 n,
++		      unsigned int field, u16 value)
++{
++	return ipa_cmd_rtk_nat_dma(p->ipa, dir * 2 + (n >= p->count),
++		(n >= p->count ? n - p->count : n) * (dir ? 4 : 32) + field, value);
++}
++
++static bool key_equal(const struct ipa_rtk_nat_tuple *a,
++		      const struct ipa_rtk_nat_tuple *b, unsigned int dir)
++{
++	return a->remote_ip == b->remote_ip && a->remote_port == b->remote_port &&
++		a->protocol == b->protocol && (dir ?
++		(a->private_ip == b->private_ip && a->private_port == b->private_port) :
++		(a->public_ip == b->public_ip && a->public_port == b->public_port));
++}
++
++/* Resolve a chain without modifying either software or DMA-visible state. */
++static int reserve_node(struct ipa_rtk_nat_pool *p, unsigned int dir, u16 hash,
++			const struct ipa_rtk_nat_tuple *tuple, u16 *index, u16 *tail)
++{
++	unsigned long *used = dir ? p->sources : p->destinations;
++	u16 n = hash;
++	unsigned int walked = 0;
++
++	*tail = 0;
++	if (!test_bit(n, used)) { *index = n; return 0; }
++	for (;;) {
++		if (!n || n >= p->total || !test_bit(n, used) || ++walked > p->total)
++			return -EUCLEAN;
++		if (p->nodes[n].owner[dir] && key_equal(&p->nodes[
++			dir ? p->nodes[n].owner[dir]->destination : n].tuple, tuple, dir))
++			return -EEXIST;
++		if (!p->nodes[n].next[dir])
++			break;
++		n = p->nodes[n].next[dir];
++	}
++	*tail = n;
++	n = find_next_zero_bit(used, p->total, p->count);
++	if (n == p->total)
++		return -ENOSPC;
++	*index = n;
++	return 0;
++}
 +
 +static DEFINE_MUTEX(pool_owner_lock);
 +static struct ipa_rtk_nat_pool *pool_owner;
@@ -3463,12 +3612,14 @@ index 00000000..1167847b
 +		if (ipa->mem[i].id == IPA_MEM_PDN_CONFIG)
 +			pdn = &ipa->mem[i];
 +	if (!pdn || pdn->size < 16) { ret = -ENODEV; goto out; }
-+	p->count = 4096;
-+	p->size = p->count * 36 + 32 + 8 + 32;
-+	p->destinations = bitmap_zalloc(p->count, GFP_KERNEL);
-+	p->sources = bitmap_zalloc(p->count, GFP_KERNEL);
++	p->count = IPA_RTK_NAT_BASE;
++	p->total = p->count + IPA_RTK_NAT_EXPANSION;
++	p->size = p->total * 36 + 32;
++	p->nodes = kvcalloc(p->total, sizeof(*p->nodes), GFP_KERNEL);
++	p->destinations = bitmap_zalloc(p->total, GFP_KERNEL);
++	p->sources = bitmap_zalloc(p->total, GFP_KERNEL);
 +	p->buffer = dma_alloc_coherent(ipa->dev, p->size, &p->address, GFP_KERNEL);
-+	if (!p->destinations || !p->sources || !p->buffer) {
++	if (!p->nodes || !p->destinations || !p->sources || !p->buffer) {
 +		ret = -ENOMEM;
 +		goto free;
 +	}
@@ -3480,11 +3631,11 @@ index 00000000..1167847b
 +	record->source_metadata = cpu_to_le32(source_metadata);
 +	record->destination_metadata = cpu_to_le32(destination_metadata);
 +	p->layout.base = p->address;
-+	p->layout.index = p->address + p->count * 32;
-+	p->layout.expansion = p->layout.index + p->count * 4;
-+	p->layout.index_expansion = p->layout.expansion + 32;
++	p->layout.expansion = p->address + p->count * 32;
++	p->layout.index = p->address + p->total * 32;
++	p->layout.index_expansion = p->layout.index + p->count * 4;
 +	p->layout.base_mask = p->count - 1;
-+	p->layout.expansion_count = 0;
++	p->layout.expansion_count = IPA_RTK_NAT_EXPANSION;
 +	p->failed = false;
 +	mutex_init(&p->lock);
 +	ret = ipa_cmd_rtk_nat_init(ipa, &p->layout, p->address + p->size - 32);
@@ -3500,6 +3651,7 @@ index 00000000..1167847b
 +		dma_free_coherent(ipa->dev, p->size, p->buffer, p->address);
 +	bitmap_free(p->sources);
 +	bitmap_free(p->destinations);
++	kvfree(p->nodes);
 +	memset(p, 0, sizeof(*p));
 +out:
 +	mutex_unlock(&pool_owner_lock);
@@ -3509,8 +3661,8 @@ index 00000000..1167847b
 +int ipa_rtk_nat_pool_add(struct ipa_rtk_nat_pool *p,
 +		const struct ipa_rtk_nat_tuple *tuple, struct ipa_rtk_nat_slot *slot)
 +{
-+	struct ipa_rtk_nat_entry *entry;
-+	u16 source, destination;
++	u16 source, destination, tail[2];
++	unsigned int dir;
 +	int ret;
 +	if (!p || !p->ipa || !tuple || !slot || slot->installed || tuple->pdn ||
 +	    tuple->public_ip != p->public_ip ||
@@ -3518,29 +3670,38 @@ index 00000000..1167847b
 +		return -EINVAL;
 +	mutex_lock(&p->lock);
 +	if (!p->active || p->failed) { ret = -ESHUTDOWN; goto out; }
-+	source = ipa_rtk_nat_source_hash(tuple, p->count - 1);
-+	destination = ipa_rtk_nat_destination_hash(tuple, p->count - 1);
-+	if (test_bit(source, p->sources) || test_bit(destination, p->destinations)) {
-+		ret = -ENOSPC;
-+		goto out;
-+	}
-+	entry = p->buffer + destination * 32;
-+	ipa_rtk_nat_encode(entry, tuple, 0, 0);
-+	dma_wmb();
-+	ret = ipa_cmd_rtk_nat_dma(p->ipa, 2, source * 4, destination);
++	if (p->active_count >= IPA_RTK_NAT_LIMIT) { ret = -ENOSPC; goto out; }
++	ret = reserve_node(p, 0, ipa_rtk_nat_destination_hash(tuple, p->count - 1),
++			   tuple, &destination, &tail[0]);
 +	if (!ret)
-+		ret = ipa_cmd_rtk_nat_dma(p->ipa, 0, destination * 32 + 18,
-+					 0x8000);
++		ret = reserve_node(p, 1, ipa_rtk_nat_source_hash(tuple, p->count - 1),
++				   tuple, &source, &tail[1]);
 +	if (ret) {
-+		/* Unknown partially published state must survive until reset. */
-+		p->failed = true;
++		if (ret == -EUCLEAN) p->failed = true;
 +		goto out;
 +	}
-+	set_bit(source, p->sources);
-+	set_bit(destination, p->destinations);
++	ipa_rtk_nat_encode(node_address(p, 0, destination), tuple, 0, 0);
++	/* An unlinked expansion index is private until its predecessor links it. */
++	memset(node_address(p, 1, source), 0, 4);
++	dma_wmb();
++	ret = write_node(p, 0, destination, 18, 0x8000);
++	if (!ret && tail[0]) ret = write_node(p, 0, tail[0], 8, destination);
++	if (!ret) ret = write_node(p, 1, source, 0, destination);
++	if (!ret && tail[1]) ret = write_node(p, 1, tail[1], 2, source);
++	if (ret) { p->failed = true; goto out; }
++	p->nodes[destination].tuple = *tuple;
 +	slot->source = source;
 +	slot->destination = destination;
 +	slot->installed = true;
++	for (dir = 0; dir < 2; dir++) {
++		u16 n = dir ? source : destination;
++		p->nodes[n].owner[dir] = slot;
++		p->nodes[n].previous[dir] = tail[dir];
++		p->nodes[n].next[dir] = 0;
++		if (tail[dir]) p->nodes[tail[dir]].next[dir] = n;
++		set_bit(n, dir ? p->sources : p->destinations);
++	}
++	p->active_count++;
 +out:
 +	mutex_unlock(&p->lock);
 +	return ret;
@@ -3548,26 +3709,74 @@ index 00000000..1167847b
 +
 +int ipa_rtk_nat_pool_delete(struct ipa_rtk_nat_pool *p, struct ipa_rtk_nat_slot *slot)
 +{
++	u16 d, s, next, previous;
 +	int ret = 0;
 +	if (!p || !p->ipa || !slot)
 +		return -EINVAL;
 +	mutex_lock(&p->lock);
-+	if (!slot->installed)
-+		goto out;
-+	if (slot->source >= p->count || slot->destination >= p->count) {
-+		ret = -EINVAL;
-+		goto out;
++	if (!slot->installed) goto out;
++	d = slot->destination; s = slot->source;
++	if (!d || !s || d >= p->total || s >= p->total ||
++	    p->nodes[d].owner[0] != slot || p->nodes[s].owner[1] != slot) {
++		ret = -EINVAL; goto out;
 +	}
 +	if (p->failed || !p->active) { ret = -ESHUTDOWN; goto out; }
-+	/* First make the entry unusable and drain lookup readers, then unlink. */
-+	ret = ipa_cmd_rtk_nat_dma(p->ipa, 0, slot->destination * 32 + 18, 0);
-+	if (!ret)
-+		ret = ipa_cmd_rtk_nat_dma(p->ipa, 2, slot->source * 4, 0);
-+	if (ret) { p->failed = true; goto out; }
-+	memset(p->buffer + slot->destination * 32, 0, 32);
-+	clear_bit(slot->source, p->sources);
-+	clear_bit(slot->destination, p->destinations);
++	/* A base head must stay enabled for the hardware to traverse successors.
++	 * Stock invalidates its protocol instead. Never reuse this sentinel until
++	 * the chain becomes empty. Every command drains prior pipeline readers.
++	 */
++	ret = d < p->count && p->nodes[d].next[0] ?
++		write_node(p, 0, d, 22, 0xff00) : write_node(p, 0, d, 18, 0);
++	if (ret) goto failed;
++	next = p->nodes[s].next[1]; previous = p->nodes[s].previous[1];
++	if (!previous && next) {
++		struct ipa_rtk_nat_slot *promoted = p->nodes[next].owner[1];
++		if (!promoted) { ret = -EUCLEAN; goto failed; }
++		/* Preserve the chain while promoting the first expansion element. */
++		ret = write_node(p, 1, s, 2, p->nodes[next].next[1]);
++		if (!ret) ret = write_node(p, 1, s, 0, promoted->destination);
++		if (ret) goto failed;
++		p->nodes[s].owner[1] = promoted;
++		p->nodes[s].next[1] = p->nodes[next].next[1];
++		if (p->nodes[s].next[1]) p->nodes[p->nodes[s].next[1]].previous[1] = s;
++		promoted->source = s;
++		s = next;
++	} else {
++		ret = write_node(p, 1, previous ? previous : s, previous ? 2 : 0, next);
++		if (ret) goto failed;
++		if (previous) p->nodes[previous].next[1] = next;
++		if (next) p->nodes[next].previous[1] = previous;
++	}
++	p->nodes[s].owner[1] = NULL;
++	p->nodes[s].next[1] = p->nodes[s].previous[1] = 0;
++	memset(node_address(p, 1, s), 0, 4);
++	clear_bit(s, p->sources);
++
++	next = p->nodes[d].next[0]; previous = p->nodes[d].previous[0];
++	p->nodes[d].owner[0] = NULL;
++	if (previous || !next) {
++		if (previous) {
++			ret = write_node(p, 0, previous, 8, next);
++			if (ret) goto failed;
++			p->nodes[previous].next[0] = next;
++			if (next) p->nodes[next].previous[0] = previous;
++		}
++		memset(node_address(p, 0, d), 0, 32);
++		p->nodes[d].next[0] = p->nodes[d].previous[0] = 0;
++		clear_bit(d, p->destinations);
++		if (previous && !next && previous < p->count && !p->nodes[previous].owner[0]) {
++			ret = write_node(p, 0, previous, 18, 0);
++			if (ret) goto failed;
++			memset(node_address(p, 0, previous), 0, 32);
++			clear_bit(previous, p->destinations);
++		}
++	}
++	p->active_count--;
 +	memset(slot, 0, sizeof(*slot));
++	goto out;
++failed:
++	/* Unknown partially published state stays allocated until reset. */
++	p->failed = true;
 +out:
 +	mutex_unlock(&p->lock);
 +	return ret;
@@ -3580,7 +3789,7 @@ index 00000000..1167847b
 +	if (!p || !p->ipa || !slot)
 +		return 0;
 +	mutex_lock(&p->lock);
-+	if (p->active && slot->installed && slot->destination < p->count) {
++	if (p->active && slot->installed && slot->destination < p->total) {
 +		entry = p->buffer + slot->destination * 32;
 +		dma_rmb();
 +		timestamp = le32_to_cpu(READ_ONCE(entry->word[5])) & 0xffffff;
@@ -3605,7 +3814,9 @@ index 00000000..1167847b
 +	dma_free_coherent(p->ipa->dev, p->size, p->buffer, p->address);
 +	bitmap_free(p->sources);
 +	bitmap_free(p->destinations);
++	kvfree(p->nodes);
 +	p->buffer = NULL;
++	p->nodes = NULL;
 +	p->ipa = NULL;
 +	pool_owner = NULL;
 +out:
@@ -3615,10 +3826,9 @@ index 00000000..1167847b
 +}
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.h b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.h
 new file mode 100644
-index 00000000..6a424d36
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,42 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _IPA_RTK_NAT_POOL_H_
 +#define _IPA_RTK_NAT_POOL_H_
@@ -3639,12 +3849,16 @@ index 00000000..6a424d36
 +	dma_addr_t address;
 +	size_t size;
 +	unsigned long *destinations, *sources;
-+	u16 count;
++	u16 count, total, active_count;
++	/* Indices use the IPA ABI: base entries followed by expansion entries.
++	 * Separate graphs are required because the two hashes collide differently.
++	 */
++	struct ipa_rtk_nat_node *nodes;
 +	__be32 public_ip;
 +	bool active, failed;
 +};
 +/* Caller holds IPA power and stops/removes every referencing filter before
-+ * destroy. Collision returns ENOSPC and leaves the packet on CPU fallback.
++ * destroy. Exhaustion returns ENOSPC and leaves the packet on CPU fallback.
 + */
 +int ipa_rtk_nat_pool_create(struct ipa_rtk_nat_pool *pool, struct ipa *ipa,
 +			   __be32 public_ip, u32 source_metadata, u32 destination_metadata);
@@ -3756,10 +3970,9 @@ index 00000000..f9e17b77
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
 new file mode 100644
-index 00000000..ee30858b
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
-@@ -0,0 +1,1341 @@
+@@ -0,0 +1,1349 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* SDX65/RTL8125 external DMA controller. Stage 0 is passive domain attachment. */
 +#include <linux/dma-mapping.h>
@@ -3789,13 +4002,16 @@ index 00000000..ee30858b
 +#include "ipa_rtk_flow_manager.h"
 +
 +#define H5_EP8_METADATA (0x101c + 8 * 0x80)
-+#define IPA_RTK_MAX_HEADERS 6
++#define IPA_RTK_MAX_HEADERS IPA_RTK_HEADER_CAPACITY
++#define IPA_RTK_DL_POLICY_COUNT 2
++#define IPA_RTK_ROUTE_SIZE 8192
++#define IPA_RTK_OFFLOAD_SIZE (4096 + 2 * IPA_RTK_ROUTE_SIZE)
 +
 +struct h5_dl_fltr_req_ex_msg {
 +	u8 filter_spec_ex_list_valid;
 +	u8 reserved_1[3];
 +	u32 filter_spec_ex_list_len;
-+	struct h5_filter_spec_ex_type filter_spec_ex_list[IPA_RTK_FLOW_LIMIT];
++	struct h5_filter_spec_ex_type filter_spec_ex_list[IPA_RTK_DL_POLICY_COUNT];
 +} __packed;
 +
 +static const struct qmi_elem_info h5_dl_fltr_req_ex_msg_ei[] = {
@@ -3817,7 +4033,7 @@ index 00000000..ee30858b
 +	},
 +	{
 +		.data_type = QMI_STRUCT,
-+		.elem_len = IPA_RTK_FLOW_LIMIT,
++		.elem_len = IPA_RTK_DL_POLICY_COUNT,
 +		.elem_size = sizeof(struct h5_filter_spec_ex_type),
 +		.array_type = VAR_LEN_ARRAY,
 +		.tlv_type = 0x10,
@@ -3908,15 +4124,20 @@ index 00000000..ee30858b
 +static const u32 dl_nat_eps[3] = { 5, 12, 15 };
 +
 +struct ipa_rtk_header_ref {
-+	struct ipa_rtk_header header;
++	u16 route_offset;
 +	u8 ethernet[ETH_HLEN];
 +	unsigned int refcount;
 +};
 +
 +struct ipa_rtk_offload_slot {
 +	struct ipa_rtk_nat_tuple nat;
-+	unsigned int header_index;
++	unsigned int client_index;
 +	bool active;
++};
++
++struct ipa_rtk_client {
++	__be32 address;
++	unsigned int header_index, refcount;
 +};
 +
 +struct ipa_rtk_controller {
@@ -3940,7 +4161,9 @@ index 00000000..ee30858b
 +	struct work_struct netdev_down_work;
 +	struct ipa_rtk_table ul[4], route, route_hash;
 +	struct ipa_rtk_header_ref headers[IPA_RTK_MAX_HEADERS];
-+	struct ipa_rtk_offload_slot flows[IPA_RTK_FLOW_LIMIT];
++	struct ipa_rtk_offload_slot *flows;
++	struct ipa_rtk_client clients[IPA_RTK_HEADER_CAPACITY];
++	struct ipa_rtk_header_bank header_bank;
 +	struct h5_fltr_installed_notif_req_msg *notification;
 +	void *offload_buf;
 +	dma_addr_t offload_addr;
@@ -4126,66 +4349,52 @@ index 00000000..ee30858b
 +	}
 +	if (free_idx == IPA_RTK_MAX_HEADERS)
 +		return -ENOSPC;
-+	ret = ipa_header_rtk_acquire(c->ipa, ethernet, &c->headers[free_idx].header);
++	ret = ipa_header_rtk_bank_set(&c->header_bank, free_idx, ethernet);
 +	if (ret)
 +		return ret;
 +	memcpy(c->headers[free_idx].ethernet, ethernet, ETH_HLEN);
 +	c->headers[free_idx].refcount = 1;
++	c->headers[free_idx].route_offset = free_idx * 32;
 +	*out_idx = free_idx;
 +	return 0;
 +}
 +
 +static int ipa_rtk_header_put(struct ipa_rtk_controller *c, unsigned int idx)
 +{
-+	int ret;
-+
 +	if (idx >= IPA_RTK_MAX_HEADERS || !c->headers[idx].refcount)
 +		return -EINVAL;
 +	if (--c->headers[idx].refcount > 0)
 +		return 0;
-+	ret = ipa_header_rtk_release(&c->headers[idx].header);
-+	if (ret) {
-+		c->headers[idx].refcount = 1;
-+		return ret;
-+	}
 +	memset(&c->headers[idx], 0, sizeof(c->headers[idx]));
 +	return 0;
 +}
 +
 +static int ipa_rtk_rebuild_routes(struct ipa_rtk_controller *c)
 +{
-+	unsigned int off = 4096 + (c->route_flip ? 1024 : 0);
-+	unsigned int i, j, cursor = 0, prio = 0;
++	unsigned int off = 4096 + (c->route_flip ? IPA_RTK_ROUTE_SIZE : 0);
++	unsigned int i, cursor = 0, prio = 0;
 +	int ret;
 +
-+	memset(c->offload_buf + off, 0, 1024);
-+	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
++	memset(c->offload_buf + off, 0, IPA_RTK_ROUTE_SIZE);
++	for (i = 0; i < IPA_RTK_HEADER_CAPACITY; i++) {
 +		struct ipa_rtk_equations eq = {};
-+		bool dup = false;
++		struct ipa_rtk_client *client = &c->clients[i];
 +		int len;
-+
-+		if (!c->flows[i].active)
++		if (!client->refcount)
 +			continue;
-+		for (j = 0; j < i; j++) {
-+			if (c->flows[j].active &&
-+			    c->flows[j].nat.private_ip == c->flows[i].nat.private_ip &&
-+			    c->flows[j].header_index == c->flows[i].header_index) {
-+				dup = true;
-+				break;
-+			}
-+		}
-+		if (dup)
-+			continue;
-+		if (cursor + 256 > 1024)
++		/* The generic encoder clears up to 256 bytes, even for a 24B rule.
++		 * Preserve eight zero terminator bytes beyond its maximum write.
++		 */
++		if (cursor + 256 + 8 > IPA_RTK_ROUTE_SIZE)
 +			return -ENOSPC;
 +		eq.bitmap = BIT(5);
 +		eq.meq32_count = 1;
 +		eq.meq32[0].offset = 16;
 +		eq.meq32[0].mask = U32_MAX;
-+		eq.meq32[0].value = be32_to_cpu(c->flows[i].nat.private_ip);
++		eq.meq32[0].value = be32_to_cpu(client->address);
 +		len = ipa_rtk_route_encode(c->offload_buf + off + cursor, &eq, 26,
-+			c->headers[c->flows[i].header_index].header.route_offset,
-+			0, 0, prio, 711 + prio, 0, 0);
++			c->headers[client->header_index].route_offset,
++			1, 1, prio, 711 + prio, 0, 0);
 +		if (len < 0)
 +			return len;
 +		cursor += len;
@@ -4234,51 +4443,31 @@ index 00000000..ee30858b
 +		kfree(qreq);
 +		return -ENOMEM;
 +	}
-+	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
-+		const struct ipa_rtk_nat_tuple *t = &c->flows[i].nat;
-+		struct h5_filter_spec_ex_type *spec;
-+
-+		if (!c->flows[i].active)
-+			continue;
-+		spec = &qreq->filter_spec_ex_list[count++];
++	/* One WAN policy per supported protocol, as in stock. Linux authorizes
++	 * exact tuples through the independent NAT table; NAT misses must take
++	 * the IPA exception/CPU path. TCP FIN/RST remain under conntrack control.
++	 */
++	for (i = 0; i < IPA_RTK_DL_POLICY_COUNT; i++) {
++		struct h5_filter_spec_ex_type *spec = &qreq->filter_spec_ex_list[count++];
 +		spec->ip_type = 1;
-+		spec->filter_action = 2; /* HW action=2 (DST_NAT) */
++		spec->filter_action = 2;
 +		spec->is_routing_table_index_valid = 1;
 +		spec->route_table_index = 11;
 +		spec->is_mux_id_valid = 1;
 +		spec->mux_id = 1;
-+		spec->rule_id = 0;
 +		spec->is_rule_hashable = 1;
-+		spec->filter_rule.rule_eq_bitmap =
-+			BIT(1) | BIT(5) | BIT(6) | BIT(10) | BIT(11);
++		spec->filter_rule.rule_eq_bitmap = BIT(1) | BIT(5);
 +		spec->filter_rule.protocol_eq_present = 1;
-+		spec->filter_rule.protocol_eq = t->protocol;
-+		spec->filter_rule.num_ihl_offset_range_16 = 2;
-+		spec->filter_rule.ihl_offset_range_16[0].offset = 0;
-+		spec->filter_rule.ihl_offset_range_16[0].range_low =
-+			be16_to_cpu(t->remote_port);
-+		spec->filter_rule.ihl_offset_range_16[0].range_high =
-+			be16_to_cpu(t->remote_port);
-+		spec->filter_rule.ihl_offset_range_16[1].offset = 2;
-+		spec->filter_rule.ihl_offset_range_16[1].range_low =
-+			be16_to_cpu(t->public_port);
-+		spec->filter_rule.ihl_offset_range_16[1].range_high =
-+			be16_to_cpu(t->public_port);
-+		spec->filter_rule.num_offset_meq_32 = 2;
-+		spec->filter_rule.offset_meq_32[0].offset = 12;
++		spec->filter_rule.protocol_eq = i ? IPPROTO_TCP : IPPROTO_UDP;
++		spec->filter_rule.num_offset_meq_32 = 1;
++		spec->filter_rule.offset_meq_32[0].offset = 16;
 +		spec->filter_rule.offset_meq_32[0].mask = U32_MAX;
-+		spec->filter_rule.offset_meq_32[0].value =
-+			be32_to_cpu(t->remote_ip);
-+		spec->filter_rule.offset_meq_32[1].offset = 16;
-+		spec->filter_rule.offset_meq_32[1].mask = U32_MAX;
-+		spec->filter_rule.offset_meq_32[1].value =
-+			be32_to_cpu(t->public_ip);
-+		if (t->protocol == IPPROTO_TCP) {
++		spec->filter_rule.offset_meq_32[0].value = be32_to_cpu(c->flow_manager.pool.public_ip);
++		if (i) {
 +			spec->filter_rule.rule_eq_bitmap |= BIT(7);
 +			spec->filter_rule.num_ihl_offset_meq_32 = 1;
 +			spec->filter_rule.ihl_offset_meq_32[0].offset = 12;
 +			spec->filter_rule.ihl_offset_meq_32[0].mask = 0x00050000U;
-+			spec->filter_rule.ihl_offset_meq_32[0].value = 0;
 +		}
 +	}
 +	qreq->filter_spec_ex_list_valid = count > 0;
@@ -4298,25 +4487,41 @@ index 00000000..ee30858b
 +				const struct ipa_rtk_flow flow[2])
 +{
 +	struct ipa_rtk_controller *c = private;
-+	unsigned int hdr_idx;
++	unsigned int i, free = IPA_RTK_HEADER_CAPACITY, hdr;
 +	int ret;
-+
 +	if (index >= IPA_RTK_FLOW_LIMIT || c->flows[index].active)
 +		return -EINVAL;
-+	ret = ipa_rtk_header_get(c, flow[1].ethernet, &hdr_idx);
++	for (i = 0; i < IPA_RTK_HEADER_CAPACITY; i++) {
++		struct ipa_rtk_client *client = &c->clients[i];
++		if (!client->refcount) { free = i; continue; }
++		if (client->address != flow[1].nat.private_ip)
++			continue;
++		/* A conflicting L2 destination must wait for old flows to drain. */
++		if (memcmp(c->headers[client->header_index].ethernet, flow[1].ethernet, ETH_HLEN))
++			return -ESTALE;
++		client->refcount++;
++		goto installed;
++	}
++	if (free == IPA_RTK_HEADER_CAPACITY)
++		return -ENOSPC;
++	ret = ipa_rtk_header_get(c, flow[1].ethernet, &hdr);
 +	if (ret)
 +		return ret;
++	i = free;
++	c->clients[i].address = flow[1].nat.private_ip;
++	c->clients[i].header_index = hdr;
++	c->clients[i].refcount = 1;
++	/* Record partial state before publication; manager remove handles any
++	 * failure. Never release a header when route rollback has failed.
++	 */
++installed:
 +	c->flows[index].nat = flow[1].nat;
-+	c->flows[index].header_index = hdr_idx;
++	c->flows[index].client_index = i;
 +	c->flows[index].active = true;
-+	ret = ipa_rtk_rebuild_routes(c);
-+	if (!ret)
-+		ret = ipa_rtk_sync_dl_qmi(c);
-+	if (ret) {
-+		c->flows[index].active = false;
-+		ipa_rtk_rebuild_routes(c);
-+		ipa_rtk_header_put(c, hdr_idx);
-+		return ret;
++	if (c->clients[i].refcount == 1) {
++		ret = ipa_rtk_rebuild_routes(c);
++		if (ret)
++			return ret;
 +	}
 +	c->total_installs++;
 +	return 0;
@@ -4325,23 +4530,23 @@ index 00000000..ee30858b
 +static int ipa_rtk_flow_remove(void *private, unsigned int index)
 +{
 +	struct ipa_rtk_controller *c = private;
-+	unsigned int hdr_idx;
-+	int ret, ret2;
-+
++	struct ipa_rtk_client *client;
++	int ret;
 +	if (index >= IPA_RTK_FLOW_LIMIT || !c->flows[index].active)
 +		return 0;
-+	hdr_idx = c->flows[index].header_index;
-+	c->flows[index].active = false;
-+	ret = ipa_rtk_sync_dl_qmi(c);
-+	ret2 = ipa_rtk_rebuild_routes(c);
-+	if (!ret && ret2)
-+		ret = ret2;
-+	ret2 = ipa_rtk_header_put(c, hdr_idx);
-+	if (!ret && ret2)
-+		ret = ret2;
-+	if (!ret)
-+		c->total_removes++;
-+	return ret;
++	client = &c->clients[c->flows[index].client_index];
++	if (!client->refcount)
++		return -EUCLEAN;
++	if (--client->refcount == 0) {
++		ret = ipa_rtk_rebuild_routes(c);
++		if (ret) { client->refcount = 1; return ret; }
++		ret = ipa_rtk_header_put(c, client->header_index);
++		if (ret) { client->refcount = 1; return ret; }
++		memset(client, 0, sizeof(*client));
++	}
++	memset(&c->flows[index], 0, sizeof(c->flows[index]));
++	c->total_removes++;
++	return 0;
 +}
 +
 +static int ipa_rtk_quiesce(struct ipa_rtk_controller *c)
@@ -4443,10 +4648,11 @@ index 00000000..ee30858b
 +		struct h5_dl_fltr_req_ex_msg *qreq = kzalloc(sizeof(*qreq), GFP_KERNEL);
 +		struct h5_dl_fltr_resp_ex_msg *qresp = kzalloc(sizeof(*qresp), GFP_KERNEL);
 +
-+		if (qreq && qresp)
-+			send_dl_qmi(c->ipa, qreq, qresp);
++		ret = qreq && qresp ? send_dl_qmi(c->ipa, qreq, qresp) : -ENOMEM;
 +		kfree(qresp);
 +		kfree(qreq);
++		if (ret)
++			return ret;
 +		c->dl_qmi_installed = false;
 +	}
 +	if (c->nat_changed) {
@@ -4470,16 +4676,15 @@ index 00000000..ee30858b
 +		ret = ipa_table_rtk_release(&c->route_hash);
 +	if (ret)
 +		return ret;
-+	for (i = 0; i < IPA_RTK_MAX_HEADERS; i++) {
-+		if (c->headers[i].header.ipa) {
-+			ret = ipa_header_rtk_release(&c->headers[i].header);
-+			if (ret)
-+				return ret;
-+			memset(&c->headers[i], 0, sizeof(c->headers[i]));
-+		}
-+	}
++	ret = ipa_header_rtk_bank_release(&c->header_bank);
++	if (ret)
++		return ret;
++	memset(c->headers, 0, sizeof(c->headers));
++	memset(c->clients, 0, sizeof(c->clients));
++	kvfree(c->flows);
++	c->flows = NULL;
 +	if (c->offload_buf) {
-+		dma_free_coherent(&c->ipa_pdev->dev, 8192,
++		dma_free_coherent(&c->ipa_pdev->dev, IPA_RTK_OFFLOAD_SIZE,
 +				  c->offload_buf, c->offload_addr);
 +		c->offload_buf = NULL;
 +	}
@@ -4520,13 +4725,17 @@ index 00000000..ee30858b
 +
 +	rules = kzalloc(sizeof(*rules), GFP_KERNEL);
 +	c->notification = kzalloc(sizeof(*c->notification), GFP_KERNEL);
-+	c->offload_buf = dma_alloc_coherent(&c->ipa_pdev->dev, 8192,
++	c->flows = kvcalloc(IPA_RTK_FLOW_LIMIT, sizeof(*c->flows), GFP_KERNEL);
++	c->offload_buf = dma_alloc_coherent(&c->ipa_pdev->dev, IPA_RTK_OFFLOAD_SIZE,
 +					    &c->offload_addr, GFP_KERNEL);
-+	if (!rules || !c->notification || !c->offload_buf) {
++	if (!rules || !c->notification || !c->offload_buf || !c->flows) {
 +		ret = -ENOMEM;
 +		goto fail;
 +	}
-+	memset(c->offload_buf, 0, 8192);
++	memset(c->offload_buf, 0, IPA_RTK_OFFLOAD_SIZE);
++	ret = ipa_header_rtk_bank_acquire(c->ipa, &c->header_bank);
++	if (ret)
++		goto fail;
 +	ret = ipa_qmi_rtk_rules_copy(c->ipa, rules, &c->qmi_generation);
 +	if (ret)
 +		goto fail;
@@ -4739,15 +4948,27 @@ index 00000000..ee30858b
 +			  READ_ONCE(c->stage), READ_ONCE(c->failed),
 +			  stats.packets, stats.bytes, stats.invalid);
 +	if (c->stage == 4) {
-+		unsigned int i, active_flows = 0;
++		unsigned int i, active_flows = 0, clients = 0, pending = 0;
 +
 +		for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++)
 +			if (READ_ONCE(c->flows[i].active))
 +				active_flows++;
++		for (i = 0; i < IPA_RTK_HEADER_CAPACITY; i++)
++			if (READ_ONCE(c->clients[i].refcount))
++				clients++;
++		for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++)
++			if (READ_ONCE(c->flow_manager.entries[i].used) &&
++			    !READ_ONCE(c->flow_manager.entries[i].hardware))
++				pending++;
 +		length += sysfs_emit_at(buf, length,
 +			"offload active_flows=%u installs=%llu removes=%llu wan_ip=%pI4\n",
 +			active_flows, READ_ONCE(c->total_installs),
 +			READ_ONCE(c->total_removes), &c->flow_manager.pool.public_ip);
++		length += sysfs_emit_at(buf, length,
++			"capacity flows=%u clients=%u/%u pending=%u nat_base=%u nat_expansion=%u dl_policies=%u\n",
++			IPA_RTK_FLOW_LIMIT, clients, IPA_RTK_HEADER_CAPACITY, pending,
++			c->flow_manager.pool.count, c->flow_manager.pool.layout.expansion_count,
++			IPA_RTK_DL_POLICY_COUNT);
 +	}
 +	for (dir = 0; dir < 2; dir++) {
 +		void __iomem *context;
@@ -5325,16 +5546,29 @@ index 00000000..5ea55fa1
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_table_rtk.h b/package/kernel/h5-ipa-rtk/src/ipa_table_rtk.h
 new file mode 100644
-index 00000000..643a79ef
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_table_rtk.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,62 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _IPA_TABLE_RTK_H_
 +#define _IPA_TABLE_RTK_H_
 +#include <linux/dma-mapping.h>
 +#include <linux/list.h>
 +struct ipa;
++
++#define IPA_RTK_HEADER_CAPACITY 200
++/* Dedicated system processing contexts. The global base must be unused; the
++ * lease never follows, replaces, or frees modem-owned system memory.
++ */
++struct ipa_rtk_header_bank {
++	struct ipa *ipa;
++	void *buffer;
++	dma_addr_t address;
++};
++int ipa_header_rtk_bank_acquire(struct ipa *ipa, struct ipa_rtk_header_bank *bank);
++int ipa_header_rtk_bank_set(struct ipa_rtk_header_bank *bank, unsigned int slot,
++			    const u8 ethernet[14]);
++int ipa_header_rtk_bank_release(struct ipa_rtk_header_bank *bank);
 +
 +struct ipa_rtk_table {
 +	struct list_head node;
@@ -9143,10 +9377,9 @@ index 00000000..fbdea3f2
 +BOARDNAME:=SDX65
 diff --git a/target/linux/sdx/h5-cpe.config b/target/linux/sdx/h5-cpe.config
 new file mode 100644
-index 00000000..6e82ac26
 --- /dev/null
 +++ b/target/linux/sdx/h5-cpe.config
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,29 @@
 +CONFIG_TARGET_sdx=y
 +CONFIG_TARGET_sdx_generic=y
 +CONFIG_TARGET_sdx_generic_DEVICE_greenpacket_h5-200q1-cpe=y
@@ -9156,6 +9389,7 @@ index 00000000..6e82ac26
 +CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
 +CONFIG_TARGET_ROOTFS_SQUASHFS=y
 +CONFIG_PACKAGE_luci=y
++CONFIG_PACKAGE_uhttpd-mod-ucode=y
 +CONFIG_PACKAGE_modemmanager=y
 +CONFIG_PACKAGE_modemmanager-rpcd=y
 +CONFIG_PACKAGE_luci-proto-modemmanager=y
@@ -9177,16 +9411,16 @@ index 00000000..6e82ac26
 +CONFIG_PACKAGE_tqftpserv=y
 diff --git a/target/linux/sdx/h5-modem.config b/target/linux/sdx/h5-modem.config
 new file mode 100644
-index 00000000..3908aaef
 --- /dev/null
 +++ b/target/linux/sdx/h5-modem.config
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +CONFIG_TARGET_sdx=y
 +CONFIG_TARGET_sdx_generic=y
 +CONFIG_TARGET_sdx_generic_DEVICE_greenpacket_h5-200q1-ipa=y
 +CONFIG_TARGET_ROOTFS_INITRAMFS=y
 +CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
 +CONFIG_PACKAGE_luci=y
++CONFIG_PACKAGE_uhttpd-mod-ucode=y
 +CONFIG_PACKAGE_modemmanager=y
 +CONFIG_PACKAGE_modemmanager-rpcd=y
 +CONFIG_PACKAGE_luci-proto-modemmanager=y
@@ -9205,10 +9439,9 @@ index 00000000..3908aaef
 +CONFIG_PACKAGE_tqftpserv=y
 diff --git a/target/linux/sdx/h5-web.config b/target/linux/sdx/h5-web.config
 new file mode 100644
-index 00000000..3b68be57
 --- /dev/null
 +++ b/target/linux/sdx/h5-web.config
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,10 @@
 +# Seed for a clean vanilla OpenWrt v25.12.6 checkout; run make defconfig.
 +CONFIG_TARGET_sdx=y
 +CONFIG_TARGET_sdx_generic=y
@@ -9217,10 +9450,10 @@ index 00000000..3b68be57
 +# CONFIG_TARGET_INITRAMFS_COMPRESSION_GZIP is not set
 +CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
 +CONFIG_PACKAGE_luci=y
++CONFIG_PACKAGE_uhttpd-mod-ucode=y
 +CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
 diff --git a/target/linux/sdx/image/Makefile b/target/linux/sdx/image/Makefile
 new file mode 100644
-index 00000000..7a404fe6
 --- /dev/null
 +++ b/target/linux/sdx/image/Makefile
 @@ -0,0 +1,91 @@
@@ -9274,7 +9507,7 @@ index 00000000..7a404fe6
 +define Device/greenpacket_h5-200q1-web
 +  $(call Device/greenpacket_h5-200q1-usb-pcie-compat)
 +  DEVICE_VARIANT := Experimental LuCI HTTP RAM test
-+  DEVICE_PACKAGES += luci
++  DEVICE_PACKAGES += luci uhttpd-mod-ucode
 +endef
 +TARGET_DEVICES += greenpacket_h5-200q1-web
 +
@@ -14878,3 +15111,634 @@ index 00000000..b3f7b00f
 ++}
 ++
 ++#endif
+diff --git a/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py b/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py
+@@ -0,0 +1,297 @@
++#!/usr/bin/env python3
++"""Compile the production pool against a host IPA DMA model (no device I/O).
++
++Run on a Linux build host with gcc and ASan/UBSan. The model independently
++traverses the hardware wire graphs after every insertion and deletion.
++"""
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parent
++with tempfile.TemporaryDirectory(prefix='h5-nat-test-') as tmp:
++    d = Path(tmp)
++    (d / 'linux/byteorder').mkdir(parents=True)
++    for name in ('ipa_rtk_nat_pool.c', 'ipa_rtk_nat_pool.h', 'ipa_rtk_nat.h', 'ipa_rtk_nat_wire.h'):
++        shutil.copyfile(root / name, d / name)
++    for name in ('ipa_rtk_flow_manager.c', 'ipa_rtk_flow_manager.h'):
++        shutil.copyfile(root / name, d / name)
++    (d / 'shim.h').write_text(r'''
++#ifndef SHIM_H
++#define SHIM_H
++#include <assert.h>
++#include <errno.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <endian.h>
++#include <arpa/inet.h>
++typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
++typedef uint8_t __u8; typedef uint16_t __u16; typedef uint32_t __u32;
++typedef uint16_t __be16; typedef uint32_t __be32; typedef uint32_t __le32;
++typedef uintptr_t dma_addr_t;
++#define cpu_to_le32(x) htole32(x)
++#define le32_to_cpu(x) le32toh(x)
++#define be32_to_cpu(x) be32toh(x)
++#define be16_to_cpu(x) be16toh(x)
++#define GFP_KERNEL 0
++#define IPA_VERSION_5_0 50
++#define IPA_MEM_PDN_CONFIG 1
++struct mutex { int unused; };
++#define DEFINE_MUTEX(n) struct mutex n
++#define mutex_init(x) ((void)(x))
++#define mutex_lock(x) ((void)(x))
++#define mutex_unlock(x) ((void)(x))
++#define dma_wmb() ((void)0)
++#define dma_rmb() ((void)0)
++#define READ_ONCE(x) (x)
++#define memcpy_fromio memcpy
++#define kvcalloc(n,s,f) calloc(n,s)
++#define kvfree free
++static void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *a, int flags)
++{ (void)dev; (void)flags; void *p = calloc(1,size); *a = (uintptr_t)p; return p; }
++static void dma_free_coherent(void *dev, size_t size, void *p, dma_addr_t a)
++{ (void)dev; (void)size; (void)a; free(p); }
++#define BITS (8*sizeof(unsigned long))
++#define bitmap_zalloc(n,f) calloc(((n)+BITS-1)/BITS,sizeof(unsigned long))
++#define bitmap_free free
++static bool test_bit(unsigned n, unsigned long *b) {return (b[n/BITS]>>(n%BITS))&1;}
++static void set_bit(unsigned n, unsigned long *b) {b[n/BITS]|=1UL<<(n%BITS);}
++static void clear_bit(unsigned n, unsigned long *b) {b[n/BITS]&=~(1UL<<(n%BITS));}
++static unsigned find_next_zero_bit(unsigned long *b,unsigned end,unsigned start)
++{while(start<end && test_bit(start,b))start++;return start;}
++#define find_first_zero_bit(b,n) find_next_zero_bit(b,n,0)
++struct hlist_node {struct hlist_node *next,**pprev;};
++struct hlist_head {struct hlist_node *first;};
++static void hlist_add_head(struct hlist_node *n,struct hlist_head *h)
++{n->next=h->first;if(n->next)n->next->pprev=&n->next;h->first=n;n->pprev=&h->first;}
++static void hlist_del_init(struct hlist_node *n)
++{if(n->pprev){*n->pprev=n->next;if(n->next)n->next->pprev=n->pprev;}n->next=NULL;n->pprev=NULL;}
++#define container_of(p,t,m) ((t *)((char *)(p)-__builtin_offsetof(t,m)))
++#define hlist_for_each_entry(p,h,m) \
++ for(struct hlist_node *hn=(h)->first;hn && ((p)=container_of(hn,__typeof__(*(p)),m),1);hn=hn->next)
++struct list_head {struct list_head *next,*prev;};
++static void INIT_LIST_HEAD(struct list_head *h){h->next=h;h->prev=h;}
++static bool list_empty(struct list_head *h){return h->next==h;}
++static void list_add_tail(struct list_head *n,struct list_head *h)
++{n->next=h;n->prev=h->prev;h->prev->next=n;h->prev=n;}
++static void list_del_init(struct list_head *n)
++{n->prev->next=n->next;n->next->prev=n->prev;INIT_LIST_HEAD(n);}
++#define list_first_entry(h,t,m) container_of((h)->next,t,m)
++static u32 jhash(const void *data,unsigned n,u32 seed)
++{const u8 *b=data;for(unsigned i=0;i<n;i++)seed=(seed^b[i])*16777619;return seed;}
++static u32 jhash_2words(u32 a,u32 b,u32 seed)
++{u32 words[]={a,b};return jhash(words,sizeof(words),seed);}
++struct ipa_mem { unsigned id, size, offset; };
++struct ipa { int version; unsigned mem_count,mem_offset; const struct ipa_mem *mem;
++ void *dev,*mem_virt; };
++#endif
++''')
++    for name in ('mutex.h', 'dma-mapping.h', 'types.h', 'in.h', 'slab.h', 'bitmap.h', 'list.h', 'jhash.h', 'byteorder/generic.h'):
++        (d / 'linux' / name).write_text('#include "shim.h"\n')
++    for name in ('ipa.h', 'ipa_mem.h'):
++        (d / name).write_text('#include "shim.h"\n')
++    (d / 'linux/jiffies.h').write_text('''#include "shim.h"
++#define HZ 100
++static unsigned long jiffies;
++#define time_after(a,b) ((long)((b)-(a)) < 0)
++''')
++    (d / 'ipa_rtk_flowtable.h').write_text('''#include "ipa_rtk_nat_wire.h"
++#define ETH_HLEN 14
++#define FLOW_ACTION_HW_STATS_DELAYED 1
++struct ipa_rtk_flow { struct ipa_rtk_nat_tuple nat; int ingress_ifindex,egress_ifindex;
++ bool destination; u8 ethernet[14]; };
++struct flow_stats { unsigned long lastused; };
++#define flow_stats_update(s,a,b,c,last,mode) ((s)->lastused=(last))
++struct ipa_rtk_flowtable_ops {
++ int (*replace)(void *,const void *,unsigned long,const struct ipa_rtk_flow *);
++ int (*destroy)(void *,const void *,unsigned long);
++ int (*stats)(void *,const void *,unsigned long,struct flow_stats *);
++ void (*flush)(void *,const void *);
++};
++''')
++    (d / 'test.c').write_text(r'''
++#include "ipa_rtk_nat_pool.c"
++static struct ipa_rtk_nat_layout hw;
++static int fail_at, calls;
++int ipa_cmd_rtk_nat_init(struct ipa *ipa,const struct ipa_rtk_nat_layout *l,dma_addr_t pdn)
++{(void)ipa;(void)pdn;hw=*l;return 0;}
++int ipa_cmd_rtk_nat_disable(struct ipa *ipa) {(void)ipa;return 0;}
++int ipa_cmd_rtk_nat_dma(struct ipa *ipa,u8 table,u32 offset,u16 value)
++{
++ (void)ipa; if(fail_at && ++calls==fail_at)return -EIO;
++ uintptr_t base[]={hw.base,hw.expansion,hw.index,hw.index_expansion};
++ assert(table<4 && !(offset&1));
++ assert(offset+2 <= (unsigned)(table&1 ? hw.expansion_count : hw.base_mask+1)*(table<2?32:4));
++ uint16_t v=htole16(value); memcpy((void *)(base[table]+offset),&v,2);return 0;
++}
++#define N 4100
++static struct ipa_rtk_nat_slot slots[N];
++static struct ipa_rtk_nat_tuple tuples[N];
++static u16 get16(uintptr_t base,unsigned index,unsigned size,unsigned field)
++{u16 v;memcpy(&v,(void *)(base+index*size+field),2);return le16toh(v);}
++static u16 rd(unsigned dir,u16 n,unsigned field)
++{return get16(dir?hw.index:hw.base,n,dir?4:32,field);}
++static bool lookup(const struct ipa_rtk_nat_tuple *t,unsigned dir,u16 expected)
++{
++ u16 n=dir?ipa_rtk_nat_source_hash(t,4095):ipa_rtk_nat_destination_hash(t,4095);
++ for(unsigned steps=0;n;steps++) {
++  assert(steps<4896 && n<4896);
++  u16 d=dir?rd(1,n,0):n;
++  if(!dir && !(rd(0,d,18)&0x8000))return false;
++  if(dir && !d)return false;
++  assert(d<4896);
++  struct ipa_rtk_nat_entry *e=(void *)(hw.base+d*32);
++  u32 w0=le32toh(e->word[0]),w1=le32toh(e->word[1]);
++  u32 w2=le32toh(e->word[2]),w3=le32toh(e->word[3]);
++  u8 proto=le32toh(e->word[5])>>24;
++  if((rd(0,d,18)&0x8000) && proto==t->protocol && w1==ntohl(t->remote_ip) &&
++    (w3>>16)==ntohs(t->remote_port) && (dir?
++    (w0==ntohl(t->private_ip) && (u16)w3==ntohs(t->private_port)):
++    ((w2>>16)==ntohs(t->public_port)))) {assert(d==expected);return true;}
++  n=rd(dir,n,dir?2:8);
++ }
++ return false;
++}
++static void verify(struct ipa_rtk_nat_pool *p)
++{
++ unsigned count=0;
++ for(unsigned i=0;i<N;i++)if(slots[i].installed) {
++  count++;assert(lookup(&tuples[i],0,slots[i].destination));
++  assert(lookup(&tuples[i],1,slots[i].destination));
++ }
++ assert(count==p->active_count);
++}
++static void make_tuple(unsigned i, bool collision)
++{
++ struct ipa_rtk_nat_tuple *t=&tuples[i];memset(t,0,sizeof(*t));
++ t->public_ip=htonl(0x64400001);t->private_ip=htonl(0xc0a80000+(i%200)+1);
++ t->remote_ip=htonl(0x08080000+i+1);t->protocol=17;
++ t->remote_port=htons(443);t->private_port=htons(1000+i);t->public_port=htons(2000+i);
++ if(collision) {
++  /* Force both independent hashes into one bucket, without duplicate keys. */
++  u32 r=ntohl(t->remote_ip),v=ntohl(t->private_ip),pub=ntohl(t->public_ip);
++  t->private_port=htons((r^(r>>16)^v^(v>>16)^443^17^123)&4095);
++  t->public_port=htons((r^(r>>16)^pub^(pub>>16)^443^17^321)&4095);
++ }
++}
++int main(void)
++{
++ const struct ipa_mem mem={1,16,0};u8 pdn[16]={0};
++ struct ipa ipa={.version=50,.mem_count=1,.mem=&mem,.mem_virt=pdn};
++ struct ipa_rtk_nat_pool p={0};srand(918273);
++ assert(!ipa_rtk_nat_pool_create(&p,&ipa,htonl(0x64400001),0,0));
++ assert(p.layout.expansion_count==800 && p.total==4896);
++ for(unsigned i=0;i<200;i++) {make_tuple(i,true);assert(!ipa_rtk_nat_pool_add(&p,&tuples[i],&slots[i]));verify(&p);}
++ struct ipa_rtk_nat_slot duplicate={0};
++ assert(ipa_rtk_nat_pool_add(&p,&tuples[0],&duplicate)==-EEXIST);
++ /* Head, middle, tail, index promotion, sentinel reuse, and random churn. */
++ assert(!ipa_rtk_nat_pool_delete(&p,&slots[0]));verify(&p);
++ for(unsigned round=0;round<15000;round++) {
++  unsigned i=rand()%500;
++  if(slots[i].installed)assert(!ipa_rtk_nat_pool_delete(&p,&slots[i]));
++  else {make_tuple(i,round<5000);int ret=ipa_rtk_nat_pool_add(&p,&tuples[i],&slots[i]);assert(ret==0||ret==-EEXIST);}
++  verify(&p);
++ }
++ for(unsigned i=0;i<N;i++)if(slots[i].installed)assert(!ipa_rtk_nat_pool_delete(&p,&slots[i]));
++ assert(!p.active_count);
++ for(unsigned i=0;i<p.total;i++)assert(!test_bit(i,p.sources)&&!test_bit(i,p.destinations));
++ /* All 800 expansion slots usable; a collision storm falls back cleanly. */
++ for(unsigned i=0;i<801;i++){make_tuple(i,true);assert(!ipa_rtk_nat_pool_add(&p,&tuples[i],&slots[i]));}
++ make_tuple(801,true);assert(ipa_rtk_nat_pool_add(&p,&tuples[801],&slots[801])==-ENOSPC);
++ verify(&p);
++ for(unsigned i=0;i<801;i++)assert(!ipa_rtk_nat_pool_delete(&p,&slots[i]));
++ /* Exercise the configured logical cap with independent, collision-free keys. */
++ for(unsigned i=0;i<4001;i++) {
++  make_tuple(i,true);
++  tuples[i].private_port=htons(ntohs(tuples[i].private_port)^123^(i+1));
++  tuples[i].public_port=htons(ntohs(tuples[i].public_port)^321^(i+1));
++  int ret=ipa_rtk_nat_pool_add(&p,&tuples[i],&slots[i]);
++  assert(ret==(i==4000 ? -ENOSPC : 0));
++ }
++ verify(&p);
++ for(unsigned i=0;i<4000;i++)assert(!ipa_rtk_nat_pool_delete(&p,&slots[i]));
++ assert(!ipa_rtk_nat_pool_destroy(&p));
++ /* Fail every publication command in a colliding insertion. */
++ for(int step=1;step<=4;step++) {
++  memset(&p,0,sizeof(p));memset(slots,0,sizeof(slots));
++  assert(!ipa_rtk_nat_pool_create(&p,&ipa,htonl(0x64400001),0,0));
++  make_tuple(0,true);make_tuple(1,true);
++  assert(!ipa_rtk_nat_pool_add(&p,&tuples[0],&slots[0]));
++  calls=0;fail_at=step;assert(ipa_rtk_nat_pool_add(&p,&tuples[1],&slots[1])==-EIO);
++  assert(p.failed && !slots[1].installed);
++  assert(ipa_rtk_nat_pool_delete(&p,&slots[0])==-ESHUTDOWN);
++  fail_at=0;assert(!ipa_rtk_nat_pool_destroy(&p));
++ }
++ puts("PASS: production NAT pool; 200 forced-collision clients, 15000 churn operations, expansion exhaustion, DMA fault quarantine");
++ return 0;
++}
++''')
++    with (d / 'test.c').open('a') as f:
++        f.write(r'''
++#include "ipa_rtk_flow_manager.c"
++static unsigned installs,removes,quiesces;
++static int install(void *p,unsigned i,const struct ipa_rtk_flow f[2])
++{(void)p;(void)i;(void)f;installs++;return 0;}
++static int remove_flow(void *p,unsigned i){(void)p;(void)i;removes++;return 0;}
++static void quiesce(void *p){(void)p;quiesces++;}
++static void manager_test(void)
++{
++ struct ipa_rtk_flow_manager m={0};
++ const struct ipa_rtk_flow_manager_ops ops={install,remove_flow,quiesce};
++ const struct ipa_mem mem={1,16,0};u8 pdn[16]={0};
++ struct ipa ipa={.version=50,.mem_count=1,.mem=&mem,.mem_virt=pdn};
++ assert(!ipa_rtk_flow_manager_start(&m,&ipa,htonl(0x64400001),0,0,1,2,3,&ops,NULL));
++ for(unsigned i=0;i<4000;i++) {
++  make_tuple(i,true);
++  tuples[i].private_port=htons(ntohs(tuples[i].private_port)^123^(i+1));
++  tuples[i].public_port=htons(ntohs(tuples[i].public_port)^321^(i+1));
++  struct ipa_rtk_flow f={.nat=tuples[i],.ingress_ifindex=1,.egress_ifindex=3};
++  assert(managed_replace(&m,&ipa,2*i+1,&f)==-EAGAIN);
++  f.destination=true;f.ingress_ifindex=3;f.egress_ifindex=1;
++  assert(!managed_replace(&m,&ipa,2*i+2,&f));
++ }
++ assert(installs==4000 && m.pool.active_count==4000);
++ for(unsigned i=4000;i>0;i--) {
++  struct flow_stats stats={0};
++  assert(!managed_stats(&m,&ipa,2*i,&stats));
++ }
++ int other_binding;
++ assert(managed_destroy(&m,&other_binding,1)==-ENOENT);
++ struct ipa_rtk_flow conflict={.nat=tuples[0],.ingress_ifindex=1,.egress_ifindex=3};
++ conflict.nat.remote_ip^=htonl(1);
++ assert(managed_replace(&m,&ipa,1,&conflict)==-ESTALE);
++ conflict.nat=tuples[0];
++ assert(managed_replace(&m,&ipa,99999,&conflict)==-EEXIST);
++ for(unsigned i=0;i<4000;i++)assert(!managed_destroy(&m,&ipa,2*i+1));
++ assert(removes==4000 && !m.pool.active_count && !quiesces);
++ struct ipa_rtk_flow f={.nat=tuples[0],.ingress_ifindex=1,.egress_ifindex=3};
++ assert(managed_replace(&m,&ipa,1,&f)==-EAGAIN);
++ jiffies+=31*HZ;
++ assert(managed_replace(&m,&ipa,2,&f)==-EAGAIN);
++ unsigned pending=0;
++ for(unsigned i=0;i<4000;i++)pending+=m.entries[i].used;
++ assert(pending==1 && !m.pool.active_count);
++ managed_flush(&m,&ipa);
++ assert(managed_replace(&m,&ipa,3,&(struct ipa_rtk_flow){
++  .nat=tuples[0],.ingress_ifindex=3,.egress_ifindex=1,.destination=true}) == -EAGAIN);
++ managed_flush(&m,&ipa);
++ assert(!ipa_rtk_flow_manager_stop(&m));
++ managed_flush(&m,&ipa);
++ assert(managed_destroy(&m,&ipa,2)==-ENOENT);
++ assert(!m.entries);
++ puts("PASS: production flow manager; 4000 paired flows, delete, pending expiry, callbacks after stop");
++}
++''')
++    # Preserve the independent wire-graph test and add manager lifecycle tests.
++    test = (d / 'test.c').read_text().replace('int main(void)', 'static int pool_test(void)')
++    test += '\nint main(void) { pool_test(); manager_test(); return 0; }\n'
++    (d / 'test.c').write_text(test)
++    exe = d / 'test'
++    subprocess.run(['gcc', '-D__KERNEL__', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-g', '-O1', '-I', str(d),
++                    str(d / 'test.c'), '-o', str(exe)], check=True)
++    subprocess.run([str(exe)], check=True)
+diff --git a/target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch b/target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch
+@@ -0,0 +1,142 @@
++Subject: net: ipa: lease system header contexts for 200 H5 clients
++
++Use stock IPA5 NONE/HDR_ADD processing contexts with absolute header addresses.
++Refuse occupied system context bases and drain routes before releasing memory.
++
++--- a/drivers/net/ipa/ipa_table.c
+++++ b/drivers/net/ipa/ipa_table.c
++@@ -782,9 +782,111 @@
++ }
++ 
++ /* SPDX-License-Identifier: GPL-2.0-only */
+++/* SPDX-License-Identifier: GPL-2.0-only */
++ static DEFINE_MUTEX(ipa_rtk_table_lock);
++ static LIST_HEAD(ipa_rtk_table_owners);
++ static LIST_HEAD(ipa_rtk_header_owners);
+++
+++/* IPA5 register offset and NONE/HDR_ADD processing-context ABI are shared
+++ * with stock ipahal. System contexts use 32-byte route-offset units and carry
+++ * absolute header addresses, avoiding the raw header's 2044-byte offset cap.
+++ */
+++#define IPA_RTK_SYSTEM_CONTEXT_BASE 0x470
+++#define IPA_RTK_HEADER_BANK_SIZE (IPA_RTK_HEADER_CAPACITY * (32 + 16))
+++static struct ipa_rtk_header_bank *ipa_rtk_header_bank_owner;
+++
+++static int ipa_rtk_context_base_write(struct ipa *ipa, u32 value)
+++{
+++	struct gsi_trans *trans = ipa_cmd_trans_alloc(ipa, 2);
+++	if (!trans)
+++		return -EBUSY;
+++	ipa_cmd_register_write_add(trans, 0, 0, 0, true);
+++	ipa_cmd_register_write_add(trans, IPA_RTK_SYSTEM_CONTEXT_BASE, value, U32_MAX, false);
+++	gsi_trans_commit_wait(trans);
+++	return 0;
+++}
+++
+++int ipa_header_rtk_bank_acquire(struct ipa *ipa, struct ipa_rtk_header_bank *bank)
+++{
+++	int ret = -EBUSY;
+++	if (!ipa || !bank || bank->ipa || ipa->version != IPA_VERSION_5_0 ||
+++	    !ipa->setup_complete || !of_machine_is_compatible("greenpacket,h5-200q1"))
+++		return -EINVAL;
+++	mutex_lock(&ipa_rtk_table_lock);
+++	if (ipa_rtk_header_bank_owner || readl(ipa->reg_virt + IPA_RTK_SYSTEM_CONTEXT_BASE))
+++		goto out;
+++	bank->buffer = dma_alloc_coherent(ipa->dev, IPA_RTK_HEADER_BANK_SIZE,
+++					 &bank->address, GFP_KERNEL);
+++	if (!bank->buffer) { ret = -ENOMEM; goto out; }
+++	if (upper_32_bits(bank->address) || !IS_ALIGNED(bank->address, 32)) {
+++		ret = -ERANGE;
+++		goto free;
+++	}
+++	memset(bank->buffer, 0, IPA_RTK_HEADER_BANK_SIZE);
+++	dma_wmb();
+++	ret = ipa_rtk_context_base_write(ipa, lower_32_bits(bank->address));
+++	if (ret)
+++		goto free;
+++	bank->ipa = ipa;
+++	ipa_rtk_header_bank_owner = bank;
+++	goto out;
+++free:
+++	dma_free_coherent(ipa->dev, IPA_RTK_HEADER_BANK_SIZE, bank->buffer, bank->address);
+++	bank->buffer = NULL;
+++out:
+++	mutex_unlock(&ipa_rtk_table_lock);
+++	return ret;
+++}
+++EXPORT_SYMBOL_GPL(ipa_header_rtk_bank_acquire);
+++
+++/* Caller must not reuse a slot until every previous route reader is drained. */
+++int ipa_header_rtk_bank_set(struct ipa_rtk_header_bank *bank, unsigned int slot,
+++			    const u8 ethernet[14])
+++{
+++	__le32 *context;
+++	u32 header_offset;
+++	if (!bank || !bank->ipa || !ethernet || slot >= IPA_RTK_HEADER_CAPACITY)
+++		return -EINVAL;
+++	if (readl(bank->ipa->reg_virt + IPA_RTK_SYSTEM_CONTEXT_BASE) != bank->address)
+++		return -ESTALE;
+++	header_offset = IPA_RTK_HEADER_CAPACITY * 32 + slot * 16;
+++	memcpy(bank->buffer + header_offset, ethernet, 14);
+++	context = bank->buffer + slot * 32;
+++	memset(context, 0, 32);
+++	/* TLV type=HDR_ADD(1), length=2, header length=14; address, high=0,
+++	 * followed by the all-zero END TLV. Never insert a processing command.
+++	 */
+++	context[0] = cpu_to_le32(1 | 2 << 8 | 14 << 16);
+++	context[1] = cpu_to_le32(lower_32_bits(bank->address) + header_offset);
+++	dma_wmb();
+++	return 0;
+++}
+++EXPORT_SYMBOL_GPL(ipa_header_rtk_bank_set);
+++
+++int ipa_header_rtk_bank_release(struct ipa_rtk_header_bank *bank)
+++{
+++	int ret = 0;
+++	if (!bank)
+++		return -EINVAL;
+++	mutex_lock(&ipa_rtk_table_lock);
+++	if (!bank->ipa)
+++		goto out;
+++	if (ipa_rtk_header_bank_owner != bank ||
+++	    readl(bank->ipa->reg_virt + IPA_RTK_SYSTEM_CONTEXT_BASE) != bank->address) {
+++		ret = -ESTALE;
+++		goto out;
+++	}
+++	ret = ipa_rtk_context_base_write(bank->ipa, 0);
+++	if (ret)
+++		goto out;
+++	dma_free_coherent(bank->ipa->dev, IPA_RTK_HEADER_BANK_SIZE, bank->buffer, bank->address);
+++	memset(bank, 0, sizeof(*bank));
+++	ipa_rtk_header_bank_owner = NULL;
+++out:
+++	mutex_unlock(&ipa_rtk_table_lock);
+++	return ret;
+++}
+++EXPORT_SYMBOL_GPL(ipa_header_rtk_bank_release);
++ 
++ static u64 ipa_rtk_table_pointer(const struct ipa_rtk_table *table)
++ {
++--- a/drivers/net/ipa/ipa_table_rtk.h
+++++ b/drivers/net/ipa/ipa_table_rtk.h
++@@ -4,6 +4,20 @@
++ #include <linux/dma-mapping.h>
++ #include <linux/list.h>
++ struct ipa;
+++
+++#define IPA_RTK_HEADER_CAPACITY 200
+++/* Dedicated system processing contexts. The global base must be unused; the
+++ * lease never follows, replaces, or frees modem-owned system memory.
+++ */
+++struct ipa_rtk_header_bank {
+++	struct ipa *ipa;
+++	void *buffer;
+++	dma_addr_t address;
+++};
+++int ipa_header_rtk_bank_acquire(struct ipa *ipa, struct ipa_rtk_header_bank *bank);
+++int ipa_header_rtk_bank_set(struct ipa_rtk_header_bank *bank, unsigned int slot,
+++			    const u8 ethernet[14]);
+++int ipa_header_rtk_bank_release(struct ipa_rtk_header_bank *bank);
++ 
++ struct ipa_rtk_table {
++ 	struct list_head node;
+diff --git a/package/kernel/h5-ipa-rtk/src/test_clients_host.py b/package/kernel/h5-ipa-rtk/src/test_clients_host.py
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/h5-ipa-rtk/src/test_clients_host.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++"""Test production client/route code with a DMA publication model, no device I/O."""
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++import shutil
++
++root = Path(__file__).resolve().parent
++source = (root / 'ipa_rtk_platform.c').read_text()
++backend_file = root / 'ipa_table_rtk.inc'
++if backend_file.exists():
++    backend = backend_file.read_text()
++else:
++    patch = root.parents[3] / 'target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch'
++    backend = '\n'.join(line[1:] for line in patch.read_text().splitlines()
++                        if line.startswith('+') and not line.startswith('+++'))
++
++def function(text, name):
++    start = re.search(r'(?:static )?int ' + name + r'\(', text).start()
++    brace = text.index('{', start)
++    depth = 1
++    end = brace + 1
++    while depth:
++        depth += (text[end] == '{') - (text[end] == '}')
++        end += 1
++    return text[start:end] + '\n'
++
++with tempfile.TemporaryDirectory(prefix='h5-client-test-') as tmp:
++    d = Path(tmp)
++    for name in ('ipa_rtk_rule_wire.h', 'ipa_rtk_nat_wire.h'):
++        shutil.copyfile(root / name, d / name)
++    text = r'''
++#include <assert.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <arpa/inet.h>
++#include "ipa_rtk_rule_wire.h"
++#include "ipa_rtk_nat_wire.h"
++typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
++typedef uintptr_t dma_addr_t;
++#define BIT(n) (1U<<(n))
++#define U32_MAX UINT32_MAX
++#define ETH_HLEN 14
++#define IPA_RTK_HEADER_CAPACITY 200
++#define IPA_RTK_MAX_HEADERS IPA_RTK_HEADER_CAPACITY
++#define IPA_RTK_FLOW_LIMIT 4000
++#define IPA_RTK_ROUTE_SIZE 8192
++#define IPA_RTK_SYSTEM_CONTEXT_BASE 0x470
++#define lower_32_bits(v) ((u32)(v))
++#define dma_wmb() ((void)0)
++static u32 readl(void *at) {u32 v;memcpy(&v,at,4);return v;}
++struct ipa {void *reg_virt;};
++struct ipa_rtk_header_bank {struct ipa *ipa;void *buffer;dma_addr_t address;};
++struct ipa_rtk_table {unsigned unused;};
++struct ipa_rtk_flow {struct ipa_rtk_nat_tuple nat;u8 ethernet[14];};
++'''
++    for name in ('ipa_rtk_header_ref', 'ipa_rtk_offload_slot', 'ipa_rtk_client'):
++        text += re.search(r'struct ' + name + r' \{.*?\n\};', source, re.S)[0] + '\n'
++    text += r'''
++struct ipa_rtk_controller {
++ struct ipa *ipa;
++ struct ipa_rtk_header_ref headers[200];
++ struct ipa_rtk_client clients[200];
++ struct ipa_rtk_offload_slot *flows;
++ struct ipa_rtk_header_bank header_bank;
++ struct ipa_rtk_table route;
++ void *offload_buf;
++ dma_addr_t offload_addr;
++ unsigned route_flip;
++ uint64_t total_installs,total_removes;
++};
++static struct ipa_rtk_controller *current;
++static unsigned publications;
++static int fail_publish;
++static dma_addr_t active_address;
++static int ipa_table_rtk_replace(struct ipa_rtk_table *table,dma_addr_t address)
++{
++ assert(table==&current->route);
++ assert(address!=active_address);
++ if(fail_publish){fail_publish--;return -EIO;}
++ u8 *p=(void *)address;unsigned count=0,expected=0;
++ for(unsigned i=0;i<200;i++)expected+=!!current->clients[i].refcount;
++ while(1) {
++  uint64_t header;memcpy(&header,p,8);header=le64toh(header);
++  if(!header)break;
++  assert(++count<=200);
++  assert(((header>>61)&1) && ((header>>63)&1));
++  assert(((header>>16)&255)==26);
++  unsigned slot=(header>>52)&511;assert(slot<200);
++  assert(p[8]==16);
++  u32 ip;memcpy(&ip,p+20,4);ip=le32toh(ip);
++  bool found=false;
++  for(unsigned i=0;i<200;i++)if(current->clients[i].refcount &&
++    ntohl(current->clients[i].address)==ip && current->clients[i].header_index==slot)found=true;
++  assert(found);
++  u32 *ctx=current->header_bank.buffer+slot*32;
++  assert(le32toh(ctx[0])==(1|2<<8|14<<16));
++  assert(le32toh(ctx[1])==0x100000+200*32+slot*16);
++  assert(!ctx[2] && !ctx[3]);
++  assert(!memcmp(current->header_bank.buffer+200*32+slot*16,current->headers[slot].ethernet,14));
++  p+=24;
++ }
++ assert(count==expected);
++ active_address=address;publications++;return 0;
++}
++'''
++    text += function(backend, 'ipa_header_rtk_bank_set')
++    for name in ('ipa_rtk_header_get', 'ipa_rtk_header_put', 'ipa_rtk_rebuild_routes',
++                 'ipa_rtk_flow_install', 'ipa_rtk_flow_remove'):
++        text += function(source, name)
++    text += r'''
++static void make_flow(struct ipa_rtk_flow f[2],unsigned client)
++{
++ memset(f,0,2*sizeof(*f));f[1].nat.private_ip=htonl(0xc0000201+client);
++ f[1].ethernet[0]=2;f[1].ethernet[4]=client>>8;f[1].ethernet[5]=client;
++ f[1].ethernet[6]=2;f[1].ethernet[11]=255;f[1].ethernet[12]=8;
++}
++int main(void)
++{
++ u8 regs[0x500]={0};u32 base=0x100000;memcpy(regs+0x470,&base,4);
++ struct ipa ipa={regs};struct ipa_rtk_controller c={.ipa=&ipa};current=&c;
++ c.flows=calloc(4000,sizeof(*c.flows));c.offload_buf=calloc(1,4096+2*8192);
++ c.offload_addr=(uintptr_t)c.offload_buf;
++ c.header_bank=(struct ipa_rtk_header_bank){&ipa,calloc(1,200*48),0x100000};
++ struct ipa_rtk_flow f[2];
++ for(unsigned i=0;i<200;i++){make_flow(f,i);assert(!ipa_rtk_flow_install(&c,i,f));}
++ assert(publications==200);
++ make_flow(f,200);assert(ipa_rtk_flow_install(&c,200,f)==-ENOSPC);
++ for(unsigned i=200;i<4000;i++){make_flow(f,i%200);assert(!ipa_rtk_flow_install(&c,i,f));}
++ assert(publications==200 && c.total_installs==4000);
++ for(unsigned i=0;i<200;i++){assert(c.clients[i].refcount==20);assert(c.headers[i].refcount==1);}
++ unsigned order[4000];for(unsigned i=0;i<4000;i++)order[i]=i;
++ srand(6543);for(unsigned i=3999;i;i--){unsigned j=rand()%(i+1),t=order[i];order[i]=order[j];order[j]=t;}
++ for(unsigned i=0;i<4000;i++)assert(!ipa_rtk_flow_remove(&c,order[i]));
++ assert(publications==400 && c.total_removes==4000);
++ for(unsigned i=0;i<200;i++){assert(!c.clients[i].refcount);assert(!c.headers[i].refcount);}
++ make_flow(f,0);fail_publish=1;
++ assert(ipa_rtk_flow_install(&c,0,f)==-EIO);
++ assert(c.flows[0].active);
++ assert(!ipa_rtk_flow_remove(&c,0));
++ assert(!ipa_rtk_flow_install(&c,0,f));fail_publish=1;
++ assert(ipa_rtk_flow_remove(&c,0)==-EIO);
++ assert(c.flows[0].active && c.clients[c.flows[0].client_index].refcount==1);
++ assert(!ipa_rtk_flow_remove(&c,0));
++ assert(ipa_header_rtk_bank_set(&c.header_bank,200,f[1].ethernet)==-EINVAL);
++ base=0;memcpy(regs+0x470,&base,4);
++ assert(ipa_header_rtk_bank_set(&c.header_bank,0,f[1].ethernet)==-ESTALE);
++ free(c.header_bank.buffer);free(c.offload_buf);free(c.flows);
++ puts("PASS: production route/client/HDR_ADD code; 200 distinct MAC/IP clients, 4000 flows, context offsets, bounded route writes, random teardown and publication failure retention");
++}
++'''
++    (d / 'test.c').write_text(text)
++    subprocess.run(['gcc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
++                    '-fsanitize=address,undefined', '-I', str(d), str(d / 'test.c'),
++                    '-o', str(d / 'test')], check=True)
++    subprocess.run([str(d / 'test')], check=True)
+diff --git a/target/linux/sdx/base-files/etc/uci-defaults/92-h5-luci-ucode b/target/linux/sdx/base-files/etc/uci-defaults/92-h5-luci-ucode
+new file mode 100755
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/uci-defaults/92-h5-luci-ucode
+@@ -0,0 +1,12 @@
++#!/bin/sh
++# Keep LuCI's interpreter preloaded in uhttpd, including preserved old configs.
++[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
++[ -f /usr/lib/uhttpd_ucode.so ] || exit 0
++[ -f /usr/share/ucode/luci/uhttpd.uc ] || exit 0
++uci -q get uhttpd.main >/dev/null || exit 0
++
++handler='/cgi-bin/luci=/usr/share/ucode/luci/uhttpd.uc'
++if ! uci -q get uhttpd.main.ucode_prefix | tr ' ' '\n' | grep -q '^/cgi-bin/luci='; then
++	uci add_list uhttpd.main.ucode_prefix="$handler"
++	uci commit uhttpd
++fi

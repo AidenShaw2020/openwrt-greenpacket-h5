@@ -18,12 +18,16 @@ struct ipa_rtk_nat_pool {
 	dma_addr_t address;
 	size_t size;
 	unsigned long *destinations, *sources;
-	u16 count;
+	u16 count, total, active_count;
+	/* Indices use the IPA ABI: base entries followed by expansion entries.
+	 * Separate graphs are required because the two hashes collide differently.
+	 */
+	struct ipa_rtk_nat_node *nodes;
 	__be32 public_ip;
 	bool active, failed;
 };
 /* Caller holds IPA power and stops/removes every referencing filter before
- * destroy. Collision returns ENOSPC and leaves the packet on CPU fallback.
+ * destroy. Exhaustion returns ENOSPC and leaves the packet on CPU fallback.
  */
 int ipa_rtk_nat_pool_create(struct ipa_rtk_nat_pool *pool, struct ipa *ipa,
 			   __be32 public_ip, u32 source_metadata, u32 destination_metadata);

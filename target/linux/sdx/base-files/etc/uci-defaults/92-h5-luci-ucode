@@ -1,0 +1,12 @@
+#!/bin/sh
+# Keep LuCI's interpreter preloaded in uhttpd, including preserved old configs.
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
+[ -f /usr/lib/uhttpd_ucode.so ] || exit 0
+[ -f /usr/share/ucode/luci/uhttpd.uc ] || exit 0
+uci -q get uhttpd.main >/dev/null || exit 0
+
+handler='/cgi-bin/luci=/usr/share/ucode/luci/uhttpd.uc'
+if ! uci -q get uhttpd.main.ucode_prefix | tr ' ' '\n' | grep -q '^/cgi-bin/luci='; then
+	uci add_list uhttpd.main.ucode_prefix="$handler"
+	uci commit uhttpd
+fi

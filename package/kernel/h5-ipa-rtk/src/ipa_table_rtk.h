@@ -5,6 +5,20 @@
 #include <linux/list.h>
 struct ipa;
 
+#define IPA_RTK_HEADER_CAPACITY 200
+/* Dedicated system processing contexts. The global base must be unused; the
+ * lease never follows, replaces, or frees modem-owned system memory.
+ */
+struct ipa_rtk_header_bank {
+	struct ipa *ipa;
+	void *buffer;
+	dma_addr_t address;
+};
+int ipa_header_rtk_bank_acquire(struct ipa *ipa, struct ipa_rtk_header_bank *bank);
+int ipa_header_rtk_bank_set(struct ipa_rtk_header_bank *bank, unsigned int slot,
+			    const u8 ethernet[14]);
+int ipa_header_rtk_bank_release(struct ipa_rtk_header_bank *bank);
+
 struct ipa_rtk_table {
 	struct list_head node;
 	struct ipa *ipa;

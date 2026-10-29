@@ -41,10 +41,11 @@ Use the exported patch once; do not also copy the same overlay on top.
 - Independent OpenWrt initramfs recovery and readback verification.
 - Main and recovery cold boot without USB; USB serial remains a login console.
 - RTL8125B Ethernet at 1 Gb/s (`r8125-rss` with external IPA ring library support), LAN DHCP/DNS, firewall, NAT and client HTTP traffic.
-- Stock-equivalent SDX65 IPA v5.0 + Realtek RTL8125B hardware NAT and `nf_flowtable` (`[HW_OFFLOAD]`) packet acceleration (`kmod-h5-ipa-rtk`, `stage 4`), verified under an 8-stream concurrent HTTP download stress test at **115.28 Mbps** with **11.8% CPU** (**0.5% `softirq`**).
+- SDX65 IPA v5.0 + Realtek RTL8125B IPv4 hardware NAT and `nf_flowtable` acceleration (`kmod-h5-ipa-rtk`, `stage 4`). The revised implementation completed **200 simultaneous HTTPS downloads**, with **200 hardware flows** and steady samples of **12–24% CPU**, about **1% softirq**. Its limits are 4000 admitted connections and 200 LAN IPv4 clients; collision storage can exhaust earlier. See [Validation](docs/VALIDATION.md) for the physical-test scope and the unresolved cleartext HTTP close-test limitation.
 - Mobile data through IPA/rmnet, QRTR/QMI and ModemManager.
 - LTE and 5G NSA, including an active NR band n78 secondary carrier under load.
 - LuCI modem configuration, serving cells, carrier aggregation and signal tables.
+- Native uhttpd/ucode LuCI handling, with measured warm login response reduced from about 0.37 s to 0.18 s.
 - LTE cell lock, readback, data connectivity and return to the unlocked state.
 - Short RESET press rebooting without losing configuration.
 - Long RESET test and subsequent settings restoration confirmed by the device owner.

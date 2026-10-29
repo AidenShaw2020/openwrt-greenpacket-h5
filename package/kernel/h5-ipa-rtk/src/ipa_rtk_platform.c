@@ -904,7 +904,8 @@ static int ipa_rtk_prepare(struct ipa_rtk_controller *c)
 		return ret;
 	for (dir = 0; dir < 2; dir++) {
 		ret = ipa_rtk_dma_prepare(&c->dma[dir], &c->ipa_pdev->dev,
-					   c->dev, c->netdev, dir == 0, 256, 2048);
+					   c->dev, c->netdev, dir == 0,
+					   dir == 0 ? 256 : 1024, 2048);
 		if (ret)
 			return ret;
 		ret = gsi_rtk_prepare(&c->ipa->gsi, &c->dma[dir].config, &c->gsi[dir]);

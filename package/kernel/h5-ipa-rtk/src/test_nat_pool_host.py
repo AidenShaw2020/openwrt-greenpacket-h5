@@ -90,7 +90,7 @@ struct ipa { int version; unsigned mem_count,mem_offset; const struct ipa_mem *m
  void *dev,*mem_virt; };
 #endif
 ''')
-    for name in ('mutex.h', 'dma-mapping.h', 'types.h', 'in.h', 'slab.h', 'bitmap.h', 'list.h', 'jhash.h', 'byteorder/generic.h'):
+    for name in ('mutex.h', 'dma-mapping.h', 'types.h', 'in.h', 'slab.h', 'bitmap.h', 'list.h', 'jhash.h', 'workqueue.h', 'byteorder/generic.h'):
         (d / 'linux' / name).write_text('#include "shim.h"\n')
     for name in ('ipa.h', 'ipa_mem.h'):
         (d / name).write_text('#include "shim.h"\n')
@@ -98,6 +98,15 @@ struct ipa { int version; unsigned mem_count,mem_offset; const struct ipa_mem *m
 #define HZ 100
 static unsigned long jiffies;
 #define time_after(a,b) ((long)((b)-(a)) < 0)
+#define time_after_eq(a,b) ((long)((a)-(b)) >= 0)
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; };
+#define system_wq ((void *)0)
+#define to_delayed_work(w) container_of(w, struct delayed_work, work)
+#define INIT_DELAYED_WORK(dw, fn) ((void)(dw), (void)(fn))
+#define schedule_delayed_work(dw, delay) ((void)(dw), (void)(delay))
+#define mod_delayed_work(wq, dw, delay) ((void)(wq), (void)(dw), (void)(delay))
+#define cancel_delayed_work_sync(dw) ((void)(dw))
 ''')
     (d / 'ipa_rtk_flowtable.h').write_text('''#include "ipa_rtk_nat_wire.h"
 #define ETH_HLEN 14
@@ -268,6 +277,20 @@ static void manager_test(void)
  assert(managed_replace(&m,&ipa,99999,&conflict)==-EEXIST);
  for(unsigned i=0;i<4000;i++)assert(!managed_destroy(&m,&ipa,2*i+1));
  assert(removes==4000 && !m.pool.active_count && !quiesces);
+ /* Verify TCP deferred teardown grace period and immediate reuse. */
+ make_tuple(0,true);tuples[0].protocol=6;
+ struct ipa_rtk_flow tf={.nat=tuples[0],.ingress_ifindex=1,.egress_ifindex=3};
+ assert(managed_replace(&m,&ipa,50001,&tf)==-EAGAIN);
+ tf.destination=true;tf.ingress_ifindex=3;tf.egress_ifindex=1;
+ assert(!managed_replace(&m,&ipa,50002,&tf));
+ assert(m.pool.active_count==1);
+ assert(!managed_destroy(&m,&ipa,50001));
+ assert(managed_destroy(&m,&ipa,50002)==0);
+ assert(m.pool.active_count==1 && removes==4000);
+ jiffies+=IPA_RTK_TEARDOWN_GRACE;
+ retire_work_fn(&m.retire_work.work);
+ assert(!m.pool.active_count && removes==4001);
+ make_tuple(0,true);
  struct ipa_rtk_flow f={.nat=tuples[0],.ingress_ifindex=1,.egress_ifindex=3};
  assert(managed_replace(&m,&ipa,1,&f)==-EAGAIN);
  jiffies+=31*HZ;

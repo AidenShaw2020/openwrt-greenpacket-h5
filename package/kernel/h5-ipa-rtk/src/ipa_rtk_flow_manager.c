@@ -67,6 +67,8 @@ static void forget_entry(struct ipa_rtk_flow_manager *m, struct ipa_rtk_managed_
 		hlist_del_init(&entry->refs[dir].node);
 	if (!list_empty(&entry->pending))
 		list_del_init(&entry->pending);
+	if (!list_empty(&entry->retiring))
+		list_del_init(&entry->retiring);
 	clear_bit(entry - m->entries, m->used);
 	memset(entry, 0, sizeof(*entry));
 }
@@ -115,6 +117,34 @@ fail:
 	return ret;
 }
 
+static void expire_retiring(struct ipa_rtk_flow_manager *m, bool force_one)
+{
+	while (!list_empty(&m->retiring)) {
+		struct ipa_rtk_managed_flow *entry =
+			list_first_entry(&m->retiring, struct ipa_rtk_managed_flow, retiring);
+		if (!force_one && !time_after_eq(jiffies, entry->retire_at)) {
+			unsigned long delay = entry->retire_at - jiffies;
+			mod_delayed_work(system_wq, &m->retire_work, delay ? delay : 1);
+			break;
+		}
+		if (remove_entry(m, entry - m->entries))
+			break;
+		if (force_one)
+			break;
+	}
+}
+
+static void retire_work_fn(struct work_struct *work)
+{
+	struct ipa_rtk_flow_manager *m =
+		container_of(to_delayed_work(work), struct ipa_rtk_flow_manager, retire_work);
+
+	mutex_lock(&m->lock);
+	if (m->active && !m->failed)
+		expire_retiring(m, false);
+	mutex_unlock(&m->lock);
+}
+
 static int managed_replace(void *private, const void *binding, unsigned long cookie,
 			   const struct ipa_rtk_flow *flow)
 {
@@ -137,18 +167,38 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 	    (dir && (flow->ingress_ifindex != m->wan || !lan_out)))
 		goto out;
 	expire_pending(m);
+	expire_retiring(m, false);
 	entry = find_cookie(m, binding, cookie, dir);
+	if (entry && entry->closing) {
+		ret = remove_entry(m, entry - m->entries);
+		if (ret)
+			goto out;
+		entry = NULL;
+	}
 	if (entry && !same_tuple(&entry->flow[dir].nat, &flow->nat)) {
 		ret = -ESTALE;
 		goto out;
 	}
-	if (!entry)
+	if (!entry) {
 		entry = find_tuple(m, binding, &flow->nat);
+		if (entry && entry->closing) {
+			ret = remove_entry(m, entry - m->entries);
+			if (ret)
+				goto out;
+			entry = NULL;
+		}
+	}
 	if (!entry) {
 		index = find_first_zero_bit(m->used, IPA_RTK_FLOW_LIMIT);
+		if (index == IPA_RTK_FLOW_LIMIT && !list_empty(&m->retiring)) {
+			expire_retiring(m, true);
+			if (m->failed) { ret = -ESHUTDOWN; goto out; }
+			index = find_first_zero_bit(m->used, IPA_RTK_FLOW_LIMIT);
+		}
 		if (index == IPA_RTK_FLOW_LIMIT) { ret = -ENOSPC; goto out; }
 		entry = &m->entries[index];
 		INIT_LIST_HEAD(&entry->pending);
+		INIT_LIST_HEAD(&entry->retiring);
 		entry->binding = binding;
 		entry->used = true;
 		entry->lastused = jiffies;
@@ -182,6 +232,11 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 	 * has both independently supplied directions may activate hardware.
 	 */
 	ret = ipa_rtk_nat_pool_add(&m->pool, &flow->nat, &entry->nat);
+	if (ret == -ENOSPC && !list_empty(&m->retiring)) {
+		expire_retiring(m, true);
+		if (m->failed) { ret = -ESHUTDOWN; goto out; }
+		ret = ipa_rtk_nat_pool_add(&m->pool, &flow->nat, &entry->nat);
+	}
 	if (ret) {
 		if (m->pool.failed)
 			fail_closed(m);
@@ -212,9 +267,31 @@ static int managed_destroy(void *private, const void *binding, unsigned long coo
 	int ret = -ENOENT;
 	mutex_lock(&m->lock);
 	if (!m->active || m->failed) { ret = m->failed ? -ESHUTDOWN : -ENOENT; goto out; }
+	expire_retiring(m, false);
 	entry = find_cookie(m, binding, cookie, 2);
-	if (entry)
-		ret = remove_entry(m, entry - m->entries);
+	if (entry) {
+		/* Keep TCP hardware translation alive briefly across FIN/RST
+		 * teardown so in-flight data and SACK retransmissions before
+		 * FIN are not dropped by an immediate NAT miss.
+		 */
+		if (entry->hardware && entry->nat.installed &&
+		    entry->flow[0].nat.protocol == IPPROTO_TCP) {
+			unsigned int dir;
+			for (dir = 0; dir < 2; dir++) {
+				if (entry->present[dir] && entry->cookie[dir] == cookie)
+					hlist_del_init(&entry->refs[dir].node);
+			}
+			if (!entry->closing) {
+				entry->closing = true;
+				entry->retire_at = jiffies + IPA_RTK_TEARDOWN_GRACE;
+				list_add_tail(&entry->retiring, &m->retiring);
+				schedule_delayed_work(&m->retire_work, IPA_RTK_TEARDOWN_GRACE);
+			}
+			ret = 0;
+		} else {
+			ret = remove_entry(m, entry - m->entries);
+		}
+	}
 out:
 	mutex_unlock(&m->lock);
 	return ret;
@@ -291,6 +368,8 @@ int ipa_rtk_flow_manager_start(struct ipa_rtk_flow_manager *m, struct ipa *ipa,
 		goto free;
 	}
 	INIT_LIST_HEAD(&m->pending);
+	INIT_LIST_HEAD(&m->retiring);
+	INIT_DELAYED_WORK(&m->retire_work, retire_work_fn);
 	ret = ipa_rtk_nat_pool_create(&m->pool, ipa, public_ip, source_metadata, destination_metadata);
 	if (ret)
 		goto free;
@@ -314,6 +393,7 @@ int ipa_rtk_flow_manager_stop(struct ipa_rtk_flow_manager *m)
 	int ret = 0;
 	if (!m || !m->active)
 		return -EINVAL;
+	cancel_delayed_work_sync(&m->retire_work);
 	mutex_lock(&m->lock);
 	if (m->failed) { ret = -ESHUTDOWN; goto out; }
 	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {

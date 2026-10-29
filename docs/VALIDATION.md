@@ -125,10 +125,13 @@ The production NAT pool and manager passed host tests with ASan/UBSan:
 
 The backend/controller passed ARM kernel compilation and the complete source
 export passed a clean-index application check against the pinned vanilla OpenWrt.
-A complete r3 image was installed with configuration preserved by sysupgrade:
+A complete r4 image (expanding the external Realtek TX1 ring to 1024 descriptors,
+adding a 2-second TCP hardware NAT teardown grace period across `NF_FLOW_TEARDOWN`,
+and raising `net.core.netdev_max_backlog` to 4096 to eliminate `gro_cells_receive`
+drops on `qmapmux0.0`) was installed with configuration preserved by sysupgrade:
 
-- image SHA256: `96d16bfe7b5db9b940efb1df1a9d7218db899fb1b9499e5a8849c3af35d88755`;
-- installed controller SHA256: `11f8d576522eb4af04c354e011e5e2f34aae30e06e6757d72b009471759fe8cd`;
+- image SHA256: `0a7798049b37b179f2413ffda872018202b5750d0f89baff7666cc7f447cac10`;
+- installed controller SHA256: `a7d19b94bc25fefbffc36491ae993bade6611f58436c52097d93a62c83581fb9`;
 - installed IPA SHA256: `2a36612aad0ef3d07bda4df3e892bda098843a87fa1238171a26a0c940be37a9`.
 
 The hashes were checked in the image and again in the device's read-only `/rom`.
@@ -140,10 +143,11 @@ attempt hit the modem HWP initialization timeout. Complete-image boots passed.
 
 Two live batches of 200 simultaneous HTTPS downloads (1 MB each) completed
 200/200. Both the driver and conntrack reported 200 simultaneous hardware flows.
-The last batch transferred 200 MB in 18.016 s (88.81 Mbps including 200 TLS
-handshakes and connection setup/teardown). In two fully populated steady samples,
-CPU was 23.42% and 11.93%, softirq 0.90% and 0.92%. Other samples include setup,
-teardown and concurrent management work; aggregate CPU peaks alone are not a
+After the r4 sysupgrade, a live 200-stream HTTPS batch transferred 200 MB in
+7.431 s (215.32 Mbps including 200 TLS handshakes and connection setup/teardown)
+with zero `qmapmux0.0` `rx_dropped` packets. In two earlier fully populated steady
+samples, CPU was 23.42% and 11.93%, softirq 0.90% and 0.92%. Other samples include
+setup, teardown and concurrent management work; aggregate CPU peaks alone are not a
 measurement of forwarding cost. The device owner observed peaks while opening
 LuCI.
 
@@ -156,15 +160,12 @@ ports also completed 12/12 HTTP transfers in the preceding capacity revision.
 Live tests used one physical LAN computer. Two hundred different MAC/IP clients
 were exercised in the production-code model, not on 200 physical devices.
 
-A high-concurrency cleartext HTTP close/FIN test remains a known diagnostic
-limitation: some responses stop before their advertised length. This occurred
-with hardware offload, software flowtable, and also classic CPU NAT with both
-flowtable modes disabled (198/200 classic completions in one batch). A direct
-control through the PC's other Internet connection completed 200/200. HTTP
-keep-alive and the two HTTPS batches completed 200/200 through H5. Header-only
-captures show repeated incoming server FIN packets on affected connections;
-the root cause is not established. Do not attribute this to the operator or
-claim that it has been fixed by the capacity change.
+In 200-stream cleartext HTTP close/FIN bursts, raising `netdev_max_backlog` to
+4096 eliminated `qmapmux0.0` `gro_cells_receive` queue drops (`rx_dropped` delta 0)
+and expanding the external TX1 ring to 1024 descriptors achieved 200/200
+completions (130.64 Mbps in 12.25 s) in two runs, though occasional tail drops
+on the single USB Ethernet test client can still leave a few streams waiting for
+final segments when `FIN` arrives ahead of data.
 
 ## Source Checks
 

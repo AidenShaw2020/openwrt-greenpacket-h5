@@ -333,7 +333,7 @@ new file mode 100644
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=3
++PKG_RELEASE:=4
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -392,10 +392,9 @@ index 00000000..701d494b
 +esac
 diff --git a/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
 new file mode 100644
-index 00000000..d5fb960c
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,60 @@
 +#!/bin/sh /etc/rc.common
 +START=96
 +STOP=10
@@ -433,6 +432,9 @@ index 00000000..d5fb960c
 +start() {
 +	[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "greenpacket,h5-200q1" ] || return 0
 +	[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ] || return 0
++	if [ -w /proc/sys/net/core/netdev_max_backlog ]; then
++		echo 4096 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null || true
++	fi
 +	ensure_controller
 +	[ -e "$stage_file" ] || return 0
 +	if [ "$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]; then
@@ -2737,7 +2739,7 @@ diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c b/package/kern
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,416 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/in.h>
 +#include <linux/jiffies.h>
@@ -2807,6 +2809,8 @@ new file mode 100644
 +		hlist_del_init(&entry->refs[dir].node);
 +	if (!list_empty(&entry->pending))
 +		list_del_init(&entry->pending);
++	if (!list_empty(&entry->retiring))
++		list_del_init(&entry->retiring);
 +	clear_bit(entry - m->entries, m->used);
 +	memset(entry, 0, sizeof(*entry));
 +}
@@ -2855,6 +2859,34 @@ new file mode 100644
 +	return ret;
 +}
 +
++static void expire_retiring(struct ipa_rtk_flow_manager *m, bool force_one)
++{
++	while (!list_empty(&m->retiring)) {
++		struct ipa_rtk_managed_flow *entry =
++			list_first_entry(&m->retiring, struct ipa_rtk_managed_flow, retiring);
++		if (!force_one && !time_after_eq(jiffies, entry->retire_at)) {
++			unsigned long delay = entry->retire_at - jiffies;
++			mod_delayed_work(system_wq, &m->retire_work, delay ? delay : 1);
++			break;
++		}
++		if (remove_entry(m, entry - m->entries))
++			break;
++		if (force_one)
++			break;
++	}
++}
++
++static void retire_work_fn(struct work_struct *work)
++{
++	struct ipa_rtk_flow_manager *m =
++		container_of(to_delayed_work(work), struct ipa_rtk_flow_manager, retire_work);
++
++	mutex_lock(&m->lock);
++	if (m->active && !m->failed)
++		expire_retiring(m, false);
++	mutex_unlock(&m->lock);
++}
++
 +static int managed_replace(void *private, const void *binding, unsigned long cookie,
 +			   const struct ipa_rtk_flow *flow)
 +{
@@ -2877,18 +2909,38 @@ new file mode 100644
 +	    (dir && (flow->ingress_ifindex != m->wan || !lan_out)))
 +		goto out;
 +	expire_pending(m);
++	expire_retiring(m, false);
 +	entry = find_cookie(m, binding, cookie, dir);
++	if (entry && entry->closing) {
++		ret = remove_entry(m, entry - m->entries);
++		if (ret)
++			goto out;
++		entry = NULL;
++	}
 +	if (entry && !same_tuple(&entry->flow[dir].nat, &flow->nat)) {
 +		ret = -ESTALE;
 +		goto out;
 +	}
-+	if (!entry)
++	if (!entry) {
 +		entry = find_tuple(m, binding, &flow->nat);
++		if (entry && entry->closing) {
++			ret = remove_entry(m, entry - m->entries);
++			if (ret)
++				goto out;
++			entry = NULL;
++		}
++	}
 +	if (!entry) {
 +		index = find_first_zero_bit(m->used, IPA_RTK_FLOW_LIMIT);
++		if (index == IPA_RTK_FLOW_LIMIT && !list_empty(&m->retiring)) {
++			expire_retiring(m, true);
++			if (m->failed) { ret = -ESHUTDOWN; goto out; }
++			index = find_first_zero_bit(m->used, IPA_RTK_FLOW_LIMIT);
++		}
 +		if (index == IPA_RTK_FLOW_LIMIT) { ret = -ENOSPC; goto out; }
 +		entry = &m->entries[index];
 +		INIT_LIST_HEAD(&entry->pending);
++		INIT_LIST_HEAD(&entry->retiring);
 +		entry->binding = binding;
 +		entry->used = true;
 +		entry->lastused = jiffies;
@@ -2922,6 +2974,11 @@ new file mode 100644
 +	 * has both independently supplied directions may activate hardware.
 +	 */
 +	ret = ipa_rtk_nat_pool_add(&m->pool, &flow->nat, &entry->nat);
++	if (ret == -ENOSPC && !list_empty(&m->retiring)) {
++		expire_retiring(m, true);
++		if (m->failed) { ret = -ESHUTDOWN; goto out; }
++		ret = ipa_rtk_nat_pool_add(&m->pool, &flow->nat, &entry->nat);
++	}
 +	if (ret) {
 +		if (m->pool.failed)
 +			fail_closed(m);
@@ -2952,9 +3009,31 @@ new file mode 100644
 +	int ret = -ENOENT;
 +	mutex_lock(&m->lock);
 +	if (!m->active || m->failed) { ret = m->failed ? -ESHUTDOWN : -ENOENT; goto out; }
++	expire_retiring(m, false);
 +	entry = find_cookie(m, binding, cookie, 2);
-+	if (entry)
-+		ret = remove_entry(m, entry - m->entries);
++	if (entry) {
++		/* Keep TCP hardware translation alive briefly across FIN/RST
++		 * teardown so in-flight data and SACK retransmissions before
++		 * FIN are not dropped by an immediate NAT miss.
++		 */
++		if (entry->hardware && entry->nat.installed &&
++		    entry->flow[0].nat.protocol == IPPROTO_TCP) {
++			unsigned int dir;
++			for (dir = 0; dir < 2; dir++) {
++				if (entry->present[dir] && entry->cookie[dir] == cookie)
++					hlist_del_init(&entry->refs[dir].node);
++			}
++			if (!entry->closing) {
++				entry->closing = true;
++				entry->retire_at = jiffies + IPA_RTK_TEARDOWN_GRACE;
++				list_add_tail(&entry->retiring, &m->retiring);
++				schedule_delayed_work(&m->retire_work, IPA_RTK_TEARDOWN_GRACE);
++			}
++			ret = 0;
++		} else {
++			ret = remove_entry(m, entry - m->entries);
++		}
++	}
 +out:
 +	mutex_unlock(&m->lock);
 +	return ret;
@@ -3031,6 +3110,8 @@ new file mode 100644
 +		goto free;
 +	}
 +	INIT_LIST_HEAD(&m->pending);
++	INIT_LIST_HEAD(&m->retiring);
++	INIT_DELAYED_WORK(&m->retire_work, retire_work_fn);
 +	ret = ipa_rtk_nat_pool_create(&m->pool, ipa, public_ip, source_metadata, destination_metadata);
 +	if (ret)
 +		goto free;
@@ -3054,6 +3135,7 @@ new file mode 100644
 +	int ret = 0;
 +	if (!m || !m->active)
 +		return -EINVAL;
++	cancel_delayed_work_sync(&m->retire_work);
 +	mutex_lock(&m->lock);
 +	if (m->failed) { ret = -ESHUTDOWN; goto out; }
 +	for (i = 0; i < IPA_RTK_FLOW_LIMIT; i++) {
@@ -3078,16 +3160,18 @@ diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h b/package/kern
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,61 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _IPA_RTK_FLOW_MANAGER_H_
 +#define _IPA_RTK_FLOW_MANAGER_H_
 +#include "ipa_rtk_flowtable.h"
 +#include "ipa_rtk_nat_pool.h"
 +#include <linux/list.h>
++#include <linux/workqueue.h>
 +
 +#define IPA_RTK_FLOW_LIMIT 4000
 +#define IPA_RTK_FLOW_BUCKETS 1024
++#define IPA_RTK_TEARDOWN_GRACE (2 * HZ)
 +struct ipa_rtk_managed_flow;
 +struct ipa_rtk_cookie_ref {
 +	struct hlist_node node;
@@ -3108,13 +3192,13 @@ new file mode 100644
 +struct ipa_rtk_managed_flow {
 +	struct hlist_node tuple_node;
 +	struct ipa_rtk_cookie_ref refs[2];
-+	struct list_head pending;
++	struct list_head pending, retiring;
 +	const void *binding;
-+	unsigned long cookie[2], lastused;
++	unsigned long cookie[2], lastused, retire_at;
 +	struct ipa_rtk_flow flow[2];
 +	struct ipa_rtk_nat_slot nat;
 +	u32 timestamp;
-+	bool present[2], used, hardware;
++	bool present[2], used, hardware, closing;
 +};
 +struct ipa_rtk_flow_manager {
 +	struct mutex lock;
@@ -3122,7 +3206,8 @@ new file mode 100644
 +	struct ipa_rtk_managed_flow *entries;
 +	struct hlist_head *tuples, *cookies;
 +	unsigned long *used;
-+	struct list_head pending;
++	struct list_head pending, retiring;
++	struct delayed_work retire_work;
 +	const struct ipa_rtk_flow_manager_ops *ops;
 +	void *private;
 +	int lan, bridge, wan;
@@ -3972,7 +4057,7 @@ diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c b/package/kernel/h
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
-@@ -0,0 +1,1349 @@
+@@ -0,0 +1,1350 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* SDX65/RTL8125 external DMA controller. Stage 0 is passive domain attachment. */
 +#include <linux/dma-mapping.h>
@@ -4879,7 +4964,8 @@ new file mode 100644
 +		return ret;
 +	for (dir = 0; dir < 2; dir++) {
 +		ret = ipa_rtk_dma_prepare(&c->dma[dir], &c->ipa_pdev->dev,
-+					   c->dev, c->netdev, dir == 0, 256, 2048);
++					   c->dev, c->netdev, dir == 0,
++					   dir == 0 ? 256 : 1024, 2048);
 +		if (ret)
 +			return ret;
 +		ret = gsi_rtk_prepare(&c->ipa->gsi, &c->dma[dir].config, &c->gsi[dir]);
@@ -15115,7 +15201,7 @@ diff --git a/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py b/package/kerne
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,320 @@
 +#!/usr/bin/env python3
 +"""Compile the production pool against a host IPA DMA model (no device I/O).
 +
@@ -15208,7 +15294,7 @@ new file mode 100644
 + void *dev,*mem_virt; };
 +#endif
 +''')
-+    for name in ('mutex.h', 'dma-mapping.h', 'types.h', 'in.h', 'slab.h', 'bitmap.h', 'list.h', 'jhash.h', 'byteorder/generic.h'):
++    for name in ('mutex.h', 'dma-mapping.h', 'types.h', 'in.h', 'slab.h', 'bitmap.h', 'list.h', 'jhash.h', 'workqueue.h', 'byteorder/generic.h'):
 +        (d / 'linux' / name).write_text('#include "shim.h"\n')
 +    for name in ('ipa.h', 'ipa_mem.h'):
 +        (d / name).write_text('#include "shim.h"\n')
@@ -15216,6 +15302,15 @@ new file mode 100644
 +#define HZ 100
 +static unsigned long jiffies;
 +#define time_after(a,b) ((long)((b)-(a)) < 0)
++#define time_after_eq(a,b) ((long)((a)-(b)) >= 0)
++struct work_struct { int unused; };
++struct delayed_work { struct work_struct work; };
++#define system_wq ((void *)0)
++#define to_delayed_work(w) container_of(w, struct delayed_work, work)
++#define INIT_DELAYED_WORK(dw, fn) ((void)(dw), (void)(fn))
++#define schedule_delayed_work(dw, delay) ((void)(dw), (void)(delay))
++#define mod_delayed_work(wq, dw, delay) ((void)(wq), (void)(dw), (void)(delay))
++#define cancel_delayed_work_sync(dw) ((void)(dw))
 +''')
 +    (d / 'ipa_rtk_flowtable.h').write_text('''#include "ipa_rtk_nat_wire.h"
 +#define ETH_HLEN 14
@@ -15386,6 +15481,20 @@ new file mode 100644
 + assert(managed_replace(&m,&ipa,99999,&conflict)==-EEXIST);
 + for(unsigned i=0;i<4000;i++)assert(!managed_destroy(&m,&ipa,2*i+1));
 + assert(removes==4000 && !m.pool.active_count && !quiesces);
++ /* Verify TCP deferred teardown grace period and immediate reuse. */
++ make_tuple(0,true);tuples[0].protocol=6;
++ struct ipa_rtk_flow tf={.nat=tuples[0],.ingress_ifindex=1,.egress_ifindex=3};
++ assert(managed_replace(&m,&ipa,50001,&tf)==-EAGAIN);
++ tf.destination=true;tf.ingress_ifindex=3;tf.egress_ifindex=1;
++ assert(!managed_replace(&m,&ipa,50002,&tf));
++ assert(m.pool.active_count==1);
++ assert(!managed_destroy(&m,&ipa,50001));
++ assert(managed_destroy(&m,&ipa,50002)==0);
++ assert(m.pool.active_count==1 && removes==4000);
++ jiffies+=IPA_RTK_TEARDOWN_GRACE;
++ retire_work_fn(&m.retire_work.work);
++ assert(!m.pool.active_count && removes==4001);
++ make_tuple(0,true);
 + struct ipa_rtk_flow f={.nat=tuples[0],.ingress_ifindex=1,.egress_ifindex=3};
 + assert(managed_replace(&m,&ipa,1,&f)==-EAGAIN);
 + jiffies+=31*HZ;

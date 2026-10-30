@@ -175,7 +175,17 @@ controller `ae40985be8928ad99700b1710e3e8e771b9929e80243152cf927a7d1f76bb46c`)
 was installed by sysupgrade with configuration preserved. It reached stage 4 with
 failed=0 automatically and completed a 200-stream HTTPS batch 200/200 at
 183.07 Mbps in 8.740 s. The new default script was verified on copies of the
-live configuration; unsolicited WAN traffic handling is still not validated.
+live configuration.
+
+Unsolicited WAN UDP was tested on r5 through the carrier CGNAT with RFC 5780
+STUN CHANGE-REQUEST replies from each server's alternate port/address while an
+offloaded flow to its primary address was active. Temporary nftables counters
+on `qmapmux0.0` confirmed arrival at H5. Against two independent servers, 20/20
+probes arrived each time; all took the IPA exception path (`exception_delta`
+20/21), Realtek TX1 did not advance, and the LAN client received none. A third
+server's probes did not reach H5. This covers UDP from a new remote port to an
+existing public mapping, not TCP, inbound traffic without a CGNAT mapping, or a
+public-IP subscription.
 
 ## Source Checks
 

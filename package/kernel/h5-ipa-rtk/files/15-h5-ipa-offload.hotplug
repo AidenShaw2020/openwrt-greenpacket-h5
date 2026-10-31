@@ -12,7 +12,8 @@ ifup|ifupdate)
 	;;
 ifdown)
 	if [ -e "$stage_file" ]; then
-		echo 0 > "$stage_file" 2>/dev/null || true
+		# Stage 2 keeps the NIC rings; stage 0 would reset the LAN link.
+		echo 2 > "$stage_file" 2>/dev/null || echo 0 > "$stage_file" 2>/dev/null || true
 		logger -t h5-ipa-offload "Stopped IPA hardware flowtable offload on $INTERFACE ($ACTION)"
 	fi
 	;;

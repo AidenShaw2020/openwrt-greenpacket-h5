@@ -46,8 +46,11 @@ start() {
 		l3="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 		[ -n "$l3" ] && [ -w "$wan_param" ] && printf '%s' "$l3" > "$wan_param"
 		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null; then
-			echo 0 > "$stage_file" 2>/dev/null || true
-			echo 4 > "$stage_file" 2>/dev/null || true
+			# From stage 2 the NIC rings are reused; reset fully only on failure.
+			if ! echo 4 > "$stage_file" 2>/dev/null; then
+				echo 0 > "$stage_file" 2>/dev/null || true
+				echo 4 > "$stage_file" 2>/dev/null || true
+			fi
 			fw4 -q reload 2>/dev/null || true
 		fi
 	fi

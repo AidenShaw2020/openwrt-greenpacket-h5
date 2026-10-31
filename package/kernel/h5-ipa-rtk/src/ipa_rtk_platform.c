@@ -185,6 +185,7 @@ struct ipa_rtk_controller {
 	struct ipa_rtk_flowtable flowtable;
 	struct notifier_block netdev_nb;
 	struct work_struct netdev_down_work;
+	struct work_struct wan_down_work;
 	struct ipa_rtk_table ul[4], route, route_hash;
 	struct ipa_rtk_header_ref headers[IPA_RTK_MAX_HEADERS];
 	struct ipa_rtk_offload_slot *flows;
@@ -1091,21 +1092,25 @@ static ssize_t stage_store(struct device *dev, struct device_attribute *attr,
 		ret = ipa_rtk_clear(c);
 		goto out;
 	}
-	if (target < c->stage) {
+	if (target == 2 && c->stage > 2) {
+		/* Stop only the WAN-bound offload; the NIC rings keep running. */
+		ret = ipa_rtk_offload_stop(c);
+	} else if (target < c->stage) {
 		ret = -EINVAL;
 		goto out;
+	} else {
+		if (c->stage == 0)
+			ret = ipa_rtk_prepare(c);
+		if (!ret && target >= 2 && c->stage == 1)
+			ret = ipa_rtk_start(c);
+		if (!ret && target == 3 && c->stage == 2) {
+			ret = rtl8125_rss_redirect(c->netdev, 0, c->dma[0].ring);
+			if (!ret)
+				c->stage = 3;
+		}
+		if (!ret && target == 4 && c->stage == 2)
+			ret = ipa_rtk_offload_start(c);
 	}
-	if (c->stage == 0)
-		ret = ipa_rtk_prepare(c);
-	if (!ret && target >= 2 && c->stage == 1)
-		ret = ipa_rtk_start(c);
-	if (!ret && target == 3 && c->stage == 2) {
-		ret = rtl8125_rss_redirect(c->netdev, 0, c->dma[0].ring);
-		if (!ret)
-			c->stage = 3;
-	}
-	if (!ret && target == 4 && c->stage == 2)
-		ret = ipa_rtk_offload_start(c);
 	if (ret) {
 		int cleanup = ipa_rtk_clear(c);
 
@@ -1145,6 +1150,36 @@ static void ipa_rtk_netdev_down_work(struct work_struct *work)
 	mutex_unlock(&c->lock);
 }
 
+/* The mobile data netdev went away (modem reconnect, ModemManager restart).
+ * Only the offload depends on it: return to stage 2 and keep the NIC rings.
+ * Releasing them closes and reopens the RTL8125, which drops the LAN link.
+ */
+static void ipa_rtk_wan_down_work(struct work_struct *work)
+{
+	struct ipa_rtk_controller *c =
+		container_of(work, struct ipa_rtk_controller, wan_down_work);
+	int ret;
+
+	mutex_lock(&c->lock);
+	rtnl_lock();
+	if (c->stage > 2 && !c->failed) {
+		dev_info(c->dev, "WAN netdev event; stopping offload, keeping NIC rings\n");
+		ret = ipa_rtk_offload_stop(c);
+		if (ret) {
+			dev_err(c->dev, "offload stop on WAN event failed (%d); returning to stage0\n",
+				ret);
+			ret = ipa_rtk_clear(c);
+			if (ret) {
+				c->failed = true;
+				dev_err(c->dev, "RTK stop incomplete on WAN event (%d); retaining DMA\n",
+					ret);
+			}
+		}
+	}
+	rtnl_unlock();
+	mutex_unlock(&c->lock);
+}
+
 static int ipa_rtk_netdev_event(struct notifier_block *nb, unsigned long event,
 				void *ptr)
 {
@@ -1155,10 +1190,12 @@ static int ipa_rtk_netdev_event(struct notifier_block *nb, unsigned long event,
 	if (event != NETDEV_GOING_DOWN && event != NETDEV_DOWN &&
 	    event != NETDEV_UNREGISTER && event != NETDEV_CHANGEMTU)
 		return NOTIFY_DONE;
-	if (dev == c->netdev ||
-	    (READ_ONCE(c->wan_ifindex) && dev->ifindex == READ_ONCE(c->wan_ifindex)) ||
-	    !strcmp(dev->name, "qmapmux0.0") || !strcmp(dev->name, "rmnet_ipa0"))
+	if (dev == c->netdev)
 		schedule_work(&c->netdev_down_work);
+	else if ((READ_ONCE(c->wan_ifindex) && dev->ifindex == READ_ONCE(c->wan_ifindex)) ||
+		 (wan_ifname[0] && !strcmp(dev->name, wan_ifname)) ||
+		 !strcmp(dev->name, "qmapmux0.0") || !strcmp(dev->name, "rmnet_ipa0"))
+		schedule_work(&c->wan_down_work);
 	return NOTIFY_DONE;
 }
 
@@ -1287,6 +1324,7 @@ static int ipa_rtk_probe(struct platform_device *pdev)
 	}
 	platform_set_drvdata(pdev, c);
 	INIT_WORK(&c->netdev_down_work, ipa_rtk_netdev_down_work);
+	INIT_WORK(&c->wan_down_work, ipa_rtk_wan_down_work);
 	ret = ipa_rtk_flowtable_register(&c->flowtable, c->netdev,
 					 &ipa_rtk_managed_flow_ops,
 					 &c->flow_manager);
@@ -1300,6 +1338,7 @@ static int ipa_rtk_probe(struct platform_device *pdev)
 	if (ret) {
 		unregister_netdevice_notifier(&c->netdev_nb);
 		cancel_work_sync(&c->netdev_down_work);
+		cancel_work_sync(&c->wan_down_work);
 		goto err_flowtable;
 	}
 	dev_info(&pdev->dev, "ETH SID0x5e3 shares RTL8125 DMA domain; passive stage0\n");
@@ -1336,6 +1375,7 @@ static void ipa_rtk_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_stage);
 	unregister_netdevice_notifier(&c->netdev_nb);
 	cancel_work_sync(&c->netdev_down_work);
+	cancel_work_sync(&c->wan_down_work);
 	if (READ_ONCE(c->flowtable.registered))
 		ipa_rtk_flowtable_unregister(&c->flowtable);
 	mutex_lock(&c->lock);

@@ -338,5 +338,15 @@ offload controller looked for `qmapmux0.0`, fell back to `rmnet_ipa0` and
 Ethernet receive stopped reaching the CPU until reboot. netifd's l3_device is
 now passed in (`wan_ifname`), and `h5-ippt` uses it as well. Repeated with the
 fix: offload followed `qmapmux1.0`, the H5 stayed reachable and mobile data
-returned 25 s after the restart. Each offload stage change still drops the
-LAN link for about 3 s.
+returned 25 s after the restart.
+
+A mobile reconnect used to drop the LAN link for about 3 s twice: losing the
+WAN netdev returned the controller to stage 0, and releasing the external
+rings makes the r8125 IPA library close and reopen the NIC. Only the offload
+depends on the WAN, so a WAN netdev event now stops just the offload (stage
+4 -> 2, also writable as `2`) and keeps the rings; the hotplug script and
+`h5-ippt` use that path (kmod-h5-ipa-rtk release 8). Measured with
+`carrier_changes` on eth0: zero LAN link changes across `ifup mobile` and
+across a ModemManager restart (mux renamed to `qmapmux1.0`); the offload
+returned to stage 4 on the new netdev and a speed test through the
+passthrough router then reached 282/87 Mb/s with 111 new hardware flows.

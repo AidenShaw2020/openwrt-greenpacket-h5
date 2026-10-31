@@ -443,7 +443,7 @@ index 00000000..2201460d
 ++ }
 diff --git a/package/kernel/h5-ipa-rtk/Makefile b/package/kernel/h5-ipa-rtk/Makefile
 new file mode 100644
-index 00000000..63d07025
+index 00000000..e2ffd5b1
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/Makefile
 @@ -0,0 +1,39 @@
@@ -454,7 +454,7 @@ index 00000000..63d07025
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=8
++PKG_RELEASE:=9
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -514,10 +514,10 @@ index 00000000..290626d9
 +esac
 diff --git a/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
 new file mode 100755
-index 00000000..cf87d306
+index 00000000..70492b96
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,70 @@
 +#!/bin/sh /etc/rc.common
 +START=96
 +STOP=10
@@ -571,7 +571,10 @@ index 00000000..cf87d306
 +				echo 0 > "$stage_file" 2>/dev/null || true
 +				echo 4 > "$stage_file" 2>/dev/null || true
 +			fi
-+			fw4 -q reload 2>/dev/null || true
++			# No fw4 reload: the flowtable provider stays registered, and the
++			# firewall hotplug already reloads on mobile ifup. One reload costs
++			# about 1.8 s of CPU, which software forwarding can stretch to
++			# tens of seconds while the offload is down.
 +		fi
 +	fi
 +}
@@ -16196,16 +16199,18 @@ index 00000000..426599cb
 +}
 diff --git a/target/linux/sdx/base-files/etc/hotplug.d/iface/12-h5-ippt b/target/linux/sdx/base-files/etc/hotplug.d/iface/12-h5-ippt
 new file mode 100755
-index 00000000..dc0077fd
+index 00000000..bc8eb76c
 --- /dev/null
 +++ b/target/linux/sdx/base-files/etc/hotplug.d/iface/12-h5-ippt
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,9 @@
 +#!/bin/sh
 +[ "$INTERFACE" = "mobile" ] || exit 0
 +
++# Nothing is torn down on ifdown: the LAN host keeps its lease and gateway,
++# so the H5 stays reachable through it, and a reconnect with the same address
++# restarts neither dnsmasq nor anything else. apply reconciles changes.
 +case "$ACTION" in
 +ifup|ifupdate) /usr/sbin/h5-ippt apply ;;
-+ifdown) /usr/sbin/h5-ippt clear ;;
 +esac
 diff --git a/target/linux/sdx/base-files/etc/hotplug.d/iface/13-h5-cellular-leds b/target/linux/sdx/base-files/etc/hotplug.d/iface/13-h5-cellular-leds
 new file mode 100755

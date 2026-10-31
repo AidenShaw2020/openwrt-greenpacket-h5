@@ -1,7 +1,9 @@
 #!/bin/sh
 [ "$INTERFACE" = "mobile" ] || exit 0
 
+# Nothing is torn down on ifdown: the LAN host keeps its lease and gateway,
+# so the H5 stays reachable through it, and a reconnect with the same address
+# restarts neither dnsmasq nor anything else. apply reconciles changes.
 case "$ACTION" in
 ifup|ifupdate) /usr/sbin/h5-ippt apply ;;
-ifdown) /usr/sbin/h5-ippt clear ;;
 esac

@@ -51,7 +51,10 @@ start() {
 				echo 0 > "$stage_file" 2>/dev/null || true
 				echo 4 > "$stage_file" 2>/dev/null || true
 			fi
-			fw4 -q reload 2>/dev/null || true
+			# No fw4 reload: the flowtable provider stays registered, and the
+			# firewall hotplug already reloads on mobile ifup. One reload costs
+			# about 1.8 s of CPU, which software forwarding can stretch to
+			# tens of seconds while the offload is down.
 		fi
 	fi
 }

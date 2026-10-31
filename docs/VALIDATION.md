@@ -350,3 +350,32 @@ depends on the WAN, so a WAN netdev event now stops just the offload (stage
 across a ModemManager restart (mux renamed to `qmapmux1.0`); the offload
 returned to stage 4 on the new netdev and a speed test through the
 passthrough router then reached 282/87 Mb/s with 111 new hardware flows.
+
+## Passthrough stress tests (2026-10-31)
+
+Load was generated on the downstream OpenWrt router behind the H5 in
+passthrough mode, with HTTP range downloads from two Czech Debian mirrors
+(one CDN rate-limited parallel connections and was not used). The H5 was
+sampled every 5 s.
+
+- 200 concurrent 2 MiB downloads: 200/200 complete, 419 MB in 24-29 s.
+  Up to 199 simultaneous hardware flows, H5 CPU 3-8%, `failed=0`, no kernel
+  messages, no LAN link change; all flows were removed afterwards.
+- Three consecutive speed tests: 170-221 Mb/s down, 78-84 Mb/s up, 0% loss,
+  H5 CPU 3% average (5% peak). A further run reached 276 Mb/s; the NR5G-NSA
+  cell changed during the test, so the spread is radio-side.
+- Mobile reconnect (`ifup mobile`) during 50 concurrent downloads: no LAN
+  link change, hardware offload active 1 s after the mobile interface came
+  back, new downloads then completed. CPU is high only while the mobile
+  link is down and traffic falls back to software.
+- 24 LuCI requests in rounds of 8 during the 200-connection load: all served
+  in 0.5-2.2 s.
+
+The first reconnect-under-load run took up to 49 s to restore the offload:
+one `fw4 reload` costs about 1.8 s of CPU and software forwarding left the
+hotplug scripts a few percent of it. The offload init script no longer
+reloads the firewall (the provider stays registered and the firewall
+hotplug reloads on mobile ifup anyway), and `h5-ippt` no longer tears down
+the passthrough state on mobile ifdown, so an unchanged address restarts
+nothing. The LAN host keeps its gateway and can reach the H5 during an
+outage.

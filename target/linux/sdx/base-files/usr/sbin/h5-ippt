@@ -67,7 +67,12 @@ apply_runtime() {
 	[ -n "$mac" ] || { log "no LAN host MAC configured"; clear_runtime; return 1; }
 
 	st="$(ifstatus mobile 2>/dev/null)"
-	[ "$(echo "$st" | jsonfilter -e '@.up')" = true ] || { clear_runtime; return 0; }
+	# Before netifd is ready (boot) there is no status to parse.
+	[ -n "$st" ] && [ "$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)" = true ] ||
+		{ clear_runtime; return 0; }
+	# ModemManager may recreate its mux link under another name.
+	WAN="$(echo "$st" | jsonfilter -e '@.l3_device')"
+	[ -n "$WAN" ] || WAN=qmapmux0.0
 	IP="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].address')"
 	PREFIX="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].mask')"
 	GW="$(echo "$st" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' | head -n1)"

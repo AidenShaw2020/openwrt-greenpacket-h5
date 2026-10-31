@@ -308,3 +308,35 @@ its ubus connection at import time in the uhttpd parent, so all forked request
 processes shared one socket. With the per-request connection patch, eight
 concurrent requests completed in 0.5-1.4 s and five successive hard reloads
 in headless Chrome 156 rendered the menu with no pending requests.
+
+## Boot time, idle load and reconnect robustness (2026-10-31)
+
+Idle CPU load fell from about 3.5% to 0.6%. The radio LED helper polled
+`mmcli` every 10 s (about 0.22 s CPU per poll, including ModemManager and
+D-Bus). It now follows the mobile interface through hotplug and, only while
+connected, asks the modem for the serving cell (`h5-at serving`, about 0.02 s
+CPU) every 30 s. The 5G LED tracks an actual NR5G-NSA/SA serving cell.
+
+Measured boot to mobile data: 174 s before, about 132 s after:
+
+- NAND reads were 2.2 MB/s because `qcom_nandc` only enables the RPMh QPIC
+  clock, leaving the minimum vote. The stock driver sets 100 MHz
+  (`MSM_NAND_BUS_VOTE_MAX_RATE`); the DT now assigns that rate, giving
+  4.9 MB/s raw and 2.1 MB/s through the stock firmware squashfs.
+- `h5-modem` starts right after the network, asynchronously. Loading the
+  modem firmware no longer holds back the remaining init scripts. Starting it
+  before the network only delayed the LAN, as the load competes for NAND/CPU.
+- ModemManager spent two 10 s timeouts on SUPL/assistance data requests the
+  SoC QMI LOC service never answers. The qcom-soc plugin now reports no
+  location capabilities (GNSS is unused on this CPE).
+- The modem recreates its glink channels while starting, so a one-time DS
+  bind could attach to a vanished channel. A rpmsg hotplug script binds DS to
+  rpmsg_char on every add and creates `/dev/h5-at`.
+
+After a ModemManager restart its mux link came back as `qmapmux1.0`. The
+offload controller looked for `qmapmux0.0`, fell back to `rmnet_ipa0` and
+Ethernet receive stopped reaching the CPU until reboot. netifd's l3_device is
+now passed in (`wan_ifname`), and `h5-ippt` uses it as well. Repeated with the
+fix: offload followed `qmapmux1.0`, the H5 stayed reachable and mobile data
+returned 25 s after the restart. Each offload stage change still drops the
+LAN link for about 3 s.

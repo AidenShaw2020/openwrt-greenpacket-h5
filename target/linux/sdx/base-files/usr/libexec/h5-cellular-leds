@@ -1,28 +1,34 @@
 #!/bin/sh
 # Drive only the radio LEDs; modem control remains with ModemManager/netifd.
+# The LEDs are off unless the mobile interface is up. While it is, one
+# serving-cell AT query every 30 s picks 4G or 5G; mmcli would cost several
+# times more CPU per poll on this single-core CPE. A hotplug script signals
+# USR1 on mobile ifup/ifdown for an immediate update.
 set_led() {
 	local path="/sys/class/leds/h5:$1/brightness"
 	[ -w "$path" ] && echo "$2" > "$path"
 }
 trap 'set_led 4g 0; set_led 5g 0; exit 0' TERM INT
+trap 'kill "$sleeper" 2>/dev/null' USR1
+lte=0
+nr=0
 while :; do
-	info="$(mmcli -m any --output-keyvalue 2>/dev/null)"
-	state="$(printf '%s\n' "$info" | sed -n 's/^modem.generic.state *: *//p')"
-	tech="$(printf '%s\n' "$info" | sed -n \
-		-e 's/^modem.generic.access-technologies *: *//p' \
-		-e 's/^modem.generic.access-technologies.value\[[0-9][0-9]*\] *: *//p')"
-	lte=0
-	nr=0
-	case "$state" in
-		registered|connecting|connected)
-			case "$tech" in
-				*5gnr*) nr=1 ;;
-				*lte*) lte=1 ;;
-			esac
-			;;
-	esac
+	if [ "$(ubus call network.interface.mobile status 2>/dev/null | jsonfilter -e '@.up')" = true ]; then
+		serving="$(/usr/libexec/h5-at serving 2>/dev/null)"
+		case "$serving" in
+			# LuCI or a cell-lock change holds the AT port; keep the LEDs.
+			*'"error":"busy"'*) ;;
+			*NR5G-SA*|*NR5G-NSA*) lte=0; nr=1 ;;
+			*LTE*) lte=1; nr=0 ;;
+			*) lte=0; nr=0 ;;
+		esac
+	else
+		lte=0
+		nr=0
+	fi
 	set_led 4g "$lte"
 	set_led 5g "$nr"
-	sleep 10 &
-	wait $!
+	sleep 30 &
+	sleeper=$!
+	wait "$sleeper"
 done

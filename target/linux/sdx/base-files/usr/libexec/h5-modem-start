@@ -60,6 +60,13 @@ echo disabled > /sys/class/remoteproc/remoteproc0/coredump
 sleep 1
 echo start > /sys/class/remoteproc/remoteproc0/state
 if [ -f "/lib/modules/$(uname -r)/rpmsg_char.ko" ]; then
-	/usr/libexec/h5-at-bind || logger -t h5-modem 'DS AT endpoint binding failed'
+	# /etc/hotplug.d/rpmsg/20-h5-at binds the DS channel whenever glink
+	# (re)creates it; bind directly only if that has not happened in time.
+	for n in $(seq 1 60); do
+		[ -e /dev/h5-at ] && break
+		sleep 1
+	done
+	[ -e /dev/h5-at ] || /usr/libexec/h5-at-bind ||
+		logger -t h5-modem 'DS AT endpoint binding failed'
 fi
 logger -t h5-modem 'Modem started with upstream drivers and local read-only stock firmware'

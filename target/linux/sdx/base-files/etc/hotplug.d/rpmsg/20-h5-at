@@ -1,0 +1,25 @@
+#!/bin/sh
+# The modem (re)creates its glink channels while it starts, so a one-time
+# bind can attach to a channel that disappears again. Bind the DS channel to
+# rpmsg_char on every add, and point /dev/h5-at at its character device.
+# Upstream drivers only; the channel stays outside ModemManager's probing.
+[ "$ACTION" = add ] || exit 0
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
+
+dev="/sys$DEVPATH"
+if [ -n "$DEVNAME" ]; then
+	# rpmsg_char character device of a bound channel
+	[ "$(cat "$dev/name" 2>/dev/null)" = DS ] || exit 0
+	[ -c "/dev/$DEVNAME" ] || exit 0
+	chmod 600 "/dev/$DEVNAME"
+	ln -sf "/dev/$DEVNAME" /dev/h5-at
+	logger -t h5-at "DS AT endpoint at /dev/$DEVNAME"
+	exit 0
+fi
+
+[ "$(cat "$dev/name" 2>/dev/null)" = DS ] || exit 0
+[ -e "$dev/driver" ] && exit 0
+modprobe rpmsg_char 2>/dev/null
+echo rpmsg_chrdev > "$dev/driver_override"
+echo "${DEVPATH##*/}" > /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind ||
+	logger -t h5-at "binding ${DEVPATH##*/} to rpmsg_chrdev failed"

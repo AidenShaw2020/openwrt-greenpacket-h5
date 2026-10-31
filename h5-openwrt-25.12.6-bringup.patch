@@ -352,9 +352,98 @@ index 00000000..475aeb57
 ++     }
 ++ }
 ++ 
+diff --git a/h5-patches/packages/040-0007-qcom-soc-skip-unused-location-setup.patch b/h5-patches/packages/040-0007-qcom-soc-skip-unused-location-setup.patch
+new file mode 100644
+index 00000000..2201460d
+--- /dev/null
++++ b/h5-patches/packages/040-0007-qcom-soc-skip-unused-location-setup.patch
+@@ -0,0 +1,83 @@
++diff --git a/net/modemmanager/patches/0007-qcom-soc-skip-unused-location-setup.patch b/net/modemmanager/patches/0007-qcom-soc-skip-unused-location-setup.patch
++new file mode 100644
++index 0000000..7a3aea6
++--- /dev/null
+++++ b/net/modemmanager/patches/0007-qcom-soc-skip-unused-location-setup.patch
++@@ -0,0 +1,77 @@
+++From: AidenShaw2020
+++Subject: [PATCH] qcom-soc: skip unused location setup
+++
+++The SoC QMI LOC service accepts the SUPL server and assistance data
+++requests but never sends the indications, costing two 10 s timeouts
+++before the modem can be unlocked on every start. GNSS is not used on
+++the GreenPacket H5; report no location capabilities.
+++---
+++--- a/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
++++++ b/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
+++@@ -24,9 +24,51 @@
+++ #include "ModemManager.h"
+++ #include "mm-log.h"
+++ #include "mm-iface-modem.h"
++++#include "mm-iface-modem-location.h"
+++ #include "mm-broadband-modem-qmi-qcom-soc.h"
+++ 
+++-G_DEFINE_TYPE (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI)
++++static void iface_modem_location_init (MMIfaceModemLocationInterface *iface);
++++
++++G_DEFINE_TYPE_EXTENDED (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI, 0,
++++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_LOCATION, iface_modem_location_init))
++++
++++/*****************************************************************************/
++++/* Location capabilities loading (Location interface)
++++ *
++++ * GNSS is not used on SoC-integrated CPEs such as the GreenPacket H5. Their
++++ * QMI LOC service accepts the SUPL server and assistance data requests but
++++ * never sends the indications, which costs two 10 s timeouts before the
++++ * modem can be unlocked on every start. Report no location capabilities so
++++ * the Location interface is not initialized.
++++ */
++++
++++static MMModemLocationSource
++++location_load_capabilities_finish (MMIfaceModemLocation  *self,
++++                                   GAsyncResult          *res,
++++                                   GError               **error)
++++{
++++    GError *inner_error = NULL;
++++    gssize  value;
++++
++++    value = g_task_propagate_int (G_TASK (res), &inner_error);
++++    if (inner_error) {
++++        g_propagate_error (error, inner_error);
++++        return MM_MODEM_LOCATION_SOURCE_NONE;
++++    }
++++    return (MMModemLocationSource)value;
++++}
++++
++++static void
++++location_load_capabilities (MMIfaceModemLocation *self,
++++                            GAsyncReadyCallback   callback,
++++                            gpointer              user_data)
++++{
++++    GTask *task;
++++
++++    task = g_task_new (self, NULL, callback, user_data);
++++    g_task_return_int (task, MM_MODEM_LOCATION_SOURCE_NONE);
++++    g_object_unref (task);
++++}
+++ 
+++ /*****************************************************************************/
+++ 
+++@@ -165,6 +207,13 @@
+++ }
+++ 
+++ static void
++++iface_modem_location_init (MMIfaceModemLocationInterface *iface)
++++{
++++    iface->load_capabilities = location_load_capabilities;
++++    iface->load_capabilities_finish = location_load_capabilities_finish;
++++}
++++
++++static void
+++ mm_broadband_modem_qmi_qcom_soc_init (MMBroadbandModemQmiQcomSoc *self)
+++ {
+++ }
 diff --git a/package/kernel/h5-ipa-rtk/Makefile b/package/kernel/h5-ipa-rtk/Makefile
 new file mode 100644
-index 00000000..b3749a53
+index 00000000..8c9c402c
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/Makefile
 @@ -0,0 +1,39 @@
@@ -365,7 +454,7 @@ index 00000000..b3749a53
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=6
++PKG_RELEASE:=7
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -424,15 +513,16 @@ index 00000000..701d494b
 +esac
 diff --git a/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
 new file mode 100755
-index 00000000..f4fccf15
+index 00000000..598c14c8
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,64 @@
 +#!/bin/sh /etc/rc.common
 +START=96
 +STOP=10
 +
 +stage_file=/sys/bus/platform/devices/soc:ipa-ethernet/stage
++wan_param=/sys/module/h5_ipa_rtk/parameters/wan_ifname
 +
 +bind_r8125() {
 +	local pci dev driver
@@ -471,6 +561,9 @@ index 00000000..f4fccf15
 +	ensure_controller
 +	[ -e "$stage_file" ] || return 0
 +	if [ "$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]; then
++		# Pass netifd's data netdev; ModemManager may recreate its mux link.
++		l3="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
++		[ -n "$l3" ] && [ -w "$wan_param" ] && printf '%s' "$l3" > "$wan_param"
 +		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null; then
 +			echo 0 > "$stage_file" 2>/dev/null || true
 +			echo 4 > "$stage_file" 2>/dev/null || true
@@ -4118,10 +4211,10 @@ index 00000000..f9e17b77
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
 new file mode 100644
-index 00000000..dca6ae5e
+index 00000000..a8492d0d
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
-@@ -0,0 +1,1367 @@
+@@ -0,0 +1,1383 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* SDX65/RTL8125 external DMA controller. Stage 0 is passive domain attachment. */
 +#include <linux/dma-mapping.h>
@@ -4851,6 +4944,24 @@ index 00000000..dca6ae5e
 +module_param_string(passthrough_ip, passthrough_ip, sizeof(passthrough_ip), 0644);
 +MODULE_PARM_DESC(passthrough_ip, "WAN IPv4 address leased to the LAN host in IP passthrough");
 +
++/* The mobile data netdev as configured by netifd. ModemManager recreates its
++ * mux link when it restarts; falling back to rmnet_ipa0 then programs the
++ * wrong WAN and Ethernet receive stops reaching the CPU.
++ */
++static char wan_ifname[IFNAMSIZ];
++module_param_string(wan_ifname, wan_ifname, sizeof(wan_ifname), 0644);
++MODULE_PARM_DESC(wan_ifname, "Mobile data netdev (the l3_device of the mobile interface)");
++
++static struct net_device *ipa_rtk_wan_dev(void)
++{
++	struct net_device *dev;
++
++	if (wan_ifname[0])
++		return __dev_get_by_name(&init_net, strim(wan_ifname));
++	dev = __dev_get_by_name(&init_net, "qmapmux0.0");
++	return dev ? dev : __dev_get_by_name(&init_net, "rmnet_ipa0");
++}
++
 +static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 +{
 +	struct h5_install_fltr_rule_req_msg *rules = NULL;
@@ -4864,9 +4975,7 @@ index 00000000..dca6ae5e
 +
 +	if (c->stage != 2)
 +		return -EINVAL;
-+	wan_dev = __dev_get_by_name(&init_net, "qmapmux0.0");
-+	if (!wan_dev)
-+		wan_dev = __dev_get_by_name(&init_net, "rmnet_ipa0");
++	wan_dev = ipa_rtk_wan_dev();
 +	if (!wan_dev)
 +		return -ENODEV;
 +	wan_ifindex = wan_dev->ifindex;
@@ -7764,10 +7873,10 @@ index 00000000..fff968c5
 +esac
 diff --git a/package/utils/h5-modem-tools/src/h5-at.c b/package/utils/h5-modem-tools/src/h5-at.c
 new file mode 100644
-index 00000000..b5a64798
+index 00000000..c186f585
 --- /dev/null
 +++ b/package/utils/h5-modem-tools/src/h5-at.c
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,174 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <errno.h>
 +#include <fcntl.h>
@@ -7898,6 +8007,9 @@ index 00000000..b5a64798
 +    unsigned freq, pci, scs, band;
 +    if (argc == 2 && !strcmp(argv[1], "status")) {
 +        queries = status; count = sizeof(status) / sizeof(*status);
++    } else if (argc == 2 && !strcmp(argv[1], "serving")) {
++        /* Serving cell only: the radio LED helper polls this. */
++        queries = status; count = 1;
 +    } else if (argc == 2 && !strcmp(argv[1], "capabilities")) {
 +        queries = capabilities; count = sizeof(capabilities) / sizeof(*capabilities);
 +    } else if (argc == 4 && !strcmp(argv[1], "lock-lte") &&
@@ -8097,7 +8209,7 @@ index 00000000..3cc8bf79
 +	option service_version '3'
 diff --git a/target/linux/sdx/base-files/etc/init.d/h5-cellular-leds b/target/linux/sdx/base-files/etc/init.d/h5-cellular-leds
 new file mode 100755
-index 00000000..ea61a936
+index 00000000..2692d5f3
 --- /dev/null
 +++ b/target/linux/sdx/base-files/etc/init.d/h5-cellular-leds
 @@ -0,0 +1,12 @@
@@ -8107,7 +8219,7 @@ index 00000000..ea61a936
 +USE_PROCD=1
 +
 +start_service() {
-+	[ -x /usr/bin/mmcli ] || return 0
++	[ -x /usr/libexec/h5-at ] || return 0
 +	procd_open_instance
 +	procd_set_param command /usr/libexec/h5-cellular-leds
 +	procd_set_param respawn 3600 5 5
@@ -8115,15 +8227,25 @@ index 00000000..ea61a936
 +}
 diff --git a/target/linux/sdx/base-files/etc/init.d/h5-modem b/target/linux/sdx/base-files/etc/init.d/h5-modem
 new file mode 100755
-index 00000000..886f0fdf
+index 00000000..7ce5929b
 --- /dev/null
 +++ b/target/linux/sdx/base-files/etc/init.d/h5-modem
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,16 @@
 +#!/bin/sh /etc/rc.common
-+START=78
++# Start right after the LAN and asynchronously: loading the modem firmware
++# from NAND takes tens of seconds and would otherwise hold back every later
++# init script. Starting it before the network only delayed the LAN, because
++# the firmware load competes for the same NAND and CPU.
++START=22
++USE_PROCD=1
 +
-+start() {
-+	/usr/libexec/h5-modem-start || logger -t h5-modem 'Modem startup failed; LAN management remains available'
++start_service() {
++	procd_open_instance
++	procd_set_param command /bin/sh -c \
++		"/usr/libexec/h5-modem-start || logger -t h5-modem 'Modem startup failed; LAN management remains available'"
++	procd_set_param stdout 1
++	procd_set_param stderr 1
++	procd_close_instance
 +}
 diff --git a/target/linux/sdx/base-files/etc/inittab b/target/linux/sdx/base-files/etc/inittab
 new file mode 100644
@@ -8252,10 +8374,10 @@ index 00000000..ff7f944d
 +}
 diff --git a/target/linux/sdx/base-files/usr/libexec/h5-at-bind b/target/linux/sdx/base-files/usr/libexec/h5-at-bind
 new file mode 100755
-index 00000000..c4a07eaa
+index 00000000..4c12ccdb
 --- /dev/null
 +++ b/target/linux/sdx/base-files/usr/libexec/h5-at-bind
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,39 @@
 +#!/bin/sh
 +# Use the upstream persistent default endpoint, outside MM's WWAN probing.
 +set -eu
@@ -8263,7 +8385,8 @@ index 00000000..c4a07eaa
 +[ "$(cat /sys/class/remoteproc/remoteproc0/state)" = running ] || exit 1
 +modprobe rpmsg_char
 +
-+for n in $(seq 1 10); do
++# The DS channel can appear well after "running" while the boot is busy.
++for n in $(seq 1 60); do
 +	count=0
 +	for p in /sys/bus/rpmsg/devices/*; do
 +		[ -f "$p/name" ] || continue
@@ -8296,44 +8419,50 @@ index 00000000..c4a07eaa
 +exit 1
 diff --git a/target/linux/sdx/base-files/usr/libexec/h5-cellular-leds b/target/linux/sdx/base-files/usr/libexec/h5-cellular-leds
 new file mode 100755
-index 00000000..a788932f
+index 00000000..5d716cf4
 --- /dev/null
 +++ b/target/linux/sdx/base-files/usr/libexec/h5-cellular-leds
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,34 @@
 +#!/bin/sh
 +# Drive only the radio LEDs; modem control remains with ModemManager/netifd.
++# The LEDs are off unless the mobile interface is up. While it is, one
++# serving-cell AT query every 30 s picks 4G or 5G; mmcli would cost several
++# times more CPU per poll on this single-core CPE. A hotplug script signals
++# USR1 on mobile ifup/ifdown for an immediate update.
 +set_led() {
 +	local path="/sys/class/leds/h5:$1/brightness"
 +	[ -w "$path" ] && echo "$2" > "$path"
 +}
 +trap 'set_led 4g 0; set_led 5g 0; exit 0' TERM INT
++trap 'kill "$sleeper" 2>/dev/null' USR1
++lte=0
++nr=0
 +while :; do
-+	info="$(mmcli -m any --output-keyvalue 2>/dev/null)"
-+	state="$(printf '%s\n' "$info" | sed -n 's/^modem.generic.state *: *//p')"
-+	tech="$(printf '%s\n' "$info" | sed -n \
-+		-e 's/^modem.generic.access-technologies *: *//p' \
-+		-e 's/^modem.generic.access-technologies.value\[[0-9][0-9]*\] *: *//p')"
-+	lte=0
-+	nr=0
-+	case "$state" in
-+		registered|connecting|connected)
-+			case "$tech" in
-+				*5gnr*) nr=1 ;;
-+				*lte*) lte=1 ;;
-+			esac
-+			;;
-+	esac
++	if [ "$(ubus call network.interface.mobile status 2>/dev/null | jsonfilter -e '@.up')" = true ]; then
++		serving="$(/usr/libexec/h5-at serving 2>/dev/null)"
++		case "$serving" in
++			# LuCI or a cell-lock change holds the AT port; keep the LEDs.
++			*'"error":"busy"'*) ;;
++			*NR5G-SA*|*NR5G-NSA*) lte=0; nr=1 ;;
++			*LTE*) lte=1; nr=0 ;;
++			*) lte=0; nr=0 ;;
++		esac
++	else
++		lte=0
++		nr=0
++	fi
 +	set_led 4g "$lte"
 +	set_led 5g "$nr"
-+	sleep 10 &
-+	wait $!
++	sleep 30 &
++	sleeper=$!
++	wait "$sleeper"
 +done
 diff --git a/target/linux/sdx/base-files/usr/libexec/h5-modem-start b/target/linux/sdx/base-files/usr/libexec/h5-modem-start
 new file mode 100755
-index 00000000..8e82d250
+index 00000000..e9f7bba9
 --- /dev/null
 +++ b/target/linux/sdx/base-files/usr/libexec/h5-modem-start
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,72 @@
 +#!/bin/sh
 +# Start the upstream drivers using the existing stock read-only firmware volume.
 +set -eu
@@ -8396,7 +8525,14 @@ index 00000000..8e82d250
 +sleep 1
 +echo start > /sys/class/remoteproc/remoteproc0/state
 +if [ -f "/lib/modules/$(uname -r)/rpmsg_char.ko" ]; then
-+	/usr/libexec/h5-at-bind || logger -t h5-modem 'DS AT endpoint binding failed'
++	# /etc/hotplug.d/rpmsg/20-h5-at binds the DS channel whenever glink
++	# (re)creates it; bind directly only if that has not happened in time.
++	for n in $(seq 1 60); do
++		[ -e /dev/h5-at ] && break
++		sleep 1
++	done
++	[ -e /dev/h5-at ] || /usr/libexec/h5-at-bind ||
++		logger -t h5-modem 'DS AT endpoint binding failed'
 +fi
 +logger -t h5-modem 'Modem started with upstream drivers and local read-only stock firmware'
 diff --git a/target/linux/sdx/config-6.12 b/target/linux/sdx/config-6.12
@@ -9110,10 +9246,10 @@ index 00000000..c3fc172e
 +};
 diff --git a/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-ipa.dts b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-ipa.dts
 new file mode 100644
-index 00000000..24557af2
+index 00000000..a9e0e040
 --- /dev/null
 +++ b/target/linux/sdx/files-6.12/arch/arm/boot/dts/qcom/qcom-sdx65-greenpacket-h5-ipa.dts
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,38 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +#include "qcom-sdx65-greenpacket-h5-modem.dts"
 +
@@ -9134,6 +9270,12 @@ index 00000000..24557af2
 +
 +&qpic_nand {
 +	status = "okay";
++	/* The stock msm_qpic_nand driver sets 100 MHz (MSM_NAND_BUS_VOTE_MAX_RATE).
++	 * qcom_nandc only enables the RPMh clock, which leaves the minimum vote:
++	 * raw reads measured 2.2 MB/s, versus 4.9 MB/s at 100 MHz.
++	 */
++	assigned-clocks = <&rpmhcc RPMH_QPIC_CLK>;
++	assigned-clock-rates = <100000000>;
 +
 +	nand@0 {
 +		reg = <0>;
@@ -16021,6 +16163,52 @@ index 00000000..dc0077fd
 +ifup|ifupdate) /usr/sbin/h5-ippt apply ;;
 +ifdown) /usr/sbin/h5-ippt clear ;;
 +esac
+diff --git a/target/linux/sdx/base-files/etc/hotplug.d/iface/13-h5-cellular-leds b/target/linux/sdx/base-files/etc/hotplug.d/iface/13-h5-cellular-leds
+new file mode 100755
+index 00000000..abcc63db
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/hotplug.d/iface/13-h5-cellular-leds
+@@ -0,0 +1,9 @@
++#!/bin/sh
++[ "$INTERFACE" = "mobile" ] || exit 0
++
++case "$ACTION" in
++ifup|ifdown)
++	# SIGUSR1: wake the LED helper instead of waiting for its next poll.
++	ubus call service signal '{"name":"h5-cellular-leds","signal":10}' 2>/dev/null
++	;;
++esac
+diff --git a/target/linux/sdx/base-files/etc/hotplug.d/rpmsg/20-h5-at b/target/linux/sdx/base-files/etc/hotplug.d/rpmsg/20-h5-at
+new file mode 100755
+index 00000000..138f5fa6
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/hotplug.d/rpmsg/20-h5-at
+@@ -0,0 +1,25 @@
++#!/bin/sh
++# The modem (re)creates its glink channels while it starts, so a one-time
++# bind can attach to a channel that disappears again. Bind the DS channel to
++# rpmsg_char on every add, and point /dev/h5-at at its character device.
++# Upstream drivers only; the channel stays outside ModemManager's probing.
++[ "$ACTION" = add ] || exit 0
++[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
++
++dev="/sys$DEVPATH"
++if [ -n "$DEVNAME" ]; then
++	# rpmsg_char character device of a bound channel
++	[ "$(cat "$dev/name" 2>/dev/null)" = DS ] || exit 0
++	[ -c "/dev/$DEVNAME" ] || exit 0
++	chmod 600 "/dev/$DEVNAME"
++	ln -sf "/dev/$DEVNAME" /dev/h5-at
++	logger -t h5-at "DS AT endpoint at /dev/$DEVNAME"
++	exit 0
++fi
++
++[ "$(cat "$dev/name" 2>/dev/null)" = DS ] || exit 0
++[ -e "$dev/driver" ] && exit 0
++modprobe rpmsg_char 2>/dev/null
++echo rpmsg_chrdev > "$dev/driver_override"
++echo "${DEVPATH##*/}" > /sys/bus/rpmsg/drivers/rpmsg_chrdev/bind ||
++	logger -t h5-at "binding ${DEVPATH##*/} to rpmsg_chrdev failed"
 diff --git a/target/linux/sdx/base-files/etc/init.d/h5-ippt b/target/linux/sdx/base-files/etc/init.d/h5-ippt
 new file mode 100755
 index 00000000..43a51dcc
@@ -16077,10 +16265,10 @@ index 00000000..a6678384
 +exit 0
 diff --git a/target/linux/sdx/base-files/usr/sbin/h5-ippt b/target/linux/sdx/base-files/usr/sbin/h5-ippt
 new file mode 100755
-index 00000000..c464270f
+index 00000000..42270ba6
 --- /dev/null
 +++ b/target/linux/sdx/base-files/usr/sbin/h5-ippt
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,248 @@
 +#!/bin/sh
 +# H5 IPv4 passthrough: lease the mobile IPv4 address to one LAN host.
 +#
@@ -16150,7 +16338,12 @@ index 00000000..c464270f
 +	[ -n "$mac" ] || { log "no LAN host MAC configured"; clear_runtime; return 1; }
 +
 +	st="$(ifstatus mobile 2>/dev/null)"
-+	[ "$(echo "$st" | jsonfilter -e '@.up')" = true ] || { clear_runtime; return 0; }
++	# Before netifd is ready (boot) there is no status to parse.
++	[ -n "$st" ] && [ "$(echo "$st" | jsonfilter -e '@.up' 2>/dev/null)" = true ] ||
++		{ clear_runtime; return 0; }
++	# ModemManager may recreate its mux link under another name.
++	WAN="$(echo "$st" | jsonfilter -e '@.l3_device')"
++	[ -n "$WAN" ] || WAN=qmapmux0.0
 +	IP="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].address')"
 +	PREFIX="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].mask')"
 +	GW="$(echo "$st" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' | head -n1)"

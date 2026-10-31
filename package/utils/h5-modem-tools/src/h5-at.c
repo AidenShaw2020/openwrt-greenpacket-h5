@@ -128,6 +128,9 @@ int main(int argc, char **argv)
     unsigned freq, pci, scs, band;
     if (argc == 2 && !strcmp(argv[1], "status")) {
         queries = status; count = sizeof(status) / sizeof(*status);
+    } else if (argc == 2 && !strcmp(argv[1], "serving")) {
+        /* Serving cell only: the radio LED helper polls this. */
+        queries = status; count = 1;
     } else if (argc == 2 && !strcmp(argv[1], "capabilities")) {
         queries = capabilities; count = sizeof(capabilities) / sizeof(*capabilities);
     } else if (argc == 4 && !strcmp(argv[1], "lock-lte") &&

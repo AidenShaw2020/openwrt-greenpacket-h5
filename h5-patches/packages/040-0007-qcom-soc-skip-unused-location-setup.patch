@@ -1,0 +1,83 @@
+diff --git a/net/modemmanager/patches/0007-qcom-soc-skip-unused-location-setup.patch b/net/modemmanager/patches/0007-qcom-soc-skip-unused-location-setup.patch
+new file mode 100644
+index 0000000..7a3aea6
+--- /dev/null
++++ b/net/modemmanager/patches/0007-qcom-soc-skip-unused-location-setup.patch
+@@ -0,0 +1,77 @@
++From: AidenShaw2020
++Subject: [PATCH] qcom-soc: skip unused location setup
++
++The SoC QMI LOC service accepts the SUPL server and assistance data
++requests but never sends the indications, costing two 10 s timeouts
++before the modem can be unlocked on every start. GNSS is not used on
++the GreenPacket H5; report no location capabilities.
++---
++--- a/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
+++++ b/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
++@@ -24,9 +24,51 @@
++ #include "ModemManager.h"
++ #include "mm-log.h"
++ #include "mm-iface-modem.h"
+++#include "mm-iface-modem-location.h"
++ #include "mm-broadband-modem-qmi-qcom-soc.h"
++ 
++-G_DEFINE_TYPE (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI)
+++static void iface_modem_location_init (MMIfaceModemLocationInterface *iface);
+++
+++G_DEFINE_TYPE_EXTENDED (MMBroadbandModemQmiQcomSoc, mm_broadband_modem_qmi_qcom_soc, MM_TYPE_BROADBAND_MODEM_QMI, 0,
+++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_LOCATION, iface_modem_location_init))
+++
+++/*****************************************************************************/
+++/* Location capabilities loading (Location interface)
+++ *
+++ * GNSS is not used on SoC-integrated CPEs such as the GreenPacket H5. Their
+++ * QMI LOC service accepts the SUPL server and assistance data requests but
+++ * never sends the indications, which costs two 10 s timeouts before the
+++ * modem can be unlocked on every start. Report no location capabilities so
+++ * the Location interface is not initialized.
+++ */
+++
+++static MMModemLocationSource
+++location_load_capabilities_finish (MMIfaceModemLocation  *self,
+++                                   GAsyncResult          *res,
+++                                   GError               **error)
+++{
+++    GError *inner_error = NULL;
+++    gssize  value;
+++
+++    value = g_task_propagate_int (G_TASK (res), &inner_error);
+++    if (inner_error) {
+++        g_propagate_error (error, inner_error);
+++        return MM_MODEM_LOCATION_SOURCE_NONE;
+++    }
+++    return (MMModemLocationSource)value;
+++}
+++
+++static void
+++location_load_capabilities (MMIfaceModemLocation *self,
+++                            GAsyncReadyCallback   callback,
+++                            gpointer              user_data)
+++{
+++    GTask *task;
+++
+++    task = g_task_new (self, NULL, callback, user_data);
+++    g_task_return_int (task, MM_MODEM_LOCATION_SOURCE_NONE);
+++    g_object_unref (task);
+++}
++ 
++ /*****************************************************************************/
++ 
++@@ -165,6 +207,13 @@
++ }
++ 
++ static void
+++iface_modem_location_init (MMIfaceModemLocationInterface *iface)
+++{
+++    iface->load_capabilities = location_load_capabilities;
+++    iface->load_capabilities_finish = location_load_capabilities_finish;
+++}
+++
+++static void
++ mm_broadband_modem_qmi_qcom_soc_init (MMBroadbandModemQmiQcomSoc *self)
++ {
++ }

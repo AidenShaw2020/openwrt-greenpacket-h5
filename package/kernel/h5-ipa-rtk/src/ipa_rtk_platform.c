@@ -727,6 +727,24 @@ static char passthrough_ip[16];
 module_param_string(passthrough_ip, passthrough_ip, sizeof(passthrough_ip), 0644);
 MODULE_PARM_DESC(passthrough_ip, "WAN IPv4 address leased to the LAN host in IP passthrough");
 
+/* The mobile data netdev as configured by netifd. ModemManager recreates its
+ * mux link when it restarts; falling back to rmnet_ipa0 then programs the
+ * wrong WAN and Ethernet receive stops reaching the CPU.
+ */
+static char wan_ifname[IFNAMSIZ];
+module_param_string(wan_ifname, wan_ifname, sizeof(wan_ifname), 0644);
+MODULE_PARM_DESC(wan_ifname, "Mobile data netdev (the l3_device of the mobile interface)");
+
+static struct net_device *ipa_rtk_wan_dev(void)
+{
+	struct net_device *dev;
+
+	if (wan_ifname[0])
+		return __dev_get_by_name(&init_net, strim(wan_ifname));
+	dev = __dev_get_by_name(&init_net, "qmapmux0.0");
+	return dev ? dev : __dev_get_by_name(&init_net, "rmnet_ipa0");
+}
+
 static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 {
 	struct h5_install_fltr_rule_req_msg *rules = NULL;
@@ -740,9 +758,7 @@ static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 
 	if (c->stage != 2)
 		return -EINVAL;
-	wan_dev = __dev_get_by_name(&init_net, "qmapmux0.0");
-	if (!wan_dev)
-		wan_dev = __dev_get_by_name(&init_net, "rmnet_ipa0");
+	wan_dev = ipa_rtk_wan_dev();
 	if (!wan_dev)
 		return -ENODEV;
 	wan_ifindex = wan_dev->ifindex;

@@ -3,6 +3,7 @@ START=96
 STOP=10
 
 stage_file=/sys/bus/platform/devices/soc:ipa-ethernet/stage
+wan_param=/sys/module/h5_ipa_rtk/parameters/wan_ifname
 
 bind_r8125() {
 	local pci dev driver
@@ -41,6 +42,9 @@ start() {
 	ensure_controller
 	[ -e "$stage_file" ] || return 0
 	if [ "$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]; then
+		# Pass netifd's data netdev; ModemManager may recreate its mux link.
+		l3="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+		[ -n "$l3" ] && [ -w "$wan_param" ] && printf '%s' "$l3" > "$wan_param"
 		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null; then
 			echo 0 > "$stage_file" 2>/dev/null || true
 			echo 4 > "$stage_file" 2>/dev/null || true

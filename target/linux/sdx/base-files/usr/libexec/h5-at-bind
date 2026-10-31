@@ -5,7 +5,8 @@ set -eu
 [ "$(cat /sys/class/remoteproc/remoteproc0/state)" = running ] || exit 1
 modprobe rpmsg_char
 
-for n in $(seq 1 10); do
+# The DS channel can appear well after "running" while the boot is busy.
+for n in $(seq 1 60); do
 	count=0
 	for p in /sys/bus/rpmsg/devices/*; do
 		[ -f "$p/name" ] || continue

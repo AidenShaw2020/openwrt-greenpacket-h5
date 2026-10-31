@@ -18,6 +18,12 @@
 
 &qpic_nand {
 	status = "okay";
+	/* The stock msm_qpic_nand driver sets 100 MHz (MSM_NAND_BUS_VOTE_MAX_RATE).
+	 * qcom_nandc only enables the RPMh clock, which leaves the minimum vote:
+	 * raw reads measured 2.2 MB/s, versus 4.9 MB/s at 100 MHz.
+	 */
+	assigned-clocks = <&rpmhcc RPMH_QPIC_CLK>;
+	assigned-clock-rates = <100000000>;
 
 	nand@0 {
 		reg = <0>;

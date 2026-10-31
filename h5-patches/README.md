@@ -14,7 +14,9 @@ Linux 6.12.112. Tested feed revisions:
 
 From a clean OpenWrt checkout, apply the exported target patch, update feeds,
 check out the above feed revisions, then install feeds. Run
-`sh h5-patches/apply-packages.sh` to apply the included ModemManager fixes.
+`sh h5-patches/apply-packages.sh` to apply the included ModemManager fixes
+and the LuCI ucode dispatcher fix (a per-request ubus connection; with the
+shared inherited one, concurrent LuCI requests under uhttpd-mod-ucode hang).
 The tested feed snapshot has an unrelated weechat-full/weechat-minimal Kconfig
 cycle through the unused luci-app-weechat package; remove that feed symlink with
 `./scripts/feeds uninstall luci-app-weechat` if all packages were installed.
@@ -52,7 +54,8 @@ recovery; holding it for ten seconds can also activate Linux failsafe at
 
 The default is a normal cellular CPE router: Ethernet LAN 192.168.0.1/24,
 DHCP/DNS, and a firewalled/NAT cellular WAN named mobile. Automatic mobile
-startup is enabled. Bridge/IP passthrough is deferred and is not enabled.
+startup is enabled. Optional IPv4 passthrough to one LAN router is available
+under Network -> IP Passthrough and is not enabled by default.
 
 LuCI is available over HTTP. Fresh root has no password and Dropbear permits
 password authentication. The USB CDC ACM and UART consoles use the standard

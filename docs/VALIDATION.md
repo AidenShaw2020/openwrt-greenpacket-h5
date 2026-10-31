@@ -242,7 +242,7 @@ keeps the final sysupgrade as a separate manual command.
 - Different hardware or original firmware revisions.
 - IPv6 service on a carrier that actually provides it.
 - 5G SA registration or SA cell lock.
-- Bridge/IP passthrough.
+- IPv6 passthrough; a public mobile IPv4 address in passthrough mode.
 - Automatic stock-to-OpenWrt installation for third-party devices.
 - Bit-for-bit reproducibility or privacy of a new third-party build.
 
@@ -268,3 +268,43 @@ The idempotent board default adds the native handler to preserved configurations
 without replacing a custom handler. The currently running device received the
 package/config fix live; a complete image is also built for subsequent upgrades.
 No causal connection with the separate cleartext HTTP transfer issue is established.
+
+## IPv4 passthrough and LuCI concurrency (2026-10-31)
+
+Passthrough is optional; the default remains the NAT router. It is selected
+under Network -> IP Passthrough (`/etc/config/h5ippt`); saving triggers
+`/etc/init.d/h5-ippt`, which applies the firewall, offload and DHCP changes.
+The mobile address is removed from `qmapmux0.0`, the H5 takes the mobile
+gateway address on br-lan and leases the mobile address to the configured
+MAC with a two-minute lease. Unsolicited inbound IPv4 is forwarded to that
+host only; traffic originated by the H5 is SNATed to the mobile address.
+
+Tested with a test SIM behind carrier NAT and an OpenWrt router as the
+passthrough host:
+
+- The router received the mobile address and gateway, with working DNS and
+  internet access; the H5 stayed reachable on its LAN address through it.
+- After a reboot and a new mobile address (/29 to /30), the router obtained
+  the new address automatically. A router holding a LAN lease from before the
+  modem came up is forced to restart DHCP by a short LAN carrier drop.
+- Switching router -> passthrough -> router through the LuCI save path (uci
+  commit over ubus) restored masquerading and the mobile address on the H5
+  in router mode, and the passthrough state on the way back, within ~25 s.
+
+`kmod-h5-ipa-rtk` release 6 offloads the routed flows as identity NAT entries
+(public = private = mobile address), selected by the new `passthrough_ip`
+parameter because the modem netdev has no address. Hardware installs were
+observed in the controller counters and `[HW_OFFLOAD]` conntrack entries.
+Two 100 MiB downloads through the router returned identical SHA256 values;
+OVH reached 186 Mb/s with negligible H5 softirq time, and `speedtest-go` on
+the router measured 296.9/99.3 Mb/s with 0% packet loss. NAT-mode offload is
+unchanged when the parameter is empty. Not tested: a public mobile address,
+IPv6 passthrough, and inbound connections from the internet.
+
+LuCI ucode handler: with `uhttpd-mod-ucode`, six concurrent requests to
+`/cgi-bin/luci/` hung (two after 30 s, one 502 after 60 s, three never
+finished), and a Chrome hard reload kept loading. `luci.dispatcher` opened
+its ubus connection at import time in the uhttpd parent, so all forked request
+processes shared one socket. With the per-request connection patch, eight
+concurrent requests completed in 0.5-1.4 s and five successive hard reloads
+in headless Chrome 156 rendered the menu with no pending requests.

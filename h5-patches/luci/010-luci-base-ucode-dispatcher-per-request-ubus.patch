@@ -1,0 +1,17 @@
+diff --git a/modules/luci-base/ucode/dispatcher.uc b/modules/luci-base/ucode/dispatcher.uc
+index 99712b85..affe8e98 100644
+--- a/modules/luci-base/ucode/dispatcher.uc
++++ b/modules/luci-base/ucode/dispatcher.uc
+@@ -880,6 +880,12 @@ function run_action(request_path, lang, tree, resolved, action) {
+ }
+ 
+ dispatch = function(_http, path) {
++	/* uhttpd forks every request from the process that imported this module;
++	 * the inherited ubus connection must not be shared by concurrent requests.
++	 */
++	if (!http)
++		ubus = connect();
++
+ 	http = _http;
+ 
+ 	let version = determine_version();

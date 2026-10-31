@@ -1,0 +1,243 @@
+#!/bin/sh
+# H5 IPv4 passthrough: lease the mobile IPv4 address to one LAN host.
+#
+# The address is removed from the modem netdev, so every packet for it is
+# forwarded to the LAN host. The H5 keeps 192.168.1.1 for management and
+# owns the mobile gateway address on br-lan so the host has a next hop.
+# Traffic originated by the H5 itself is SNATed to the mobile address.
+# The mode is set in /etc/config/h5ippt, normally from LuCI (Network ->
+# IP Passthrough); the default is the routed NAT mode.
+#
+#   h5-ippt apply|clear      called from /etc/hotplug.d/iface/12-h5-ippt
+#   h5-ippt sync             apply the configured mode (/etc/init.d/h5-ippt)
+#   h5-ippt enable [<mac>]   configure and switch to passthrough
+#   h5-ippt disable          configure and switch back to the routed NAT mode
+#   h5-ippt status
+
+WAN=qmapmux0.0
+LAN=br-lan
+STATE=/var/run/h5-ippt.state
+LEASE=2m
+PARAM=/sys/module/h5_ipa_rtk/parameters/passthrough_ip
+STAGE=/sys/bus/platform/devices/soc:ipa-ethernet/stage
+
+log() { logger -t h5-ippt "$*"; }
+
+confdir() {
+	local d
+	for d in /tmp/dnsmasq.*.d; do
+		[ -d "$d" ] && { echo "$d"; return; }
+	done
+	echo /tmp/dnsmasq.d
+}
+DHCPCONF="$(confdir)/h5-ippt.conf"
+
+int() { local IFS=.; set -- $1; echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 )); }
+quad() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+maskn() { echo $(( (0xffffffff << (32 - $1)) & 0xffffffff )); }
+
+# usable <ipn> <prefix> <gwn>: both are distinct host addresses of one subnet
+usable() {
+	local m n b
+	[ "$2" -ge 8 ] && [ "$2" -le 30 ] || return 1
+	m=$(maskn "$2"); n=$(( $1 & m )); b=$(( n | (~m & 0xffffffff) ))
+	[ $(( $3 & m )) -eq "$n" ] && [ "$3" -ne "$1" ] &&
+		[ "$1" -ne "$n" ] && [ "$1" -ne "$b" ] &&
+		[ "$3" -ne "$n" ] && [ "$3" -ne "$b" ]
+}
+
+restart_dnsmasq() { /etc/init.d/dnsmasq restart >/dev/null 2>&1; }
+
+clear_runtime() {
+	local GW PREFIX
+	[ -f "$STATE" ] && . "$STATE"
+	[ -n "$GW" ] && ip addr del "$GW/$PREFIX" dev "$LAN" 2>/dev/null
+	nft delete table ip h5ippt 2>/dev/null
+	if [ -f "$DHCPCONF" ]; then
+		rm -f "$DHCPCONF"
+		restart_dnsmasq
+	fi
+	rm -f "$STATE"
+}
+
+apply_runtime() {
+	local mac st IP PREFIX GW DNS ipn gwn p m n lanip conf old leased ports
+	[ "$(uci -q get h5ippt.main.enabled)" = 1 ] || { clear_runtime; return 0; }
+	mac="$(uci -q get h5ippt.main.mac)"
+	[ -n "$mac" ] || { log "no LAN host MAC configured"; clear_runtime; return 1; }
+
+	st="$(ifstatus mobile 2>/dev/null)"
+	[ "$(echo "$st" | jsonfilter -e '@.up')" = true ] || { clear_runtime; return 0; }
+	IP="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].address')"
+	PREFIX="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].mask')"
+	GW="$(echo "$st" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' | head -n1)"
+	DNS="$(echo "$st" | jsonfilter -e '@["dns-server"][*]' | grep -v : | head -n2 | tr '\n' ',')"
+	DNS="${DNS%,}"
+	[ -n "$IP" ] || { clear_runtime; return 0; }
+
+	ipn=$(int "$IP")
+	gwn=0; [ -n "$GW" ] && gwn=$(int "$GW")
+	if [ -z "$PREFIX" ] || ! usable "$ipn" "$PREFIX" "$gwn"; then
+		# The modem gave no usable on-link gateway; synthesize one.
+		GW=
+		for p in 30 29 28; do
+			m=$(maskn $p); n=$(( ipn & m ))
+			[ "$ipn" -eq "$n" ] || [ "$ipn" -eq $(( n | (~m & 0xffffffff) )) ] && continue
+			gwn=$(( n + 1 )); [ "$gwn" -eq "$ipn" ] && gwn=$(( n + 2 ))
+			PREFIX=$p; GW=$(quad $gwn)
+			break
+		done
+		[ -n "$GW" ] || { log "cannot derive a gateway for $IP"; return 1; }
+	fi
+	[ -n "$DNS" ] || DNS="$GW"
+
+	if [ -f "$STATE" ]; then
+		old="$(cat "$STATE")"
+		case "$old" in
+		*"IP=$IP"*"GW=$GW"*"PREFIX=$PREFIX"*) ;;
+		*) clear_runtime ;;
+		esac
+	fi
+
+	lanip="$(uci -q get network.lan.ipaddr)"; lanip="${lanip%%/*}"
+	ip -4 addr flush dev "$WAN"
+	ip route replace default dev "$WAN" ${lanip:+src "$lanip"}
+	ip addr replace "$GW/$PREFIX" dev "$LAN"
+
+	nft -f - <<EOF
+table ip h5ippt
+delete table ip h5ippt
+table ip h5ippt {
+	chain forward {
+		type filter hook forward priority filter - 1; policy accept;
+		iifname "$WAN" ip daddr != $IP drop
+	}
+	chain srcnat {
+		type nat hook postrouting priority srcnat + 1; policy accept;
+		oifname "$WAN" ip saddr != $IP snat to $IP
+	}
+}
+EOF
+
+	conf="dhcp-range=set:ippt,$IP,$IP,$(quad $(maskn "$PREFIX")),$LEASE
+dhcp-host=$mac,set:ippt,$IP,$LEASE
+dhcp-option=tag:ippt,option:router,$GW
+dhcp-option=tag:ippt,option:dns-server,$DNS"
+	if [ "$(cat "$DHCPCONF" 2>/dev/null)" != "$conf" ]; then
+		echo "$conf" > "$DHCPCONF"
+		restart_dnsmasq
+	fi
+
+	# A host that took a LAN lease while the modem was down would renew only
+	# after half of it. Drop the LAN carrier so its DHCP client starts over.
+	leased="$(awk -v m="$mac" 'tolower($2) == tolower(m) { print $3 }' /tmp/dhcp.leases 2>/dev/null)"
+	if [ -n "$leased" ] && [ "$leased" != "$IP" ]; then
+		echo 0 > "$STAGE" 2>/dev/null
+		ports="$(ls /sys/class/net/$LAN/brif 2>/dev/null)"
+		for p in $ports; do ip link set "$p" down; done
+		sleep 3
+		for p in $ports; do ip link set "$p" up; done
+		log "bounced $ports: $mac held $leased"
+	fi
+
+	# Hardware offload of the routed flows needs the address the IPA NAT
+	# table maps onto itself; restart stage 4 when it changes.
+	if [ -w "$PARAM" ] && [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = 1 ]; then
+		printf '%s' "$IP" > "$PARAM"
+		if ! grep -q "wan_ip=$IP\$" "$STAGE" 2>/dev/null; then
+			echo 0 > "$STAGE" 2>/dev/null
+			/etc/init.d/h5-ipa-offload start
+		fi
+	fi
+
+	printf 'IP=%s\nGW=%s\nPREFIX=%s\nMAC=%s\n' "$IP" "$GW" "$PREFIX" "$mac" > "$STATE"
+	log "passthrough $IP/$PREFIX gw $GW -> $mac"
+}
+
+wan_zone() {
+	local z i=0
+	while z="$(uci -q get firewall.@zone[$i].name)"; do
+		[ "$z" = wan ] && { echo "@zone[$i]"; return; }
+		i=$((i + 1))
+	done
+	return 1
+}
+
+wanted() {
+	[ "$(uci -q get h5ippt.main.enabled)" = 1 ] && [ -n "$(uci -q get h5ippt.main.mac)" ]
+}
+
+# The forward rule and disabled masquerading are only valid in passthrough.
+enable_mode() {
+	local zone
+	zone="$(wan_zone)" || { log "no wan firewall zone"; return 1; }
+	[ -n "$(uci -q get h5ippt.main.saved_hw)" ] || {
+		uci set h5ippt.main.saved_hw="$(uci -q get firewall.@defaults[0].flow_offloading_hw || echo 0)"
+		uci commit h5ippt
+	}
+	uci set firewall.$zone.masq=0
+	uci set firewall.ippt_forward=rule
+	uci set firewall.ippt_forward.name='Allow-IPPT-forward'
+	uci set firewall.ippt_forward.src='wan'
+	uci set firewall.ippt_forward.dest='lan'
+	uci set firewall.ippt_forward.family='ipv4'
+	uci set firewall.ippt_forward.proto='all'
+	uci set firewall.ippt_forward.target='ACCEPT'
+	# Only a provider with passthrough support offloads routed flows.
+	if [ -e "$PARAM" ]; then
+		uci set firewall.@defaults[0].flow_offloading_hw="$(uci get h5ippt.main.saved_hw)"
+	else
+		uci set firewall.@defaults[0].flow_offloading_hw=0
+		/etc/init.d/h5-ipa-offload stop
+	fi
+	if [ -n "$(uci changes firewall)" ]; then
+		uci commit firewall
+		fw4 -q reload
+		log "router mode -> passthrough"
+	fi
+	apply_runtime
+}
+
+disable_mode() {
+	local hw zone
+	[ -n "$(uci -q get firewall.ippt_forward)" ] || { clear_runtime; return 0; }
+	hw="$(uci -q get h5ippt.main.saved_hw)"
+	uci -q delete h5ippt.main.saved_hw
+	uci commit h5ippt
+	zone="$(wan_zone)" && uci set firewall.$zone.masq=1
+	uci -q delete firewall.ippt_forward
+	[ -n "$hw" ] && uci set firewall.@defaults[0].flow_offloading_hw="$hw"
+	uci commit firewall
+	clear_runtime
+	[ -w "$PARAM" ] && printf '' > "$PARAM"
+	fw4 -q reload
+	log "passthrough -> router mode"
+	# Reconnect so netifd restores the address and default route.
+	ifup mobile
+}
+
+# Bring the system in line with /etc/config/h5ippt (LuCI saves trigger this).
+sync_mode() {
+	if wanted; then enable_mode; else disable_mode; fi
+}
+
+set_config() {
+	[ -f /etc/config/h5ippt ] || touch /etc/config/h5ippt
+	uci -q get h5ippt.main >/dev/null || uci set h5ippt.main=ippt
+	uci set h5ippt.main.enabled="$1"
+	[ -n "$2" ] && uci set h5ippt.main.mac="$2"
+	uci commit h5ippt
+}
+
+case "$1" in
+apply) apply_runtime ;;
+clear) clear_runtime ;;
+sync) sync_mode ;;
+enable)
+	[ -n "$2" ] || [ -n "$(uci -q get h5ippt.main.mac)" ] ||
+		{ echo "usage: h5-ippt enable <lan-host-mac>" >&2; exit 1; }
+	set_config 1 "$2"; sync_mode ;;
+disable) set_config 0; sync_mode ;;
+status) cat "$STATE" 2>/dev/null || echo "passthrough inactive" ;;
+*) echo "usage: $0 apply|clear|sync|enable <mac>|disable|status" >&2; exit 1 ;;
+esac

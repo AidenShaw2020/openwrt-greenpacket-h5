@@ -4,5 +4,11 @@
     "order": 65,
     "action": { "type": "view", "path": "h5modem/radio" },
     "depends": { "acl": [ "luci-app-h5-modem" ] }
+  },
+  "admin/network/h5ippt": {
+    "title": "IP Passthrough",
+    "order": 66,
+    "action": { "type": "view", "path": "h5modem/passthrough" },
+    "depends": { "acl": [ "luci-app-h5-ippt" ], "uci": { "h5ippt": true } }
   }
 }

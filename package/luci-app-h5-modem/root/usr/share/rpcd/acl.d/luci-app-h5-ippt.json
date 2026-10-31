@@ -1,0 +1,13 @@
+{
+  "luci-app-h5-ippt": {
+    "description": "Configure H5 IPv4 passthrough",
+    "read": {
+      "file": { "/tmp/run/h5-ippt.state": [ "read" ] },
+      "ubus": { "luci-rpc": [ "getHostHints" ] },
+      "uci": [ "h5ippt" ]
+    },
+    "write": {
+      "uci": [ "h5ippt" ]
+    }
+  }
+}

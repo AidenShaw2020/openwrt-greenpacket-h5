@@ -153,16 +153,22 @@ int ipa_rtk_flow_decode(const struct flow_rule *rule, struct ipa_rtk_flow *out)
 			return -EOPNOTSUPP;
 		}
 	}
-	if (!redirect || !checksum || memchr_inv(written, 0xff, 12))
+	if (!redirect || memchr_inv(written, 0xff, 12))
 		return -EOPNOTSUPP;
 	source = addresses[0] != translated[0] || original_ports[0] != translated_ports[0];
 	destination = addresses[1] != translated[1] || original_ports[1] != translated_ports[1];
+	/* A routed flow (IP passthrough) has no NAT and no checksum action. Its
+	 * direction depends on the ingress device, which only the manager knows;
+	 * report it in source form and let the manager install identity NAT.
+	 */
+	if (!source && !destination && !checksum)
+		decoded.identity = true;
 	/* One IPA NAT entry cannot express simultaneous source and destination NAT. */
-	if (source == destination)
+	else if (!checksum || source == destination)
 		return -EOPNOTSUPP;
 	decoded.destination = destination;
 	decoded.nat.protocol = basic.key->ip_proto;
-	if (source) {
+	if (source || decoded.identity) {
 		decoded.nat.private_ip = addresses[0];
 		decoded.nat.private_port = original_ports[0];
 		decoded.nat.public_ip = translated[0];

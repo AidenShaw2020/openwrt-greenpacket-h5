@@ -1,9 +1,9 @@
 diff --git a/h5-patches/README.md b/h5-patches/README.md
 new file mode 100644
-index 00000000..b9adff2f
+index 00000000..d8ac81c9
 --- /dev/null
 +++ b/h5-patches/README.md
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,204 @@
 +# GreenPacket H5-200Q1 on vanilla OpenWrt 25.12.6
 +
 +This adds a new SDX65 target to unmodified OpenWrt; it does not use a RutOS
@@ -20,7 +20,9 @@ index 00000000..b9adff2f
 +
 +From a clean OpenWrt checkout, apply the exported target patch, update feeds,
 +check out the above feed revisions, then install feeds. Run
-+`sh h5-patches/apply-packages.sh` to apply the included ModemManager fixes.
++`sh h5-patches/apply-packages.sh` to apply the included ModemManager fixes
++and the LuCI ucode dispatcher fix (a per-request ubus connection; with the
++shared inherited one, concurrent LuCI requests under uhttpd-mod-ucode hang).
 +The tested feed snapshot has an unrelated weechat-full/weechat-minimal Kconfig
 +cycle through the unused luci-app-weechat package; remove that feed symlink with
 +`./scripts/feeds uninstall luci-app-weechat` if all packages were installed.
@@ -58,7 +60,8 @@ index 00000000..b9adff2f
 +
 +The default is a normal cellular CPE router: Ethernet LAN 192.168.0.1/24,
 +DHCP/DNS, and a firewalled/NAT cellular WAN named mobile. Automatic mobile
-+startup is enabled. Bridge/IP passthrough is deferred and is not enabled.
++startup is enabled. Optional IPv4 passthrough to one LAN router is available
++under Network -> IP Passthrough and is not enabled by default.
 +
 +LuCI is available over HTTP. Fresh root has no password and Dropbear permits
 +password authentication. The USB CDC ACM and UART consoles use the standard
@@ -207,26 +210,54 @@ index 00000000..b9adff2f
 +patch-application check alone is not proof of runtime compatibility.
 diff --git a/h5-patches/apply-packages.sh b/h5-patches/apply-packages.sh
 new file mode 100755
-index 00000000..1a80dd7a
+index 00000000..e723fd12
 --- /dev/null
 +++ b/h5-patches/apply-packages.sh
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,21 @@
 +#!/bin/sh
 +# Run from the vanilla OpenWrt checkout after feeds update/install.
 +set -eu
 +root="$(pwd)"
 +test -f include/toplevel.mk
-+test -d feeds/packages/.git
-+for patch in "$root"/h5-patches/packages/*.patch; do
-+	if git -C feeds/packages apply --check "$patch"; then
-+		git -C feeds/packages apply "$patch"
-+	elif git -C feeds/packages apply --reverse --check "$patch"; then
-+		printf 'Already applied: %s\n' "$(basename "$patch")"
-+	else
-+		printf 'Cannot apply feed patch: %s\n' "$patch" >&2
-+		exit 1
-+	fi
++
++# h5-patches/<feed>/*.patch apply to feeds/<feed>.
++for feed in packages luci; do
++	test -d "feeds/$feed/.git"
++	for patch in "$root"/h5-patches/"$feed"/*.patch; do
++		[ -e "$patch" ] || continue
++		if git -C "feeds/$feed" apply --check "$patch"; then
++			git -C "feeds/$feed" apply "$patch"
++		elif git -C "feeds/$feed" apply --reverse --check "$patch"; then
++			printf 'Already applied: %s\n' "$(basename "$patch")"
++		else
++			printf 'Cannot apply feed patch: %s\n' "$patch" >&2
++			exit 1
++		fi
++	done
 +done
+diff --git a/h5-patches/luci/010-luci-base-ucode-dispatcher-per-request-ubus.patch b/h5-patches/luci/010-luci-base-ucode-dispatcher-per-request-ubus.patch
+new file mode 100644
+index 00000000..5e490077
+--- /dev/null
++++ b/h5-patches/luci/010-luci-base-ucode-dispatcher-per-request-ubus.patch
+@@ -0,0 +1,17 @@
++diff --git a/modules/luci-base/ucode/dispatcher.uc b/modules/luci-base/ucode/dispatcher.uc
++index 99712b85..affe8e98 100644
++--- a/modules/luci-base/ucode/dispatcher.uc
+++++ b/modules/luci-base/ucode/dispatcher.uc
++@@ -880,6 +880,12 @@ function run_action(request_path, lang, tree, resolved, action) {
++ }
++ 
++ dispatch = function(_http, path) {
+++	/* uhttpd forks every request from the process that imported this module;
+++	 * the inherited ubus connection must not be shared by concurrent requests.
+++	 */
+++	if (!http)
+++		ubus = connect();
+++
++ 	http = _http;
++ 
++ 	let version = determine_version();
 diff --git a/h5-patches/packages/010-modemmanager-qrtr-monitor.patch b/h5-patches/packages/010-modemmanager-qrtr-monitor.patch
 new file mode 100644
 index 00000000..086cce24
@@ -323,7 +354,7 @@ index 00000000..475aeb57
 ++ 
 diff --git a/package/kernel/h5-ipa-rtk/Makefile b/package/kernel/h5-ipa-rtk/Makefile
 new file mode 100644
-index 00000000..406b8a20
+index 00000000..b3749a53
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/Makefile
 @@ -0,0 +1,39 @@
@@ -334,7 +365,7 @@ index 00000000..406b8a20
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=5
++PKG_RELEASE:=6
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -367,7 +398,7 @@ index 00000000..406b8a20
 +
 +$(eval $(call KernelPackage,h5-ipa-rtk))
 diff --git a/package/kernel/h5-ipa-rtk/files/15-h5-ipa-offload.hotplug b/package/kernel/h5-ipa-rtk/files/15-h5-ipa-offload.hotplug
-new file mode 100644
+new file mode 100755
 index 00000000..701d494b
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/15-h5-ipa-offload.hotplug
@@ -392,7 +423,8 @@ index 00000000..701d494b
 +	;;
 +esac
 diff --git a/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
-new file mode 100644
+new file mode 100755
+index 00000000..f4fccf15
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
 @@ -0,0 +1,60 @@
@@ -2528,10 +2560,10 @@ index 00000000..7d1fff5d
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow.c
 new file mode 100644
-index 00000000..fe8b13ee
+index 00000000..2b3a4b15
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow.c
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,188 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/etherdevice.h>
 +#include <linux/in.h>
@@ -2687,16 +2719,22 @@ index 00000000..fe8b13ee
 +			return -EOPNOTSUPP;
 +		}
 +	}
-+	if (!redirect || !checksum || memchr_inv(written, 0xff, 12))
++	if (!redirect || memchr_inv(written, 0xff, 12))
 +		return -EOPNOTSUPP;
 +	source = addresses[0] != translated[0] || original_ports[0] != translated_ports[0];
 +	destination = addresses[1] != translated[1] || original_ports[1] != translated_ports[1];
++	/* A routed flow (IP passthrough) has no NAT and no checksum action. Its
++	 * direction depends on the ingress device, which only the manager knows;
++	 * report it in source form and let the manager install identity NAT.
++	 */
++	if (!source && !destination && !checksum)
++		decoded.identity = true;
 +	/* One IPA NAT entry cannot express simultaneous source and destination NAT. */
-+	if (source == destination)
++	else if (!checksum || source == destination)
 +		return -EOPNOTSUPP;
 +	decoded.destination = destination;
 +	decoded.nat.protocol = basic.key->ip_proto;
-+	if (source) {
++	if (source || decoded.identity) {
 +		decoded.nat.private_ip = addresses[0];
 +		decoded.nat.private_port = original_ports[0];
 +		decoded.nat.public_ip = translated[0];
@@ -2716,10 +2754,10 @@ index 00000000..fe8b13ee
 +}
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow.h b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow.h
 new file mode 100644
-index 00000000..df1bb738
+index 00000000..9ae46e71
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,18 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _IPA_RTK_FLOW_H_
 +#define _IPA_RTK_FLOW_H_
@@ -2732,15 +2770,18 @@ index 00000000..df1bb738
 +	int ingress_ifindex, egress_ifindex;
 +	u8 ethernet[ETH_HLEN];
 +	bool destination;
++	/* Routed without translation; nat holds the source-form tuple. */
++	bool identity;
 +};
 +/* Only decode; never program hardware or retain a borrowed net_device. */
 +int ipa_rtk_flow_decode(const struct flow_rule *rule, struct ipa_rtk_flow *out);
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c
 new file mode 100644
+index 00000000..32269b90
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.c
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,434 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/in.h>
 +#include <linux/jiffies.h>
@@ -2893,6 +2934,7 @@ new file mode 100644
 +{
 +	struct ipa_rtk_flow_manager *m = private;
 +	struct ipa_rtk_managed_flow *entry = NULL;
++	struct ipa_rtk_flow routed;
 +	unsigned int dir;
 +	int index = -1, ret = -EOPNOTSUPP;
 +	bool lan_in, lan_out;
@@ -2900,6 +2942,23 @@ new file mode 100644
 +	if (!flow || (flow->nat.protocol != IPPROTO_UDP &&
 +		      flow->nat.protocol != IPPROTO_TCP))
 +		return ret;
++	if (flow->identity) {
++		/* IP passthrough: the LAN host owns the WAN address. Express the
++		 * routed flow as NAT onto itself; the WAN-ingress half swaps ends
++		 * so both halves share one tuple.
++		 */
++		routed = *flow;
++		if (flow->ingress_ifindex == m->wan) {
++			routed.destination = true;
++			routed.nat.private_ip = flow->nat.remote_ip;
++			routed.nat.private_port = flow->nat.remote_port;
++			routed.nat.remote_ip = flow->nat.private_ip;
++			routed.nat.remote_port = flow->nat.private_port;
++		}
++		routed.nat.public_ip = routed.nat.private_ip;
++		routed.nat.public_port = routed.nat.private_port;
++		flow = &routed;
++	}
 +	dir = flow->destination;
 +	mutex_lock(&m->lock);
 +	if (!m->active || m->failed) { ret = -ESHUTDOWN; goto out; }
@@ -3159,6 +3218,7 @@ new file mode 100644
 +}
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h
 new file mode 100644
+index 00000000..401c448d
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_flow_manager.h
 @@ -0,0 +1,61 @@
@@ -3607,6 +3667,7 @@ index 00000000..87341b89
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.c
 new file mode 100644
+index 00000000..27ac6bb9
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.c
 @@ -0,0 +1,300 @@
@@ -3912,6 +3973,7 @@ new file mode 100644
 +}
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.h b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.h
 new file mode 100644
+index 00000000..bbce8430
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_nat_pool.h
 @@ -0,0 +1,42 @@
@@ -4056,14 +4118,15 @@ index 00000000..f9e17b77
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
 new file mode 100644
-index 00000000..bb52f07e
+index 00000000..dca6ae5e
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_rtk_platform.c
-@@ -0,0 +1,1351 @@
+@@ -0,0 +1,1367 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* SDX65/RTL8125 external DMA controller. Stage 0 is passive domain attachment. */
 +#include <linux/dma-mapping.h>
 +#include <linux/ethtool.h>
++#include <linux/inet.h>
 +#include <linux/inetdevice.h>
 +#include <linux/iommu.h>
 +#include <linux/module.h>
@@ -4781,6 +4844,13 @@ index 00000000..bb52f07e
 +	return 0;
 +}
 +
++/* IP passthrough leaves the modem netdev without an address because the LAN
++ * host owns it. h5-ippt stores that address here before starting stage 4.
++ */
++static char passthrough_ip[16];
++module_param_string(passthrough_ip, passthrough_ip, sizeof(passthrough_ip), 0644);
++MODULE_PARM_DESC(passthrough_ip, "WAN IPv4 address leased to the LAN host in IP passthrough");
++
 +static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 +{
 +	struct h5_install_fltr_rule_req_msg *rules = NULL;
@@ -4800,7 +4870,15 @@ index 00000000..bb52f07e
 +	if (!wan_dev)
 +		return -ENODEV;
 +	wan_ifindex = wan_dev->ifindex;
-+	wan_ip = inet_select_addr(wan_dev, 0, RT_SCOPE_UNIVERSE);
++	/* inet_select_addr() falls back to other devices (the LAN address) when
++	 * the modem netdev has none, so an explicit passthrough address wins.
++	 */
++	if (passthrough_ip[0]) {
++		if (!in4_pton(passthrough_ip, -1, (u8 *)&wan_ip, '\n', NULL))
++			return -EINVAL;
++	} else {
++		wan_ip = inet_select_addr(wan_dev, 0, RT_SCOPE_UNIVERSE);
++	}
 +	if (!wan_ip)
 +		return -EADDRNOTAVAIL;
 +	c->wan_ifindex = wan_ifindex;
@@ -5635,6 +5713,7 @@ index 00000000..5ea55fa1
 +#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/ipa_table_rtk.h b/package/kernel/h5-ipa-rtk/src/ipa_table_rtk.h
 new file mode 100644
+index 00000000..c5590d0e
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/ipa_table_rtk.h
 @@ -0,0 +1,62 @@
@@ -7336,16 +7415,22 @@ index 00000000..8aded1f7
 +});
 diff --git a/package/luci-app-h5-modem/root/usr/share/luci/menu.d/luci-app-h5-modem.json b/package/luci-app-h5-modem/root/usr/share/luci/menu.d/luci-app-h5-modem.json
 new file mode 100644
-index 00000000..6b4488e0
+index 00000000..6426a83c
 --- /dev/null
 +++ b/package/luci-app-h5-modem/root/usr/share/luci/menu.d/luci-app-h5-modem.json
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,14 @@
 +{
 +  "admin/network/h5modem": {
 +    "title": "Cellular Network",
 +    "order": 65,
 +    "action": { "type": "view", "path": "h5modem/radio" },
 +    "depends": { "acl": [ "luci-app-h5-modem" ] }
++  },
++  "admin/network/h5ippt": {
++    "title": "IP Passthrough",
++    "order": 66,
++    "action": { "type": "view", "path": "h5modem/passthrough" },
++    "depends": { "acl": [ "luci-app-h5-ippt" ], "uci": { "h5ippt": true } }
 +  }
 +}
 diff --git a/package/network/config/firewall4/patches/010-fw4-filter-hw-offload-devices.patch b/package/network/config/firewall4/patches/010-fw4-filter-hw-offload-devices.patch
@@ -7487,7 +7572,7 @@ index 00000000..69586010
 +
 +$(eval $(call BuildPackage,tqftpserv))
 diff --git a/package/network/services/tqftpserv/files/tqftpserv.init b/package/network/services/tqftpserv/files/tqftpserv.init
-new file mode 100644
+new file mode 100755
 index 00000000..c1eba0d3
 --- /dev/null
 +++ b/package/network/services/tqftpserv/files/tqftpserv.init
@@ -7636,7 +7721,7 @@ index 00000000..b97a64e2
 +  }
 +}
 diff --git a/package/utils/h5-modem-tools/files/h5modem b/package/utils/h5-modem-tools/files/h5modem
-new file mode 100644
+new file mode 100755
 index 00000000..fff968c5
 --- /dev/null
 +++ b/package/utils/h5-modem-tools/files/h5modem
@@ -8108,7 +8193,7 @@ index 00000000..61eae235
 +fi
 +exit 0
 diff --git a/target/linux/sdx/base-files/lib/upgrade/platform.sh b/target/linux/sdx/base-files/lib/upgrade/platform.sh
-new file mode 100755
+new file mode 100644
 index 00000000..ff7f944d
 --- /dev/null
 +++ b/target/linux/sdx/base-files/lib/upgrade/platform.sh
@@ -9461,6 +9546,7 @@ index 00000000..fbdea3f2
 +BOARDNAME:=SDX65
 diff --git a/target/linux/sdx/h5-cpe.config b/target/linux/sdx/h5-cpe.config
 new file mode 100644
+index 00000000..9aa5f54a
 --- /dev/null
 +++ b/target/linux/sdx/h5-cpe.config
 @@ -0,0 +1,29 @@
@@ -9495,6 +9581,7 @@ new file mode 100644
 +CONFIG_PACKAGE_tqftpserv=y
 diff --git a/target/linux/sdx/h5-modem.config b/target/linux/sdx/h5-modem.config
 new file mode 100644
+index 00000000..8c2f6520
 --- /dev/null
 +++ b/target/linux/sdx/h5-modem.config
 @@ -0,0 +1,23 @@
@@ -9523,6 +9610,7 @@ new file mode 100644
 +CONFIG_PACKAGE_tqftpserv=y
 diff --git a/target/linux/sdx/h5-web.config b/target/linux/sdx/h5-web.config
 new file mode 100644
+index 00000000..2dade7f5
 --- /dev/null
 +++ b/target/linux/sdx/h5-web.config
 @@ -0,0 +1,10 @@
@@ -9538,6 +9626,7 @@ new file mode 100644
 +CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
 diff --git a/target/linux/sdx/image/Makefile b/target/linux/sdx/image/Makefile
 new file mode 100644
+index 00000000..e595a609
 --- /dev/null
 +++ b/target/linux/sdx/image/Makefile
 @@ -0,0 +1,91 @@
@@ -9633,7 +9722,7 @@ new file mode 100644
 +
 +$(eval $(call BuildImage))
 diff --git a/target/linux/sdx/image/h5-bootimg.py b/target/linux/sdx/image/h5-bootimg.py
-new file mode 100644
+new file mode 100755
 index 00000000..3d320a49
 --- /dev/null
 +++ b/target/linux/sdx/image/h5-bootimg.py
@@ -15196,7 +15285,8 @@ index 00000000..b3f7b00f
 ++
 ++#endif
 diff --git a/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py b/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py
-new file mode 100644
+new file mode 100755
+index 00000000..8aac823a
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/test_nat_pool_host.py
 @@ -0,0 +1,320 @@
@@ -15522,6 +15612,7 @@ new file mode 100644
 +    subprocess.run([str(exe)], check=True)
 diff --git a/target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch b/target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch
 new file mode 100644
+index 00000000..3da95118
 --- /dev/null
 +++ b/target/linux/sdx/patches-6.12/121-ipa-h5-system-header-contexts.patch
 @@ -0,0 +1,142 @@
@@ -15668,7 +15759,8 @@ new file mode 100644
 + struct ipa_rtk_table {
 + 	struct list_head node;
 diff --git a/package/kernel/h5-ipa-rtk/src/test_clients_host.py b/package/kernel/h5-ipa-rtk/src/test_clients_host.py
-new file mode 100644
+new file mode 100755
+index 00000000..3a70e850
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/src/test_clients_host.py
 @@ -0,0 +1,160 @@
@@ -15832,8 +15924,127 @@ new file mode 100644
 +                    '-fsanitize=address,undefined', '-I', str(d), str(d / 'test.c'),
 +                    '-o', str(d / 'test')], check=True)
 +    subprocess.run([str(d / 'test')], check=True)
+diff --git a/package/luci-app-h5-modem/htdocs/luci-static/resources/view/h5modem/passthrough.js b/package/luci-app-h5-modem/htdocs/luci-static/resources/view/h5modem/passthrough.js
+new file mode 100644
+index 00000000..c746db31
+--- /dev/null
++++ b/package/luci-app-h5-modem/htdocs/luci-static/resources/view/h5modem/passthrough.js
+@@ -0,0 +1,59 @@
++'use strict';
++'require view';
++'require form';
++'require fs';
++'require network';
++
++function parseState(text) {
++	const state = {};
++	for (const line of (text || '').split('\n')) {
++		const i = line.indexOf('=');
++		if (i > 0)
++			state[line.slice(0, i)] = line.slice(i + 1);
++	}
++	return state;
++}
++
++return view.extend({
++	load() {
++		return Promise.all([
++			/* rpcd checks the resolved path; /var/run links to /tmp/run */
++			L.resolveDefault(fs.read('/tmp/run/h5-ippt.state'), ''),
++			network.getHostHints()
++		]);
++	},
++
++	render([ stateText, hosts ]) {
++		const state = parseState(stateText);
++		const m = new form.Map('h5ippt', _('IP Passthrough'),
++			_('In router mode the H5 translates all LAN traffic to its mobile address. ' +
++			  'In passthrough mode the mobile IPv4 address is leased over DHCP to one LAN router ' +
++			  'and all unsolicited inbound traffic is forwarded to it, so port forwarding is ' +
++			  'configured on that router only. The H5 remains reachable at its LAN address.'));
++
++		const s = m.section(form.NamedSection, 'main', 'ippt');
++
++		let o = s.option(form.DummyValue, '_status', _('Status'));
++		o.cfgvalue = () => state.IP
++			? _('Passing %s/%s (gateway %s) to %s').format(state.IP, state.PREFIX, state.GW, state.MAC)
++			: _('Inactive');
++
++		o = s.option(form.ListValue, 'enabled', _('Mode'));
++		o.value('0', _('Router (NAT)'));
++		o.value('1', _('IP passthrough'));
++		o.default = '0';
++
++		o = s.option(form.Value, 'mac', _('Passthrough host'),
++			_('MAC address of the WAN port of the router that receives the mobile address.'));
++		o.datatype = 'macaddr';
++		o.depends('enabled', '1');
++		o.rmempty = false;
++		o.retain = true;
++		/* Leases and the stored value are lower case; hints are upper case. */
++		for (const [ mac, hint ] of hosts.getMACHints(false))
++			o.value(mac.toLowerCase(), hint ? '%s (%s)'.format(mac, hint) : mac);
++		o.write = (section_id, value) => m.data.set('h5ippt', section_id, 'mac', value.toLowerCase());
++
++		return m.render();
++	}
++});
+diff --git a/package/luci-app-h5-modem/root/usr/share/rpcd/acl.d/luci-app-h5-ippt.json b/package/luci-app-h5-modem/root/usr/share/rpcd/acl.d/luci-app-h5-ippt.json
+new file mode 100644
+index 00000000..426599cb
+--- /dev/null
++++ b/package/luci-app-h5-modem/root/usr/share/rpcd/acl.d/luci-app-h5-ippt.json
+@@ -0,0 +1,13 @@
++{
++  "luci-app-h5-ippt": {
++    "description": "Configure H5 IPv4 passthrough",
++    "read": {
++      "file": { "/tmp/run/h5-ippt.state": [ "read" ] },
++      "ubus": { "luci-rpc": [ "getHostHints" ] },
++      "uci": [ "h5ippt" ]
++    },
++    "write": {
++      "uci": [ "h5ippt" ]
++    }
++  }
++}
+diff --git a/target/linux/sdx/base-files/etc/hotplug.d/iface/12-h5-ippt b/target/linux/sdx/base-files/etc/hotplug.d/iface/12-h5-ippt
+new file mode 100755
+index 00000000..dc0077fd
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/hotplug.d/iface/12-h5-ippt
+@@ -0,0 +1,7 @@
++#!/bin/sh
++[ "$INTERFACE" = "mobile" ] || exit 0
++
++case "$ACTION" in
++ifup|ifupdate) /usr/sbin/h5-ippt apply ;;
++ifdown) /usr/sbin/h5-ippt clear ;;
++esac
+diff --git a/target/linux/sdx/base-files/etc/init.d/h5-ippt b/target/linux/sdx/base-files/etc/init.d/h5-ippt
+new file mode 100755
+index 00000000..43a51dcc
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/init.d/h5-ippt
+@@ -0,0 +1,15 @@
++#!/bin/sh /etc/rc.common
++START=21
++USE_PROCD=1
++
++start_service() {
++	/usr/sbin/h5-ippt sync
++}
++
++reload_service() {
++	/usr/sbin/h5-ippt sync
++}
++
++service_triggers() {
++	procd_add_reload_trigger h5ippt
++}
 diff --git a/target/linux/sdx/base-files/etc/uci-defaults/92-h5-luci-ucode b/target/linux/sdx/base-files/etc/uci-defaults/92-h5-luci-ucode
 new file mode 100755
+index 00000000..b7838f59
 --- /dev/null
 +++ b/target/linux/sdx/base-files/etc/uci-defaults/92-h5-luci-ucode
 @@ -0,0 +1,12 @@
@@ -15849,3 +16060,267 @@ new file mode 100755
 +	uci add_list uhttpd.main.ucode_prefix="$handler"
 +	uci commit uhttpd
 +fi
+diff --git a/target/linux/sdx/base-files/etc/uci-defaults/93-h5-ippt b/target/linux/sdx/base-files/etc/uci-defaults/93-h5-ippt
+new file mode 100755
+index 00000000..a6678384
+--- /dev/null
++++ b/target/linux/sdx/base-files/etc/uci-defaults/93-h5-ippt
+@@ -0,0 +1,9 @@
++#!/bin/sh
++# IP passthrough is off by default; LuCI edits this section.
++[ -f /etc/config/h5ippt ] || touch /etc/config/h5ippt
++uci -q get h5ippt.main >/dev/null || {
++	uci set h5ippt.main=ippt
++	uci set h5ippt.main.enabled=0
++	uci commit h5ippt
++}
++exit 0
+diff --git a/target/linux/sdx/base-files/usr/sbin/h5-ippt b/target/linux/sdx/base-files/usr/sbin/h5-ippt
+new file mode 100755
+index 00000000..c464270f
+--- /dev/null
++++ b/target/linux/sdx/base-files/usr/sbin/h5-ippt
+@@ -0,0 +1,243 @@
++#!/bin/sh
++# H5 IPv4 passthrough: lease the mobile IPv4 address to one LAN host.
++#
++# The address is removed from the modem netdev, so every packet for it is
++# forwarded to the LAN host. The H5 keeps 192.168.1.1 for management and
++# owns the mobile gateway address on br-lan so the host has a next hop.
++# Traffic originated by the H5 itself is SNATed to the mobile address.
++# The mode is set in /etc/config/h5ippt, normally from LuCI (Network ->
++# IP Passthrough); the default is the routed NAT mode.
++#
++#   h5-ippt apply|clear      called from /etc/hotplug.d/iface/12-h5-ippt
++#   h5-ippt sync             apply the configured mode (/etc/init.d/h5-ippt)
++#   h5-ippt enable [<mac>]   configure and switch to passthrough
++#   h5-ippt disable          configure and switch back to the routed NAT mode
++#   h5-ippt status
++
++WAN=qmapmux0.0
++LAN=br-lan
++STATE=/var/run/h5-ippt.state
++LEASE=2m
++PARAM=/sys/module/h5_ipa_rtk/parameters/passthrough_ip
++STAGE=/sys/bus/platform/devices/soc:ipa-ethernet/stage
++
++log() { logger -t h5-ippt "$*"; }
++
++confdir() {
++	local d
++	for d in /tmp/dnsmasq.*.d; do
++		[ -d "$d" ] && { echo "$d"; return; }
++	done
++	echo /tmp/dnsmasq.d
++}
++DHCPCONF="$(confdir)/h5-ippt.conf"
++
++int() { local IFS=.; set -- $1; echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 )); }
++quad() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
++maskn() { echo $(( (0xffffffff << (32 - $1)) & 0xffffffff )); }
++
++# usable <ipn> <prefix> <gwn>: both are distinct host addresses of one subnet
++usable() {
++	local m n b
++	[ "$2" -ge 8 ] && [ "$2" -le 30 ] || return 1
++	m=$(maskn "$2"); n=$(( $1 & m )); b=$(( n | (~m & 0xffffffff) ))
++	[ $(( $3 & m )) -eq "$n" ] && [ "$3" -ne "$1" ] &&
++		[ "$1" -ne "$n" ] && [ "$1" -ne "$b" ] &&
++		[ "$3" -ne "$n" ] && [ "$3" -ne "$b" ]
++}
++
++restart_dnsmasq() { /etc/init.d/dnsmasq restart >/dev/null 2>&1; }
++
++clear_runtime() {
++	local GW PREFIX
++	[ -f "$STATE" ] && . "$STATE"
++	[ -n "$GW" ] && ip addr del "$GW/$PREFIX" dev "$LAN" 2>/dev/null
++	nft delete table ip h5ippt 2>/dev/null
++	if [ -f "$DHCPCONF" ]; then
++		rm -f "$DHCPCONF"
++		restart_dnsmasq
++	fi
++	rm -f "$STATE"
++}
++
++apply_runtime() {
++	local mac st IP PREFIX GW DNS ipn gwn p m n lanip conf old leased ports
++	[ "$(uci -q get h5ippt.main.enabled)" = 1 ] || { clear_runtime; return 0; }
++	mac="$(uci -q get h5ippt.main.mac)"
++	[ -n "$mac" ] || { log "no LAN host MAC configured"; clear_runtime; return 1; }
++
++	st="$(ifstatus mobile 2>/dev/null)"
++	[ "$(echo "$st" | jsonfilter -e '@.up')" = true ] || { clear_runtime; return 0; }
++	IP="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].address')"
++	PREFIX="$(echo "$st" | jsonfilter -e '@["ipv4-address"][0].mask')"
++	GW="$(echo "$st" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' | head -n1)"
++	DNS="$(echo "$st" | jsonfilter -e '@["dns-server"][*]' | grep -v : | head -n2 | tr '\n' ',')"
++	DNS="${DNS%,}"
++	[ -n "$IP" ] || { clear_runtime; return 0; }
++
++	ipn=$(int "$IP")
++	gwn=0; [ -n "$GW" ] && gwn=$(int "$GW")
++	if [ -z "$PREFIX" ] || ! usable "$ipn" "$PREFIX" "$gwn"; then
++		# The modem gave no usable on-link gateway; synthesize one.
++		GW=
++		for p in 30 29 28; do
++			m=$(maskn $p); n=$(( ipn & m ))
++			[ "$ipn" -eq "$n" ] || [ "$ipn" -eq $(( n | (~m & 0xffffffff) )) ] && continue
++			gwn=$(( n + 1 )); [ "$gwn" -eq "$ipn" ] && gwn=$(( n + 2 ))
++			PREFIX=$p; GW=$(quad $gwn)
++			break
++		done
++		[ -n "$GW" ] || { log "cannot derive a gateway for $IP"; return 1; }
++	fi
++	[ -n "$DNS" ] || DNS="$GW"
++
++	if [ -f "$STATE" ]; then
++		old="$(cat "$STATE")"
++		case "$old" in
++		*"IP=$IP"*"GW=$GW"*"PREFIX=$PREFIX"*) ;;
++		*) clear_runtime ;;
++		esac
++	fi
++
++	lanip="$(uci -q get network.lan.ipaddr)"; lanip="${lanip%%/*}"
++	ip -4 addr flush dev "$WAN"
++	ip route replace default dev "$WAN" ${lanip:+src "$lanip"}
++	ip addr replace "$GW/$PREFIX" dev "$LAN"
++
++	nft -f - <<EOF
++table ip h5ippt
++delete table ip h5ippt
++table ip h5ippt {
++	chain forward {
++		type filter hook forward priority filter - 1; policy accept;
++		iifname "$WAN" ip daddr != $IP drop
++	}
++	chain srcnat {
++		type nat hook postrouting priority srcnat + 1; policy accept;
++		oifname "$WAN" ip saddr != $IP snat to $IP
++	}
++}
++EOF
++
++	conf="dhcp-range=set:ippt,$IP,$IP,$(quad $(maskn "$PREFIX")),$LEASE
++dhcp-host=$mac,set:ippt,$IP,$LEASE
++dhcp-option=tag:ippt,option:router,$GW
++dhcp-option=tag:ippt,option:dns-server,$DNS"
++	if [ "$(cat "$DHCPCONF" 2>/dev/null)" != "$conf" ]; then
++		echo "$conf" > "$DHCPCONF"
++		restart_dnsmasq
++	fi
++
++	# A host that took a LAN lease while the modem was down would renew only
++	# after half of it. Drop the LAN carrier so its DHCP client starts over.
++	leased="$(awk -v m="$mac" 'tolower($2) == tolower(m) { print $3 }' /tmp/dhcp.leases 2>/dev/null)"
++	if [ -n "$leased" ] && [ "$leased" != "$IP" ]; then
++		echo 0 > "$STAGE" 2>/dev/null
++		ports="$(ls /sys/class/net/$LAN/brif 2>/dev/null)"
++		for p in $ports; do ip link set "$p" down; done
++		sleep 3
++		for p in $ports; do ip link set "$p" up; done
++		log "bounced $ports: $mac held $leased"
++	fi
++
++	# Hardware offload of the routed flows needs the address the IPA NAT
++	# table maps onto itself; restart stage 4 when it changes.
++	if [ -w "$PARAM" ] && [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = 1 ]; then
++		printf '%s' "$IP" > "$PARAM"
++		if ! grep -q "wan_ip=$IP\$" "$STAGE" 2>/dev/null; then
++			echo 0 > "$STAGE" 2>/dev/null
++			/etc/init.d/h5-ipa-offload start
++		fi
++	fi
++
++	printf 'IP=%s\nGW=%s\nPREFIX=%s\nMAC=%s\n' "$IP" "$GW" "$PREFIX" "$mac" > "$STATE"
++	log "passthrough $IP/$PREFIX gw $GW -> $mac"
++}
++
++wan_zone() {
++	local z i=0
++	while z="$(uci -q get firewall.@zone[$i].name)"; do
++		[ "$z" = wan ] && { echo "@zone[$i]"; return; }
++		i=$((i + 1))
++	done
++	return 1
++}
++
++wanted() {
++	[ "$(uci -q get h5ippt.main.enabled)" = 1 ] && [ -n "$(uci -q get h5ippt.main.mac)" ]
++}
++
++# The forward rule and disabled masquerading are only valid in passthrough.
++enable_mode() {
++	local zone
++	zone="$(wan_zone)" || { log "no wan firewall zone"; return 1; }
++	[ -n "$(uci -q get h5ippt.main.saved_hw)" ] || {
++		uci set h5ippt.main.saved_hw="$(uci -q get firewall.@defaults[0].flow_offloading_hw || echo 0)"
++		uci commit h5ippt
++	}
++	uci set firewall.$zone.masq=0
++	uci set firewall.ippt_forward=rule
++	uci set firewall.ippt_forward.name='Allow-IPPT-forward'
++	uci set firewall.ippt_forward.src='wan'
++	uci set firewall.ippt_forward.dest='lan'
++	uci set firewall.ippt_forward.family='ipv4'
++	uci set firewall.ippt_forward.proto='all'
++	uci set firewall.ippt_forward.target='ACCEPT'
++	# Only a provider with passthrough support offloads routed flows.
++	if [ -e "$PARAM" ]; then
++		uci set firewall.@defaults[0].flow_offloading_hw="$(uci get h5ippt.main.saved_hw)"
++	else
++		uci set firewall.@defaults[0].flow_offloading_hw=0
++		/etc/init.d/h5-ipa-offload stop
++	fi
++	if [ -n "$(uci changes firewall)" ]; then
++		uci commit firewall
++		fw4 -q reload
++		log "router mode -> passthrough"
++	fi
++	apply_runtime
++}
++
++disable_mode() {
++	local hw zone
++	[ -n "$(uci -q get firewall.ippt_forward)" ] || { clear_runtime; return 0; }
++	hw="$(uci -q get h5ippt.main.saved_hw)"
++	uci -q delete h5ippt.main.saved_hw
++	uci commit h5ippt
++	zone="$(wan_zone)" && uci set firewall.$zone.masq=1
++	uci -q delete firewall.ippt_forward
++	[ -n "$hw" ] && uci set firewall.@defaults[0].flow_offloading_hw="$hw"
++	uci commit firewall
++	clear_runtime
++	[ -w "$PARAM" ] && printf '' > "$PARAM"
++	fw4 -q reload
++	log "passthrough -> router mode"
++	# Reconnect so netifd restores the address and default route.
++	ifup mobile
++}
++
++# Bring the system in line with /etc/config/h5ippt (LuCI saves trigger this).
++sync_mode() {
++	if wanted; then enable_mode; else disable_mode; fi
++}
++
++set_config() {
++	[ -f /etc/config/h5ippt ] || touch /etc/config/h5ippt
++	uci -q get h5ippt.main >/dev/null || uci set h5ippt.main=ippt
++	uci set h5ippt.main.enabled="$1"
++	[ -n "$2" ] && uci set h5ippt.main.mac="$2"
++	uci commit h5ippt
++}
++
++case "$1" in
++apply) apply_runtime ;;
++clear) clear_runtime ;;
++sync) sync_mode ;;
++enable)
++	[ -n "$2" ] || [ -n "$(uci -q get h5ippt.main.mac)" ] ||
++		{ echo "usage: h5-ippt enable <lan-host-mac>" >&2; exit 1; }
++	set_config 1 "$2"; sync_mode ;;
++disable) set_config 0; sync_mode ;;
++status) cat "$STATE" 2>/dev/null || echo "passthrough inactive" ;;
++*) echo "usage: $0 apply|clear|sync|enable <mac>|disable|status" >&2; exit 1 ;;
++esac

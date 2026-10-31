@@ -43,7 +43,7 @@ That does not establish hardware testing of your own new build.
 
 Fresh root has no password and management uses HTTP by default. Set a strong
 root password and keep management on a trusted LAN. IPv6 and 5G SA cell lock
-remain unvalidated; bridge/IP passthrough is not implemented.
+remain unvalidated. Optional IPv4 passthrough (`h5-ippt`) is off by default.
 
 Original device-specific modem firmware, SIM credentials, device backups,
 private keys and raw diagnostic logs are not included. First installation

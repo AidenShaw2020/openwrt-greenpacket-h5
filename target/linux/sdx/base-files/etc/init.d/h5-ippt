@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+START=21
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/h5-ippt sync
+}
+
+reload_service() {
+	/usr/sbin/h5-ippt sync
+}
+
+service_triggers() {
+	procd_add_reload_trigger h5ippt
+}

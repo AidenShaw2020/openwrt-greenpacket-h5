@@ -150,6 +150,7 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 {
 	struct ipa_rtk_flow_manager *m = private;
 	struct ipa_rtk_managed_flow *entry = NULL;
+	struct ipa_rtk_flow routed;
 	unsigned int dir;
 	int index = -1, ret = -EOPNOTSUPP;
 	bool lan_in, lan_out;
@@ -157,6 +158,23 @@ static int managed_replace(void *private, const void *binding, unsigned long coo
 	if (!flow || (flow->nat.protocol != IPPROTO_UDP &&
 		      flow->nat.protocol != IPPROTO_TCP))
 		return ret;
+	if (flow->identity) {
+		/* IP passthrough: the LAN host owns the WAN address. Express the
+		 * routed flow as NAT onto itself; the WAN-ingress half swaps ends
+		 * so both halves share one tuple.
+		 */
+		routed = *flow;
+		if (flow->ingress_ifindex == m->wan) {
+			routed.destination = true;
+			routed.nat.private_ip = flow->nat.remote_ip;
+			routed.nat.private_port = flow->nat.remote_port;
+			routed.nat.remote_ip = flow->nat.private_ip;
+			routed.nat.remote_port = flow->nat.private_port;
+		}
+		routed.nat.public_ip = routed.nat.private_ip;
+		routed.nat.public_port = routed.nat.private_port;
+		flow = &routed;
+	}
 	dir = flow->destination;
 	mutex_lock(&m->lock);
 	if (!m->active || m->failed) { ret = -ESHUTDOWN; goto out; }

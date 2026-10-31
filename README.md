@@ -45,15 +45,16 @@ Use the exported patch once; do not also copy the same overlay on top.
 - Mobile data through IPA/rmnet, QRTR/QMI and ModemManager.
 - LTE and 5G NSA, including an active NR band n78 secondary carrier under load.
 - LuCI modem configuration, serving cells, carrier aggregation and signal tables.
-- Native uhttpd/ucode LuCI handling, with measured warm login response reduced from about 0.37 s to 0.18 s.
+- Native uhttpd/ucode LuCI handling, with measured warm login response reduced from about 0.37 s to 0.18 s. A LuCI feed fix gives every request its own ubus connection; without it, concurrent requests (for example a browser hard reload) hang until the uhttpd timeouts.
+- Optional IPv4 passthrough of the mobile address to one LAN router, with the routed flows hardware-offloaded through identity NAT entries: 296.9/99.3 Mb/s on a speed test from the downstream router.
 - LTE cell lock, readback, data connectivity and return to the unlocked state.
 - Short RESET press rebooting without losing configuration.
 - Long RESET test and subsequent settings restoration confirmed by the device owner.
 
 Only the tested H5-200Q1 hardware with original firmware revision
 `912.001.604.145` has been validated. Other revisions are not certified.
-IPv6 service and 5G SA cell lock are not hardware validated. Bridge/IP
-passthrough is not implemented. See [Validation](docs/VALIDATION.md).
+IPv6 service and 5G SA cell lock are not hardware validated. Optional IPv4
+passthrough (see Operation) was validated on IPv4 only. See [Validation](docs/VALIDATION.md).
 
 5G NSA uses an LTE anchor. In an idle state the modem may report only LTE
 serving/carrier information; NR can be added during traffic. A ModemManager
@@ -170,6 +171,16 @@ partition; it does not install OpenWrt recovery or restore stock firmware.
 - Short RESET press, less than one second: reboot, preserving settings.
 - RESET held for at least five seconds while OpenWrt is running, then released:
   factory reset of OpenWrt settings, including saved PIN/APN.
+
+The default is a NAT router. To hand the mobile IPv4 address to one LAN
+router instead (IP passthrough), select it under Network > IP Passthrough and
+choose that router's WAN MAC (`h5-ippt enable <mac>` / `h5-ippt disable` do
+the same over SSH). The H5 then keeps its LAN address for management,
+leases the mobile address to that MAC over DHCP and forwards all unsolicited
+inbound traffic to it, so port forwarding is configured on that router only.
+With a public mobile address, LuCI requests NATed by that router arrive from
+a public source and uhttpd's default RFC1918 filter rejects them; use SSH or
+adjust `uhttpd.main.rfc1918_filter` deliberately.
 
 An OpenWrt factory reset does not restore the vendor firmware. Never guess a
 SIM PIN or repeatedly retry a rejected PIN. HTTP is intentionally enabled;

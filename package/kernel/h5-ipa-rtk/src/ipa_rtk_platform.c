@@ -2,6 +2,7 @@
 /* SDX65/RTL8125 external DMA controller. Stage 0 is passive domain attachment. */
 #include <linux/dma-mapping.h>
 #include <linux/ethtool.h>
+#include <linux/inet.h>
 #include <linux/inetdevice.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
@@ -719,6 +720,13 @@ static int ipa_rtk_offload_stop(struct ipa_rtk_controller *c)
 	return 0;
 }
 
+/* IP passthrough leaves the modem netdev without an address because the LAN
+ * host owns it. h5-ippt stores that address here before starting stage 4.
+ */
+static char passthrough_ip[16];
+module_param_string(passthrough_ip, passthrough_ip, sizeof(passthrough_ip), 0644);
+MODULE_PARM_DESC(passthrough_ip, "WAN IPv4 address leased to the LAN host in IP passthrough");
+
 static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 {
 	struct h5_install_fltr_rule_req_msg *rules = NULL;
@@ -738,7 +746,15 @@ static int ipa_rtk_offload_start(struct ipa_rtk_controller *c)
 	if (!wan_dev)
 		return -ENODEV;
 	wan_ifindex = wan_dev->ifindex;
-	wan_ip = inet_select_addr(wan_dev, 0, RT_SCOPE_UNIVERSE);
+	/* inet_select_addr() falls back to other devices (the LAN address) when
+	 * the modem netdev has none, so an explicit passthrough address wins.
+	 */
+	if (passthrough_ip[0]) {
+		if (!in4_pton(passthrough_ip, -1, (u8 *)&wan_ip, '\n', NULL))
+			return -EINVAL;
+	} else {
+		wan_ip = inet_select_addr(wan_dev, 0, RT_SCOPE_UNIVERSE);
+	}
 	if (!wan_ip)
 		return -EADDRNOTAVAIL;
 	c->wan_ifindex = wan_ifindex;

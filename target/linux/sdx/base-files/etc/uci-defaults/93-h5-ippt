@@ -1,0 +1,9 @@
+#!/bin/sh
+# IP passthrough is off by default; LuCI edits this section.
+[ -f /etc/config/h5ippt ] || touch /etc/config/h5ippt
+uci -q get h5ippt.main >/dev/null || {
+	uci set h5ippt.main=ippt
+	uci set h5ippt.main.enabled=0
+	uci commit h5ippt
+}
+exit 0

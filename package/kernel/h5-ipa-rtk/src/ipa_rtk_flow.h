@@ -10,6 +10,8 @@ struct ipa_rtk_flow {
 	int ingress_ifindex, egress_ifindex;
 	u8 ethernet[ETH_HLEN];
 	bool destination;
+	/* Routed without translation; nat holds the source-form tuple. */
+	bool identity;
 };
 /* Only decode; never program hardware or retain a borrowed net_device. */
 int ipa_rtk_flow_decode(const struct flow_rule *rule, struct ipa_rtk_flow *out);

@@ -398,3 +398,29 @@ offload resumes as soon as it is up. Board defaults now set
 `network.mobile.disable_modem=0` when unset, so a bearer drop no longer
 disables and re-enables the modem (one mmcli call less and no
 re-registration).
+
+## LAN link loss (2026-10-31)
+
+Restarting the downstream router left the H5 answering ARP but no IPv4 or
+IPv6, so the router got no DHCP lease. A LAN link loss resets the RTL8125;
+on link up the r8125 driver reprograms the IPA rings from index 0 while GSI
+keeps its previous positions, and every IP packet steered to the IPA ring is
+lost (ARP uses a host ring). Freshly started rings survive a link up, which
+is why boot and stage restarts were never affected. This applies in router
+and passthrough mode alike.
+
+The controller now records a carrier loss while the rings run (stage 2 or
+higher) and, on link up, rebuilds them and restarts the offload. Releasing the
+rings reopens the NIC; the resulting link drop is ignored for 10 s. Results:
+
+- Router WAN port bounced four times, once during a download: internet back
+  12-16 s after the start of the bounce, rings rebuilt 10 ms after link up,
+  offload active 0.2 s later, `failed=0`, no repeated rebuild.
+- Downstream router power-cycled: it had the passthrough address and internet
+  30 s after it started; the H5 rebuilt its rings once.
+
+Peak throughput from a PC behind the downstream router in passthrough mode
+(Ookla CLI, servers in Prague, NR5G-NSA with a weak n78 signal): up to
+480 Mb/s down and 120 Mb/s up, H5 CPU peaking at 9-14% (one 30% spike).
+Results earlier the same hour ranged from 95 to 240 Mb/s; the spread is
+radio-side.

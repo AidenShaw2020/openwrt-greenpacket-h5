@@ -186,6 +186,8 @@ struct ipa_rtk_controller {
 	struct notifier_block netdev_nb;
 	struct work_struct netdev_down_work;
 	struct work_struct wan_down_work;
+	struct work_struct link_up_work;
+	unsigned long relink_quiet_until;
 	struct ipa_rtk_table ul[4], route, route_hash;
 	struct ipa_rtk_header_ref headers[IPA_RTK_MAX_HEADERS];
 	struct ipa_rtk_offload_slot *flows;
@@ -208,6 +210,7 @@ struct ipa_rtk_controller {
 	bool dl_qmi_installed;
 	bool udp_rss_changed;
 	bool in_stop;
+	bool link_lost;
 	bool shared;
 	bool pinned;
 	bool failed;
@@ -1180,6 +1183,61 @@ static void ipa_rtk_wan_down_work(struct work_struct *work)
 	mutex_unlock(&c->lock);
 }
 
+/* A LAN link loss resets the RTL8125: on link up the driver reprograms the
+ * IPA rings from index 0 while GSI keeps its old positions, so every IPv4 and
+ * IPv6 packet steered to the IPA ring is lost (ARP still reaches the host
+ * ring). Rebuild the rings. Releasing them reopens the NIC; the link drop
+ * that causes is ignored, the fresh rings survive the following link up.
+ */
+static void ipa_rtk_link_up_work(struct work_struct *work)
+{
+	struct ipa_rtk_controller *c =
+		container_of(work, struct ipa_rtk_controller, link_up_work);
+	unsigned int target;
+	int ret;
+
+	mutex_lock(&c->lock);
+	rtnl_lock();
+	if (!READ_ONCE(c->link_lost))
+		goto out;
+	WRITE_ONCE(c->link_lost, false);
+	if (c->failed || c->stage < 2)
+		goto out;
+	target = c->stage;
+	dev_info(c->dev, "LAN link restored; rebuilding RTK rings (stage %u)\n", target);
+	ret = ipa_rtk_clear(c);
+	if (!ret)
+		ret = ipa_rtk_prepare(c);
+	if (!ret)
+		ret = ipa_rtk_start(c);
+	if (!ret && target == 3) {
+		ret = rtl8125_rss_redirect(c->netdev, 0, c->dma[0].ring);
+		if (!ret)
+			c->stage = 3;
+	}
+	if (ret) {
+		int cleanup = ipa_rtk_clear(c);
+
+		if (cleanup) {
+			c->failed = true;
+			dev_err(c->dev, "RTK stop incomplete after link loss (%d); retaining DMA\n",
+				cleanup);
+		}
+		dev_err(c->dev, "RTK rings not rebuilt after link loss (%d)\n", ret);
+	} else if (target == 4) {
+		/* On failure this leaves stage 2; the next mobile ifup retries. */
+		ret = ipa_rtk_offload_start(c);
+		if (ret)
+			dev_warn(c->dev, "offload not restarted after link loss (%d)\n", ret);
+	}
+	if (c->ipa->uc_command_failed)
+		c->failed = true;
+	WRITE_ONCE(c->relink_quiet_until, jiffies + 10 * HZ);
+out:
+	rtnl_unlock();
+	mutex_unlock(&c->lock);
+}
+
 static int ipa_rtk_netdev_event(struct notifier_block *nb, unsigned long event,
 				void *ptr)
 {
@@ -1187,6 +1245,16 @@ static int ipa_rtk_netdev_event(struct notifier_block *nb, unsigned long event,
 	struct ipa_rtk_controller *c =
 		container_of(nb, struct ipa_rtk_controller, netdev_nb);
 
+	if (event == NETDEV_CHANGE && dev == c->netdev) {
+		if (!netif_carrier_ok(dev)) {
+			if (READ_ONCE(c->stage) >= 2 &&
+			    time_after(jiffies, READ_ONCE(c->relink_quiet_until)))
+				WRITE_ONCE(c->link_lost, true);
+		} else if (READ_ONCE(c->link_lost)) {
+			schedule_work(&c->link_up_work);
+		}
+		return NOTIFY_DONE;
+	}
 	if (event != NETDEV_GOING_DOWN && event != NETDEV_DOWN &&
 	    event != NETDEV_UNREGISTER && event != NETDEV_CHANGEMTU)
 		return NOTIFY_DONE;
@@ -1325,6 +1393,8 @@ static int ipa_rtk_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, c);
 	INIT_WORK(&c->netdev_down_work, ipa_rtk_netdev_down_work);
 	INIT_WORK(&c->wan_down_work, ipa_rtk_wan_down_work);
+	INIT_WORK(&c->link_up_work, ipa_rtk_link_up_work);
+	c->relink_quiet_until = jiffies;
 	ret = ipa_rtk_flowtable_register(&c->flowtable, c->netdev,
 					 &ipa_rtk_managed_flow_ops,
 					 &c->flow_manager);
@@ -1339,6 +1409,7 @@ static int ipa_rtk_probe(struct platform_device *pdev)
 		unregister_netdevice_notifier(&c->netdev_nb);
 		cancel_work_sync(&c->netdev_down_work);
 		cancel_work_sync(&c->wan_down_work);
+		cancel_work_sync(&c->link_up_work);
 		goto err_flowtable;
 	}
 	dev_info(&pdev->dev, "ETH SID0x5e3 shares RTL8125 DMA domain; passive stage0\n");
@@ -1376,6 +1447,7 @@ static void ipa_rtk_remove(struct platform_device *pdev)
 	unregister_netdevice_notifier(&c->netdev_nb);
 	cancel_work_sync(&c->netdev_down_work);
 	cancel_work_sync(&c->wan_down_work);
+	cancel_work_sync(&c->link_up_work);
 	if (READ_ONCE(c->flowtable.registered))
 		ipa_rtk_flowtable_unregister(&c->flowtable);
 	mutex_lock(&c->lock);

@@ -11,10 +11,9 @@ ifup|ifupdate)
 	fi
 	;;
 ifdown)
-	if [ -e "$stage_file" ]; then
-		# Stage 2 keeps the NIC rings; stage 0 would reset the LAN link.
-		echo 2 > "$stage_file" 2>/dev/null || echo 0 > "$stage_file" 2>/dev/null || true
-		logger -t h5-ipa-offload "Stopped IPA hardware flowtable offload on $INTERFACE ($ACTION)"
-	fi
+	# Nothing to do: ifdown arrives when netifd starts tearing down, while the
+	# data netdev still forwards at full rate. The controller stops the offload
+	# itself (stage 2, rings kept) when that netdev actually goes away, and
+	# ifup restarts it if the WAN address has changed.
 	;;
 esac

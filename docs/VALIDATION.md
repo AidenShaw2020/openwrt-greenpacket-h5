@@ -379,3 +379,22 @@ hotplug reloads on mobile ifup anyway), and `h5-ippt` no longer tears down
 the passthrough state on mobile ifdown, so an unchanged address restarts
 nothing. The LAN host keeps its gateway and can reach the H5 during an
 outage.
+
+CPU during a mobile reconnect, sampled every second. With load, the mobile
+ifdown hotplug event used to stop the offload about 4 s before the data
+netdev went away, so that traffic was forwarded in software (softirq up to
+96%). The ifdown hook no longer touches the offload: the controller stops it
+when the netdev disappears, and ifup restarts it only if the stage is not 4
+with the expected WAN address. Repeated during 50 concurrent downloads:
+softirq stayed at 0%, the offload was active 1 s after the mobile interface
+came back, no LAN link change.
+
+The remaining load is the reconnect itself, the same with or without traffic:
+about 8 s at full CPU while the interface goes down and 8 s while it comes
+back, mostly the netifd ModemManager protocol handler and its mmcli calls
+(17 calls, 8.8 s), the firewall reload and ModemManager's kernel-event
+reports. No traffic needs the CPU then: the mobile link is down and the
+offload resumes as soon as it is up. Board defaults now set
+`network.mobile.disable_modem=0` when unset, so a bearer drop no longer
+disables and re-enables the modem (one mmcli call less and no
+re-registration).

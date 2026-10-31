@@ -4,6 +4,7 @@ STOP=10
 
 stage_file=/sys/bus/platform/devices/soc:ipa-ethernet/stage
 wan_param=/sys/module/h5_ipa_rtk/parameters/wan_ifname
+ip_param=/sys/module/h5_ipa_rtk/parameters/passthrough_ip
 
 bind_r8125() {
 	local pci dev driver
@@ -45,7 +46,13 @@ start() {
 		# Pass netifd's data netdev; ModemManager may recreate its mux link.
 		l3="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 		[ -n "$l3" ] && [ -w "$wan_param" ] && printf '%s' "$l3" > "$wan_param"
-		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null; then
+		want_ip="$(cat "$ip_param" 2>/dev/null)"
+		[ -n "$want_ip" ] || want_ip="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null ||
+		   ! grep -q "wan_ip=$want_ip\$" "$stage_file" 2>/dev/null; then
+			# An offload left running across a reconnect may carry the old
+			# address; stop it first (stage 2 keeps the NIC rings).
+			grep -q '^4 ' "$stage_file" 2>/dev/null && echo 2 > "$stage_file" 2>/dev/null
 			# From stage 2 the NIC rings are reused; reset fully only on failure.
 			if ! echo 4 > "$stage_file" 2>/dev/null; then
 				echo 0 > "$stage_file" 2>/dev/null || true

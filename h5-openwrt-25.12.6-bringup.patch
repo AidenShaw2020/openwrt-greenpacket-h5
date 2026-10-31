@@ -443,7 +443,7 @@ index 00000000..2201460d
 ++ }
 diff --git a/package/kernel/h5-ipa-rtk/Makefile b/package/kernel/h5-ipa-rtk/Makefile
 new file mode 100644
-index 00000000..e2ffd5b1
+index 00000000..1f2343d6
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/Makefile
 @@ -0,0 +1,39 @@
@@ -454,7 +454,7 @@ index 00000000..e2ffd5b1
 +
 +PKG_NAME:=h5-ipa-rtk
 +PKG_VERSION:=1
-+PKG_RELEASE:=9
++PKG_RELEASE:=10
 +PKG_LICENSE:=GPL-2.0-only
 +
 +include $(INCLUDE_DIR)/package.mk
@@ -488,10 +488,10 @@ index 00000000..e2ffd5b1
 +$(eval $(call KernelPackage,h5-ipa-rtk))
 diff --git a/package/kernel/h5-ipa-rtk/files/15-h5-ipa-offload.hotplug b/package/kernel/h5-ipa-rtk/files/15-h5-ipa-offload.hotplug
 new file mode 100755
-index 00000000..290626d9
+index 00000000..44fff8e6
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/15-h5-ipa-offload.hotplug
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,19 @@
 +#!/bin/sh
 +
 +stage_file=/sys/bus/platform/devices/soc:ipa-ethernet/stage
@@ -505,25 +505,25 @@ index 00000000..290626d9
 +	fi
 +	;;
 +ifdown)
-+	if [ -e "$stage_file" ]; then
-+		# Stage 2 keeps the NIC rings; stage 0 would reset the LAN link.
-+		echo 2 > "$stage_file" 2>/dev/null || echo 0 > "$stage_file" 2>/dev/null || true
-+		logger -t h5-ipa-offload "Stopped IPA hardware flowtable offload on $INTERFACE ($ACTION)"
-+	fi
++	# Nothing to do: ifdown arrives when netifd starts tearing down, while the
++	# data netdev still forwards at full rate. The controller stops the offload
++	# itself (stage 2, rings kept) when that netdev actually goes away, and
++	# ifup restarts it if the WAN address has changed.
 +	;;
 +esac
 diff --git a/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
 new file mode 100755
-index 00000000..70492b96
+index 00000000..2b484c07
 --- /dev/null
 +++ b/package/kernel/h5-ipa-rtk/files/h5-ipa-offload.init
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,77 @@
 +#!/bin/sh /etc/rc.common
 +START=96
 +STOP=10
 +
 +stage_file=/sys/bus/platform/devices/soc:ipa-ethernet/stage
 +wan_param=/sys/module/h5_ipa_rtk/parameters/wan_ifname
++ip_param=/sys/module/h5_ipa_rtk/parameters/passthrough_ip
 +
 +bind_r8125() {
 +	local pci dev driver
@@ -565,7 +565,13 @@ index 00000000..70492b96
 +		# Pass netifd's data netdev; ModemManager may recreate its mux link.
 +		l3="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 +		[ -n "$l3" ] && [ -w "$wan_param" ] && printf '%s' "$l3" > "$wan_param"
-+		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null; then
++		want_ip="$(cat "$ip_param" 2>/dev/null)"
++		[ -n "$want_ip" ] || want_ip="$(ifstatus mobile 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
++		if ! grep -q '^4 failed=0 ' "$stage_file" 2>/dev/null ||
++		   ! grep -q "wan_ip=$want_ip\$" "$stage_file" 2>/dev/null; then
++			# An offload left running across a reconnect may carry the old
++			# address; stop it first (stage 2 keeps the NIC rings).
++			grep -q '^4 ' "$stage_file" 2>/dev/null && echo 2 > "$stage_file" 2>/dev/null
 +			# From stage 2 the NIC rings are reused; reset fully only on failure.
 +			if ! echo 4 > "$stage_file" 2>/dev/null; then
 +				echo 0 > "$stage_file" 2>/dev/null || true
@@ -8329,10 +8335,10 @@ index 00000000..33ba450e
 +exit 0
 diff --git a/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile b/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile
 new file mode 100755
-index 00000000..61eae235
+index 00000000..26c42fe0
 --- /dev/null
 +++ b/target/linux/sdx/base-files/etc/uci-defaults/91-h5-mobile
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,37 @@
 +#!/bin/sh
 +[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = greenpacket,h5-200q1 ] || exit 0
 +[ -x /usr/bin/mmcli ] || exit 0
@@ -8346,6 +8352,15 @@ index 00000000..61eae235
 +set network.mobile.force_connection='0'
 +commit network
 +EOF
++fi
++# Keep the radio registered across interface restarts and bearer drops. The
++# default disable/enable cycle costs a re-registration and, with the extra
++# ModemManager work, CPU time on this single core. Unset only: an explicit
++# choice, including one made in LuCI, is preserved.
++if uci -q get network.mobile >/dev/null &&
++   [ -z "$(uci -q get network.mobile.disable_modem)" ]; then
++	uci set network.mobile.disable_modem='0'
++	uci commit network
 +fi
 +# Standard WAN firewall policy also applies to the cellular bearer.
 +for zone in $(uci show firewall | sed -n 's/^\(firewall\.[^=]*\)=zone$/\1/p'); do

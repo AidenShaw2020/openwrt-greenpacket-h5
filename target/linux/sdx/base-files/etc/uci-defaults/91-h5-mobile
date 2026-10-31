@@ -12,6 +12,15 @@ set network.mobile.force_connection='0'
 commit network
 EOF
 fi
+# Keep the radio registered across interface restarts and bearer drops. The
+# default disable/enable cycle costs a re-registration and, with the extra
+# ModemManager work, CPU time on this single core. Unset only: an explicit
+# choice, including one made in LuCI, is preserved.
+if uci -q get network.mobile >/dev/null &&
+   [ -z "$(uci -q get network.mobile.disable_modem)" ]; then
+	uci set network.mobile.disable_modem='0'
+	uci commit network
+fi
 # Standard WAN firewall policy also applies to the cellular bearer.
 for zone in $(uci show firewall | sed -n 's/^\(firewall\.[^=]*\)=zone$/\1/p'); do
 	[ "$(uci -q get "$zone.name")" = wan ] || continue
